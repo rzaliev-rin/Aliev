@@ -25,8 +25,16 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
-    with open(STORE_PATH, "w", encoding="utf-8") as f:
+    # Пишем во временный файл и подменяем атомарно: если бот упадёт или
+    # закончится место посреди записи, старый файл останется целым
+    # (иначе _load прочитает битый JSON как пустой и следующая запись
+    # сотрёт все данные).
+    tmp_path = STORE_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, STORE_PATH)
 
 
 def create_deal(record: dict) -> str:

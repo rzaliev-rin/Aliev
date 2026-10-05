@@ -10,3 +10,4 @@ dealer_chats.json
 *.pdf
 *.xlsx
 *.zip
+*.json.tmp

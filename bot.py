@@ -64,6 +64,7 @@ dp = Dispatcher()
 router = Router()
 
 ACCIDENTS_AUTO_THRESHOLD = 3  # выше этого — автоматически "Более 3х ДТП"
+ACCIDENTS_AUTO_OPTION = "Более 3х ДТП"  # должно совпадать с пунктом «Доп.данные» в таблице
 
 
 class AppraisalStates(StatesGroup):
@@ -267,7 +268,7 @@ def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_nam
                          reception_type: Optional[str] = None, appraiser_sale_cost=None,
                          presale_preparation_cost=None) -> str:
     header = _vehicle_header(vehicle_info, reception_type)
-    lines = ["📋 СОГЛАСОВАНИЕ СДЕЛКИ", f"Оценщик: {vehicle_info.get('appraiser_name') or manager_name}"]
+    lines = ["📋 СОГЛАСОВАНИЕ СДЕЛКИ", f"Оценщик: {vehicle_info.get('appraiser_name') or manager_name or '—'}"]
     if header:
         lines.append(header)
     lines += [
@@ -407,8 +408,11 @@ async def _proceed_after_condition(state: FSMContext, answer_fn, bot):
     """После тех.состояния — либо авто-ДТП, либо спрашиваем доп.данные руками."""
     data = await state.get_data()
     accidents_count = data.get("accidents_count")
-    if accidents_count is not None and accidents_count > ACCIDENTS_AUTO_THRESHOLD:
-        await state.update_data(extra="Более 3х ДТП")
+    # Пункт ставим автоматически, только если он есть в таблице «Параметры Метрики»:
+    # если его там переименуют, иначе молча получили бы 0 баллов вместо штрафа.
+    if (accidents_count is not None and accidents_count > ACCIDENTS_AUTO_THRESHOLD
+            and ACCIDENTS_AUTO_OPTION in get_extra_options()):
+        await state.update_data(extra=ACCIDENTS_AUTO_OPTION)
         await _finish_scoring(state, answer_fn, bot, auto_note=(
             f"\n(автоматически: по данным оценки — {accidents_count} ДТП, это > {ACCIDENTS_AUTO_THRESHOLD})"
         ))
@@ -918,8 +922,8 @@ def _pats_card_text(deal: dict, approved_role_label: str = "") -> str:
         f"Салон: {deal.get('dealer_name') or '—'}\n"
         f"VIN: {deal.get('vin') or '—'}\n"
         + link_line +
-        f"Оценщик: {(deal.get('vehicle') or {}).get('appraiser_name') or deal.get('manager_name')}\n"
-        f"Цена выкупа: {_fmt(deal['negotiated_price']) if deal.get('negotiated_price') else '—'} ₽\n"
+        f"Оценщик: {(deal.get('vehicle') or {}).get('appraiser_name') or deal.get('manager_name') or '—'}\n"
+        f"Цена выкупа: {_fmt(deal['negotiated_price']) + ' ₽' if deal.get('negotiated_price') else '—'}\n"
         + status_line
     )
 

@@ -25,9 +25,15 @@ Google Таблице, что и история оценок. Формат вк�
 повышенной цены выкупа сразу от УК.
 
 Если салон не найден на вкладке (или вкладка ещё пустая/не создана) —
-ограничение НЕ применяется (чтобы не блокировать процесс до заполнения
-таблицы) — согласовать сможет любой участник чата, как раньше.
+функции возвращают пустое множество, и тогда в bot.py (_can_approve)
+согласовать могут только администраторы бота. Раньше в этом случае
+кнопку мог нажать любой участник чата.
+
+Вкладка читается не чаще раза в ROWS_CACHE_TTL_SECONDS: раньше каждое
+нажатие кнопки делало 2–3 запроса к Google и на это время бот «замирал».
+Если Google временно недоступен — используются последние прочитанные данные.
 """
+import time
 from typing import Optional
 
 import gspread
@@ -41,7 +47,11 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TAB_NAME = "Иерархия согласования"
 HEADER = ["Салон", "РОП ID", "РОП Имя", "ДДЦ ID", "ДДЦ Имя", "УК ID", "УК Имя"]
 
+ROWS_CACHE_TTL_SECONDS = 60
+
 _client_cache = None
+_rows_cache = None
+_rows_cache_at = 0.0
 
 
 def _get_worksheet():
@@ -52,6 +62,26 @@ def _get_worksheet():
 
     sh = _client_cache.open_by_key(GOOGLE_SHEET_ID)
     return sh.worksheet(TAB_NAME)
+
+
+def _get_rows() -> list:
+    """Строки вкладки с кешем. Бросает исключение, только если вкладку не
+    удалось прочитать ни разу с момента запуска бота."""
+    global _rows_cache, _rows_cache_at
+    now = time.time()
+    if _rows_cache is not None and (now - _rows_cache_at) < ROWS_CACHE_TTL_SECONDS:
+        return _rows_cache
+    try:
+        rows = _get_worksheet().get_all_records()
+    except Exception as e:  # noqa: BLE001
+        if _rows_cache is None:
+            raise
+        print(f"[approval_hierarchy] Не удалось обновить вкладку «{TAB_NAME}», "
+              f"использую данные из кеша: {e}", flush=True)
+        _rows_cache_at = now  # не долбим Google на каждом нажатии, повторим через TTL
+        return _rows_cache
+    _rows_cache, _rows_cache_at = rows, now
+    return rows
 
 
 def _ids_from_cell(v) -> set:
@@ -77,8 +107,7 @@ def get_first_stage_approvers(dealer_name: Optional[str], status: Optional[str])
     обойти ДДЦ и получить согласование сразу от УК.
     """
     try:
-        ws = _get_worksheet()
-        rows = ws.get_all_records()
+        rows = _get_rows()
     except Exception as e:  # noqa: BLE001
         print(f"[approval_hierarchy] Не удалось прочитать вкладку «{TAB_NAME}»: {e}", flush=True)
         return set()
@@ -106,8 +135,7 @@ def get_uk_approvers(dealer_name: Optional[str]) -> set:
     """ID сотрудников с ролью УК для данного салона (второй этап согласования
     для сделок со статусом "Согласование УК")."""
     try:
-        ws = _get_worksheet()
-        rows = ws.get_all_records()
+        rows = _get_rows()
     except Exception as e:  # noqa: BLE001
         print(f"[approval_hierarchy] Не удалось прочитать вкладку «{TAB_NAME}»: {e}", flush=True)
         return set()
@@ -128,8 +156,7 @@ def get_pats_approvers() -> set:
     этой строке можно оставить пустыми). Пустое множество = ограничение не
     применяется (подтвердить сможет любой участник чата ПАЦ)."""
     try:
-        ws = _get_worksheet()
-        rows = ws.get_all_records()
+        rows = _get_rows()
     except Exception as e:  # noqa: BLE001
         print(f"[approval_hierarchy] Не удалось прочитать вкладку «{TAB_NAME}»: {e}", flush=True)
         return set()
@@ -157,8 +184,7 @@ def resolve_role_and_name(dealer_name: Optional[str], user_id: Optional[int]) ->
     if user_id is None:
         return None, None
     try:
-        ws = _get_worksheet()
-        rows = ws.get_all_records()
+        rows = _get_rows()
     except Exception as e:  # noqa: BLE001
         print(f"[approval_hierarchy] Не удалось прочитать вкладку «{TAB_NAME}»: {e}", flush=True)
         return None, None

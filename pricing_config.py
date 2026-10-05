@@ -39,6 +39,7 @@ from config import GOOGLE_SERVICE_ACCOUNT_FILE, GOOGLE_SHEET_ID
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TAB_NAME = "Параметры Метрики"
 CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 часов — не дёргаем Google лишний раз
+RETRY_AFTER_ERROR_SECONDS = 5 * 60  # после ошибки чтения — повторная попытка через 5 минут
 
 _client_cache = None
 _params_cache = None
@@ -207,8 +208,10 @@ def _load_from_sheet() -> Optional[dict]:
         "extra_score": extra_score or _DEFAULTS["extra_score"],
         "category_thresholds": category_thresholds,
         "ptsp_coef": ptsp_coef or _DEFAULTS["ptsp_coef"],
-        "tradein_cat_a_tiers": tradein_cat_a or _DEFAULTS["tradein_cat_a_tiers"],
-        "tradein_cat_bc_tiers": tradein_cat_bc or _DEFAULTS["tradein_cat_bc_tiers"],
+        # _vlookup_tier ожидает диапазоны по возрастанию — сортируем на случай,
+        # если строки в таблице переставили местами
+        "tradein_cat_a_tiers": sorted(tradein_cat_a, key=lambda t: t[0]) or _DEFAULTS["tradein_cat_a_tiers"],
+        "tradein_cat_bc_tiers": sorted(tradein_cat_bc, key=lambda t: t[0]) or _DEFAULTS["tradein_cat_bc_tiers"],
         "flat_rates": flat_rates or _DEFAULTS["flat_rates"],
         "gm2_formula": gm2_formula,
     }
@@ -223,6 +226,14 @@ def get_params() -> dict:
         return _params_cache
 
     fresh = _load_from_sheet()
-    _params_cache = fresh if fresh is not None else dict(_DEFAULTS)
-    _params_cache_at = now
+    if fresh is not None:
+        _params_cache, _params_cache_at = fresh, now
+    elif _params_cache is not None:
+        # Google временно недоступен — оставляем последние прочитанные из
+        # таблицы параметры (а не откатываемся на дефолты) и пробуем снова
+        # через RETRY_AFTER_ERROR_SECONDS, а не через 6 часов.
+        _params_cache_at = now - CACHE_TTL_SECONDS + RETRY_AFTER_ERROR_SECONDS
+    else:
+        _params_cache = dict(_DEFAULTS)
+        _params_cache_at = now - CACHE_TTL_SECONDS + RETRY_AFTER_ERROR_SECONDS
     return _params_cache
