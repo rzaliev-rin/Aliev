@@ -1,3 +1,12 @@
 __pycache__/
 *.pyc
 .env
+service_account.json
+# рабочие данные бота (создаются при работе)
+access_store.json
+deals_store.json
+dealer_chats.json
+# внутренние документы компании — не публикуем
+*.pdf
+*.xlsx
+*.zip

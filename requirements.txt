@@ -1,0 +1,5 @@
+pymaxgram>=4.0.46
+python-dotenv>=1.0
+requests>=2.31
+gspread>=6.0
+google-auth>=2.29
