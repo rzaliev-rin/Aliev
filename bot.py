@@ -80,14 +80,30 @@ class AppraisalStates(StatesGroup):
 
 
 def _fmt(n) -> str:
+    if n is None:
+        return "—"
     return f"{n:,.0f}".replace(",", " ")
+
+
+def _text(message) -> str:
+    """Текст сообщения; пустая строка, если прислали фото/файл/стикер без текста."""
+    body = getattr(message, "body", None)
+    return (getattr(body, "text", None) or "").strip()
+
+
+def _parse_positive(text: str) -> float:
+    """Число > 0 из строки вида '1 200 000' или '950000,5'. Бросает ValueError, если не число или ≤ 0."""
+    value = float((text or "").strip().replace(" ", "").replace(" ", "").replace(",", "."))
+    if value <= 0:
+        raise ValueError("amount must be positive")
+    return value
 
 
 def _parse_amount(text: str):
     """Возвращает float или None, если это 'пропустить'/'skip'/'-'. Бросает ValueError, если не число."""
-    if text.strip().lower() in ("пропустить", "skip", "-"):
+    if (text or "").strip().lower() in ("пропустить", "skip", "-"):
         return None
-    return float(text.strip().replace(" ", "").replace(",", "."))
+    return _parse_positive(text)
 
 
 def _maxposter_link(appraisal_id) -> Optional[str]:
@@ -133,10 +149,14 @@ def _result_text(result, avito_price: float, extra_info: dict, vehicle_info: dic
         f"Целевая валовая прибыль: {_fmt(result.gross_margin_rop)} ₽",
     ]
     if extra_info.get("repair_cost_max"):
+        repair_min = extra_info.get("repair_cost_min")
+        repair_range = (
+            f"{_fmt(repair_min)}–{_fmt(extra_info['repair_cost_max'])}" if repair_min
+            else f"до {_fmt(extra_info['repair_cost_max'])}"
+        )
         lines += [
             "",
-            f"Расчёт стоимости ремонта (по данным осмотра): "
-            f"{_fmt(extra_info['repair_cost_min'])}–{_fmt(extra_info['repair_cost_max'])} ₽",
+            f"Расчёт стоимости ремонта (по данным осмотра): {repair_range} ₽",
         ]
     if extra_info.get("autoteka_url"):
         lines += [f"Отчёт Автотеки: {extra_info['autoteka_url']}"]
@@ -352,6 +372,17 @@ def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_USER_IDS
 
 
+def _can_approve(user_id: Optional[int], approvers) -> bool:
+    """Может ли пользователь нажимать кнопки согласования. Если список
+    согласующих для салона/этапа не настроен — только администраторы
+    (раньше в этом случае кнопки мог нажать любой участник чата)."""
+    if user_id is None:
+        return False
+    if approvers:
+        return user_id in approvers
+    return _is_admin(user_id)
+
+
 async def _deny_and_request_access(message, user_id: int) -> None:
     if not access_store.is_bot_enabled():
         await message.answer(text="Бот временно отключён администратором. Попробуйте позже.")
@@ -439,6 +470,14 @@ async def _finish_scoring(state: FSMContext, answer_fn, bot, auto_note: str = ""
     )
 
 
+async def _log_appraisal_safe(manager_name, vin, appraisal_input, result, vehicle_info) -> None:
+    """Запись в Google Таблицу. Сбой таблицы не должен ломать диалог с менеджером."""
+    try:
+        await asyncio.to_thread(log_appraisal, manager_name, vin, appraisal_input, result, vehicle_info)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Не удалось записать оценку в Google Таблицу (VIN %s): %s", vin, e)
+
+
 def review_kb():
     builder = InlineKeyboardBuilder()
     builder.callback(text="📨 Отправить на согласование", payload="confirm_submit")
@@ -483,8 +522,8 @@ async def _review_or_close(state: FSMContext, answer_fn, data: dict):
             + "\n\nГотово. Чтобы посчитать следующее авто — жмите кнопку ниже.",
             keyboard=new_appraisal_kb(),
         )
-        await asyncio.to_thread(log_appraisal, manager_name, data.get("vin"), appraisal_input, result, vehicle_info)
         await state.clear()
+        await _log_appraisal_safe(manager_name, data.get("vin"), appraisal_input, result, vehicle_info)
         return
 
     appraiser_ppp = data.get("appraisal_sale_cost")
@@ -522,7 +561,13 @@ async def _review_or_close(state: FSMContext, answer_fn, data: dict):
 
 @router.message_callback(F.payload == "confirm_submit", StateFilter(AppraisalStates.reviewing_result))
 async def on_confirm_submit(callback, state: FSMContext, bot):
+    if not _allowed(_get_user_id(callback)):
+        await state.clear()
+        await callback.answer(text="У вас больше нет доступа к боту — карточка не отправлена.")
+        return
     data = await state.get_data()
+    # Сбрасываем сценарий сразу, чтобы повторное нажатие кнопки не создало вторую карточку.
+    await state.clear()
     appraisal_input = AppraisalInput(
         avito_price=data["avito_price"],
         reception_type=data["reception_type"],
@@ -546,8 +591,7 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
         + "\n\nГотово. Чтобы посчитать следующее авто — жмите кнопку ниже.",
         keyboard=new_appraisal_kb(),
     )
-    await asyncio.to_thread(log_appraisal, manager_name, data.get("vin"), appraisal_input, result, vehicle_info)
-    await state.clear()
+    await _log_appraisal_safe(manager_name, data.get("vin"), appraisal_input, result, vehicle_info)
 
 
 @router.message_callback(F.payload == "update_price", StateFilter(AppraisalStates.reviewing_result))
@@ -571,7 +615,9 @@ async def on_update_price(callback, state: FSMContext, bot):
 
     try:
         fresh = await asyncio.to_thread(fetch_appraisal, str(appraisal_id))
-    except MaxPosterError as e:
+    except Exception as e:  # noqa: BLE001 — MaxPosterError или сетевой сбой
+        if not isinstance(e, MaxPosterError):
+            logger.exception("Ошибка обновления оценки %s из MaxPoster", appraisal_id)
         await callback.answer(
             text=f"Не удалось обновить данные из MaxPoster ({e}). Проверьте оценку и нажмите кнопку ещё раз.",
             keyboard=review_kb(),
@@ -978,11 +1024,26 @@ async def _handle_adjustment_input(message, token: str, deal: dict, bot):
     """Обрабатывает ответ согласующего на вопрос о новой цене/ПЦП после
     нажатия «Согласовано с корректировкой» (личным сообщением боту)."""
     field = deal.get("awaiting_field")
-    text = (message.body.text or "").strip()
+    text = _text(message)
+
+    if text.lower() in ("отмена", "cancel", "/cancel"):
+        # Возвращаем сделку на прежний этап и заново публикуем карточку с кнопками
+        # (старая карточка после нажатия «с корректировкой» осталась без кнопок).
+        prev_stage = deal.get("stage_before_adjust") or "salon_pending"
+        deals_store.update_deal(token, stage=prev_stage,
+                                 awaiting_input_from=None, awaiting_field=None, stage_before_adjust=None)
+        kb = uk_approval_kb(token) if prev_stage == "uk_pending" else deal_approval_kb(token)
+        salon_chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
+        reposted = bool(salon_chat_id) and await _send_to_chat(bot, salon_chat_id, _deal_card_text(deal), keyboard=kb)
+        if not reposted:
+            await message.answer(text=_deal_card_text(deal), keyboard=kb)
+        await message.answer(text="Корректировка отменена, карточка согласования отправлена заново.")
+        return
+
     try:
-        value = float(text.replace(" ", "").replace(",", "."))
+        value = _parse_positive(text)
     except ValueError:
-        await message.answer(text="Не понял число, введите ещё раз (например: 950000)")
+        await message.answer(text="Не понял сумму, введите ещё раз (например: 950000) или «отмена»")
         return
 
     if field == "price":
@@ -1009,10 +1070,16 @@ async def _handle_adjustment_input(message, token: str, deal: dict, bot):
 
 async def _request_adjustment(bot, callback, token: str, deal: dict, source: str) -> None:
     user_id = _get_user_id(callback)
-    deals_store.update_deal(token, awaiting_input_from=user_id, awaiting_field="price", awaiting_source=source)
     card = _deal_card_text(deal)
-    sent = await _send_to_user(bot, user_id, "Введите новую цену выкупа клиенту (₽):")
+    sent = await _send_to_user(
+        bot, user_id, "Введите новую цену выкупа клиенту (₽) или «отмена», чтобы вернуть карточку:"
+    )
     if sent:
+        # Пока идёт корректировка, остальные кнопки карточки неактивны —
+        # иначе сделку успеют согласовать и отправить в ПАЦ параллельно.
+        deals_store.update_deal(token, awaiting_input_from=user_id, awaiting_field="price",
+                                 awaiting_source=source, stage_before_adjust=deal.get("stage"),
+                                 stage="adjusting")
         await callback.answer(text=card + "\n\n🔄 Ожидается ввод новой цены — проверьте личные сообщения от бота.")
     else:
         await callback.answer(notification="Не удалось написать вам лично. Напишите боту что-нибудь в личку и нажмите ещё раз.")
@@ -1036,7 +1103,7 @@ async def on_deal_approve(callback, bot):
     dealer_name = deal.get("dealer_name")
     approvers = approval_hierarchy.get_first_stage_approvers(dealer_name, status)
     logger.info("[approve] token=%s user=%s dealer=%r status=%r approvers=%s", token, user_id, dealer_name, status, approvers)
-    if approvers and user_id not in approvers:
+    if not _can_approve(user_id, approvers):
         role_hint = " (нужен ДДЦ)" if status == "Согласование УК" else ""
         logger.info("[approve] token=%s отклонён: user=%s нет в approvers", token, user_id)
         await callback.answer(notification=f"У вас нет прав согласовывать сделку со статусом «{status}»{role_hint}.")
@@ -1062,7 +1129,7 @@ async def on_deal_adjust(callback, bot):
     user_id = _get_user_id(callback)
     status = deal.get("approval_status")
     approvers = approval_hierarchy.get_first_stage_approvers(deal.get("dealer_name"), status)
-    if approvers and user_id not in approvers:
+    if not _can_approve(user_id, approvers):
         role_hint = " (нужен ДДЦ)" if status == "Согласование УК" else ""
         await callback.answer(notification=f"У вас нет прав согласовывать сделку со статусом «{status}»{role_hint}.")
         return
@@ -1083,7 +1150,7 @@ async def on_deal_decline(callback, bot):
 
     user_id = _get_user_id(callback)
     approvers = approval_hierarchy.get_first_stage_approvers(deal.get("dealer_name"), deal.get("approval_status"))
-    if approvers and user_id not in approvers:
+    if not _can_approve(user_id, approvers):
         await callback.answer(notification=f"У вас нет прав отклонять сделку со статусом «{deal.get('approval_status')}».")
         return
 
@@ -1107,7 +1174,7 @@ async def on_uk_approve(callback, bot):
 
     user_id = _get_user_id(callback)
     uk_ids = approval_hierarchy.get_uk_approvers(deal.get("dealer_name"))
-    if uk_ids and user_id not in uk_ids:
+    if not _can_approve(user_id, uk_ids):
         await callback.answer(notification="У вас нет прав согласовывать эту сделку (нужен УК).")
         return
 
@@ -1128,7 +1195,7 @@ async def on_uk_adjust(callback, bot):
 
     user_id = _get_user_id(callback)
     uk_ids = approval_hierarchy.get_uk_approvers(deal.get("dealer_name"))
-    if uk_ids and user_id not in uk_ids:
+    if not _can_approve(user_id, uk_ids):
         await callback.answer(notification="У вас нет прав согласовывать эту сделку (нужен УК).")
         return
 
@@ -1148,7 +1215,7 @@ async def on_uk_decline(callback, bot):
 
     user_id = _get_user_id(callback)
     uk_ids = approval_hierarchy.get_uk_approvers(deal.get("dealer_name"))
-    if uk_ids and user_id not in uk_ids:
+    if not _can_approve(user_id, uk_ids):
         await callback.answer(notification="У вас нет прав отклонять эту сделку (нужен УК).")
         return
 
@@ -1181,7 +1248,7 @@ async def _send_pats_request(callback, bot, kind: str) -> None:
 
     user_id = _get_user_id(callback)
     pats_approvers = approval_hierarchy.get_pats_approvers()
-    if pats_approvers and user_id not in pats_approvers:
+    if not _can_approve(user_id, pats_approvers):
         await callback.answer(notification="У вас нет прав отправлять такие запросы.")
         return
 
@@ -1221,7 +1288,7 @@ async def on_pats_done(callback, bot):
 
     user_id = _get_user_id(callback)
     pats_approvers = approval_hierarchy.get_pats_approvers()
-    if pats_approvers and user_id not in pats_approvers:
+    if not _can_approve(user_id, pats_approvers):
         await callback.answer(notification="У вас нет прав подтверждать приёмку в ПАЦ.")
         return
 
@@ -1364,7 +1431,7 @@ async def on_free_text(message, state: FSMContext, bot):
 
 @router.message(StateFilter(AppraisalStates.waiting_link))
 async def on_waiting_link(message, state: FSMContext, bot):
-    text = (message.body.text or "").strip()
+    text = _text(message)
     manager_name = getattr(message.sender, "first_name", None) or str(message.sender.user_id)
 
     if text.lower() in ("вручную", "manual"):
@@ -1373,9 +1440,15 @@ async def on_waiting_link(message, state: FSMContext, bot):
         await message.answer(text="Введите ВИН авто:")
         return
 
+    if not text:
+        await message.answer(text="Пришлите ссылку на оценку, VIN или номер сделки текстом, либо напишите «вручную».")
+        return
+
     try:
         data = await asyncio.to_thread(fetch_appraisal, text)
-    except MaxPosterError as e:
+    except Exception as e:  # noqa: BLE001 — MaxPosterError или сетевой сбой
+        if not isinstance(e, MaxPosterError):
+            logger.exception("Ошибка запроса к MaxPoster: %r", text)
         await message.answer(
             text=(
                 f"Не получилось найти оценку ({e}).\n"
@@ -1433,16 +1506,19 @@ async def on_waiting_link(message, state: FSMContext, bot):
 
 @router.message(StateFilter(AppraisalStates.manual_vin))
 async def on_manual_vin(message, state: FSMContext, bot):
-    await state.update_data(vin=message.body.text.strip())
+    vin = _text(message).upper()
+    if not vin:
+        await message.answer(text="Пришлите ВИН текстом:")
+        return
+    await state.update_data(vin=vin)
     await state.set_state(AppraisalStates.manual_avito)
     await message.answer(text="Введите прогнозную Авито-оценку (число, ₽):")
 
 
 @router.message(StateFilter(AppraisalStates.manual_avito))
 async def on_manual_avito(message, state: FSMContext, bot):
-    text = message.body.text.strip()
     try:
-        avito_price = float(text.replace(" ", "").replace(",", "."))
+        avito_price = _parse_positive(_text(message))
     except ValueError:
         await message.answer(text="Не понял число, попробуйте ещё раз (например: 1200000)")
         return
@@ -1533,7 +1609,7 @@ async def _handle_negotiated(text: str, state: FSMContext, answer_fn, bot):
 
 @router.message(StateFilter(AppraisalStates.waiting_planned_sale_price))
 async def on_planned_sale_price(message, state: FSMContext, bot):
-    await _handle_planned_sale_price(message.body.text, state, message.answer, bot)
+    await _handle_planned_sale_price(_text(message), state, message.answer, bot)
 
 
 @router.message_callback(F.payload == "skip_planned", StateFilter(AppraisalStates.waiting_planned_sale_price))
@@ -1543,7 +1619,7 @@ async def on_planned_sale_price_skip(callback, state: FSMContext, bot):
 
 @router.message(StateFilter(AppraisalStates.waiting_negotiated))
 async def on_waiting_negotiated(message, state: FSMContext, bot):
-    await _handle_negotiated(message.body.text, state, message.answer, bot)
+    await _handle_negotiated(_text(message), state, message.answer, bot)
 
 
 @router.message_callback(F.payload == "skip_negotiated", StateFilter(AppraisalStates.waiting_negotiated))
