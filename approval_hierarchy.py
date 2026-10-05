@@ -7,18 +7,24 @@
 Google Таблице, что и история оценок. Формат вкладки (первая строка —
 заголовки, должны совпадать буквально):
 
-Салон | РОП ID | РОП Имя | ДДЦ ID | ДДЦ Имя | УК ID | УК Имя
+Салон | РОП ID | РОП Имя | ДДЦ ID | ДДЦ Имя | УК ID | УК Имя | Город
+
+"Город" (необязательно) — город салона для расчёта ПЦП: один из городов
+вкладки «Параметры Метрики v2» или группа салонов вроде «Тойота». Если
+пусто — бот определит город по названию салона, а если не сможет —
+спросит у оценщика кнопками.
 
 "Салон" — название точно как dealer.companyName в MaxPoster (то же самое,
 что вы указывали в /register_salon). ID — числовые ID пользователей MAX
 (команда /myid). Имя — просто для наглядности, ботом не используется.
 
-Правило допуска на первом этапе (в чате салона):
-  - "Согласование РОП" -> РОП, ДДЦ, УК могут одобрить
-  - "Согласование ДДЦ" -> ДДЦ, УК могут одобрить
-  - "Согласование УК"  -> ТОЛЬКО ДДЦ может одобрить на этом этапе
+Правило допуска на первом этапе (в чате салона), статусы метрики v2.0:
+  - "Согласовано"                     -> РОП, ДДЦ, УК могут одобрить
+  - "Согласование ДДЦ"                -> ДДЦ, УК могут одобрить
+  - "Согласование УК", "Согласование УК (выше потолка)", "Не принимать"
+                                      -> ТОЛЬКО ДДЦ может одобрить на этом этапе
 
-Для статуса "Согласование УК" после одобрения ДДЦ идёт ВТОРОЙ этап —
+Для статусов УК после одобрения ДДЦ идёт ВТОРОЙ этап —
 персональное согласование от сотрудника с ролью УК (личным сообщением,
 см. get_uk_approvers), и только после этого сделка уходит в ПАЦ. Это
 сделано специально, чтобы салон не мог обойти ДДЦ и получить одобрение
@@ -40,12 +46,13 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from dealer_chats import normalize_salon_name
+from pricing_engine import STATUS_DDC, UK_STATUSES
 
 from config import GOOGLE_SERVICE_ACCOUNT_FILE, GOOGLE_SHEET_ID
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TAB_NAME = "Иерархия согласования"
-HEADER = ["Салон", "РОП ID", "РОП Имя", "ДДЦ ID", "ДДЦ Имя", "УК ID", "УК Имя"]
+HEADER = ["Салон", "РОП ID", "РОП Имя", "ДДЦ ID", "ДДЦ Имя", "УК ID", "УК Имя", "Город"]
 
 ROWS_CACHE_TTL_SECONDS = 60
 
@@ -120,13 +127,11 @@ def get_first_stage_approvers(dealer_name: Optional[str], status: Optional[str])
         ddc_ids = _ids_from_cell(row.get("ДДЦ ID"))
         uk_ids = _ids_from_cell(row.get("УК ID"))
 
-        if status == "Согласование РОП":
-            return rop_ids | ddc_ids | uk_ids
-        if status == "Согласование ДДЦ":
+        if status == STATUS_DDC:
             return ddc_ids | uk_ids
-        if status == "Согласование УК":
+        if status in UK_STATUSES:
             return ddc_ids  # только ДДЦ на первом этапе!
-        return rop_ids | ddc_ids | uk_ids
+        return rop_ids | ddc_ids | uk_ids  # "Согласовано" (и старое "Согласование РОП")
 
     return set()  # салон не найден на вкладке
 
@@ -146,6 +151,21 @@ def get_uk_approvers(dealer_name: Optional[str]) -> set:
         return _ids_from_cell(row.get("УК ID"))
 
     return set()
+
+
+def get_salon_city(dealer_name: Optional[str]) -> Optional[str]:
+    """Город салона из колонки «Город» (пусто/нет колонки/ошибка чтения -> None)."""
+    if not dealer_name:
+        return None
+    try:
+        rows = _get_rows()
+    except Exception as e:  # noqa: BLE001
+        print(f"[approval_hierarchy] Не удалось прочитать вкладку «{TAB_NAME}»: {e}", flush=True)
+        return None
+    for row in rows:
+        if normalize_salon_name(row.get("Салон", "")) == normalize_salon_name(dealer_name):
+            return str(row.get("Город") or "").strip() or None
+    return None
 
 
 def get_pats_approvers() -> set:

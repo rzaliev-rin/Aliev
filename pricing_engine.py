@@ -1,29 +1,39 @@
 # -*- coding: utf-8 -*-
 """
-Модуль расчёта выкупной цены автомобиля в трейд-ин.
+Модуль расчёта выкупной цены автомобиля в трейд-ин — метрика закупки АСП v2.0.
 
 Логика 1-в-1 повторяет формулы из файла
-"Метрики_приёма_06_2026_.xlsx" (лист "Метрика оценки").
+"Метрики приёма v2.0 24.09.2026 Экспокар.xlsx" (лист "Метрика оценки"),
+в комментариях указаны ячейки. Главное правило:
+    закупка = ПЦП − плановая ВП − переподготовка (но не выше потолка к Авито Оценке).
 
-Все "магические числа" (баллы, коэффициенты, ценовые диапазоны)
-вынесены в константы ниже — если в компании поменяют условия,
-достаточно поправить эти таблицы, код трогать не нужно.
+Все нормы (баллы, пробег, ПЦП по городам, доходность, потолок, GM2) берутся
+из pricing_config.get_params() — их можно менять в Google Таблице без правки кода.
 """
 
-from dataclasses import dataclass, field
+import datetime
+from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 from typing import Optional
 
 import pricing_config
 
-
-# =====================================================================
-# 1. СПРАВОЧНИКИ ДЛЯ ОПРЕДЕЛЕНИЯ КАТЕГОРИИ (A/B/C)
-#    Актуальные значения читаются из Google Таблицы (вкладка "Параметры
-#    Метрики") через pricing_config — значения ниже используются только
-#    как запасной вариант, если таблица недоступна.
-# =====================================================================
+METRIC_VERSION = pricing_config.METRIC_VERSION
 
 RECEPTION_TYPES = ["Trade-In", "Trade-Up", "Выкуп с улицы", "Trade-In на ПИ"]
+STREET_BUYOUT = "Выкуп с улицы"
+
+# Статусы согласования (ячейка D12)
+STATUS_OK = "Согласовано"
+STATUS_DDC = "Согласование ДДЦ"
+STATUS_UK = "Согласование УК"
+STATUS_UK_CEILING = "Согласование УК (выше потолка)"
+STATUS_REJECT = "Не принимать"
+# Статусы, которые решает УК (первый этап в чате салона — ДДЦ, затем УК лично)
+UK_STATUSES = {STATUS_UK, STATUS_UK_CEILING, STATUS_REJECT}
+
+EXTRA_YOUNG_CAR = "Возраст авто до 2х лет"
+EXTRA_NOT_APPLICABLE = "Не применимо"
 
 
 def colors_bucket_from_count(count: int) -> str:
@@ -48,26 +58,96 @@ def get_extra_options() -> list:
     return list(pricing_config.get_params()["extra_score"].keys())
 
 
-def calc_category(colors: str, condition: str, extra: str) -> tuple[str, int]:
-    """Возвращает (категория, сумма_баллов). Аналог B4/K5 в Excel."""
+def get_city_options() -> list:
+    """Города + группы салонов со своими коэффициентами (например, «Тойота»)."""
+    params = pricing_config.get_params()
+    return list(params["city_ptsp"].keys()) + list(params["city_aliases"].keys())
+
+
+def ptsp_city(city: Optional[str]) -> Optional[str]:
+    """Город, чьи коэффициенты ПЦП применяются: «Тойота» -> «Краснодар», «Казань» -> «Казань»."""
+    alias = pricing_config.get_params()["city_aliases"].get(city or "")
+    return alias["city"] if alias else city
+
+
+def city_from_salon_name(dealer_name: Optional[str]) -> Optional[str]:
+    """Определяет город (или группу салонов вроде «Тойота») по названию салона
+    из MaxPoster. Сначала — группы салонов по ключевым словам (салон Тойота в
+    Казани всё равно считается по коэффициентам Краснодара), затем — название
+    города в тексте (без учёта регистра и окончания: «Казани», «Тюмени»)."""
+    if not dealer_name:
+        return None
+    text = str(dealer_name).lower().replace("ё", "е")
+    params = pricing_config.get_params()
+    for alias, rule in params["city_aliases"].items():
+        if any(k and k in text for k in rule.get("keywords") or []):
+            return alias
+    for city in params["city_ptsp"]:
+        name = city.lower().replace("ё", "е")
+        stem = name[:-1] if len(name) > 5 else name
+        if stem in text:
+            return city
+    return None
+
+
+def car_age_years(year: Optional[int], today: Optional[datetime.date] = None) -> Optional[int]:
+    if not year:
+        return None
+    today = today or datetime.date.today()
+    return today.year - int(year)
+
+
+def is_young_car(year: Optional[int], today: Optional[datetime.date] = None) -> bool:
+    """«Возраст авто до 2х лет»: разница «текущий год − год выпуска» меньше 2."""
+    age = car_age_years(year, today)
+    return age is not None and age < 2
+
+
+def _excel_round(x: float, digits: int) -> float:
+    """ROUND() как в Excel — половина округляется от нуля (в отличие от round() в Python)."""
+    q = Decimal(1).scaleb(-digits)
+    return float(Decimal(str(x)).quantize(q, rounding=ROUND_HALF_UP))
+
+
+def _excel_rounddown(x: float, digits: int) -> float:
+    """ROUNDDOWN() как в Excel — к нулю."""
+    q = Decimal(1).scaleb(-digits)
+    return float(Decimal(str(x)).quantize(q, rounding=ROUND_DOWN))
+
+
+def mileage_per_year(year: int, mileage: float, today: Optional[datetime.date] = None) -> float:
+    """E3 = ROUND(пробег / MAX(1, текущий год − год выпуска), 0)."""
+    today = today or datetime.date.today()
+    return _excel_round(mileage / max(1, today.year - int(year)), 0)
+
+
+def mileage_points(per_year: float) -> int:
+    """K4: баллы за пробег в год."""
+    for up_to, points in pricing_config.get_params()["mileage_score"]:
+        if per_year <= up_to:
+            return points
+    return 0
+
+
+def calc_category(colors: str, condition: str, extra: str, per_year: float) -> tuple[str, int]:
+    """Возвращает (категория, сумма_баллов). Аналог B4/K5."""
     params = pricing_config.get_params()
     score = (
         params["colors_score"].get(colors, 0)
         + params["condition_score"].get(condition, 0)
         + params["extra_score"].get(extra, 0)
+        + mileage_points(per_year)
     )
     for name, threshold in params["category_thresholds"]:
         if score >= threshold:
             return name, score
-    return "Ошибка", score  # практически недостижимо
+    return "Категория С", score
 
 
 def _vlookup_tier(price: float, tiers):
     """
-    Аналог VLOOKUP(price, диапазон, ..., 1) — приближённый поиск.
-    Возвращает (доходность, мин.доход) для тарифной строки, в которую
-    попадает price (по нижней границе диапазона, как это делает Excel
-    с приближённым VLOOKUP).
+    Аналог VLOOKUP(price, диапазон, ..., 1) — приближённый поиск по нижней
+    границе ценовой группы. Возвращает (доходность, мин.доход).
     """
     match = tiers[0]
     for row in tiers:
@@ -79,135 +159,145 @@ def _vlookup_tier(price: float, tiers):
     return rate, min_income
 
 
-def calc_gross_margin(avito_price: float, category: str, reception_type: str) -> float:
-    """
-    Аналог формулы B11 (валовая прибыль с НДС).
-    """
+def calc_gross_margin(ptsp: float, category: str, reception_type: str) -> float:
+    """B13: плановая валовая прибыль с НДС — от ПЦП (не от Авито Оценки)."""
     params = pricing_config.get_params()
 
     def tiered_value(tiers):
-        rate, min_income = _vlookup_tier(avito_price, tiers)
-        candidates = [avito_price * rate]
-        if min_income is not None:
-            candidates.append(min_income)
-        return max(candidates)
+        rate, min_income = _vlookup_tier(ptsp, tiers)
+        return max(ptsp * rate, min_income or 0)
 
-    if reception_type == "Trade-In" and category == "Категория А":
+    if reception_type in ("Trade-In", "Trade-Up") and category == "Категория А":
         return tiered_value(params["tradein_cat_a_tiers"])
 
-    # иначе — как в оригинальной формуле: берём максимум из
-    # (тарифной таблицы B/C) и (плоской ставки по типу приёма, если применимо)
     candidates = [tiered_value(params["tradein_cat_bc_tiers"])]
-
-    flat_rates = params["flat_rates"]
-    if reception_type in flat_rates:
-        fr = flat_rates[reception_type]
-        candidates.append(max(avito_price * fr["доходность"], fr["мин.доход"]))
-    else:
-        candidates.append(0)
-
+    fr = params["flat_rates"].get(reception_type)
+    candidates.append(max(ptsp * fr["доходность"], fr["мин.доход"]) if fr else 0)
     return max(candidates)
 
 
 # =====================================================================
-# 4. ОСНОВНОЙ РАСЧЁТ
+# ОСНОВНОЙ РАСЧЁТ
 # =====================================================================
 
 @dataclass
 class AppraisalInput:
-    avito_price: float          # "Авито Оценка" (B6) — прогнозная цена из стороннего приложения
-    reception_type: str         # "Тип приема" (B7)
-    colors: str                 # "Окрасы" (B1)
-    condition: str              # "Тех. состояние" (B2)
-    extra: str                  # "Доп. данные" (B3)
-    negotiated_price: Optional[float] = None   # "Прогноз ДЦ" -> Закупка (C12), цена, о которой договорились с клиентом
-    refurbishment_cost: float = 0.0            # "Переподготовка" (C13)
-    manager_resale_forecast: Optional[float] = None
-    # "Прогноз ДЦ" -> Планируемая цена продажи (C10) — собственный прогноз
-    # менеджера по цене перепродажи. Если не указан, по умолчанию берётся
-    # системный расчёт (B10), как в Excel предполагается ручной ввод.
+    avito_price: float          # B8 "Авито Оценка" на день осмотра
+    reception_type: str         # B9 "Тип приема"
+    colors: str                 # B1 "Окрасы"
+    condition: str              # B2 "Тех. состояние"
+    extra: str                  # B3 "Доп. данные"
+    city: Optional[str] = None  # B10 "ГОРОД"
+    year: Optional[int] = None  # E1 "Год выпуска"
+    mileage: Optional[float] = None  # E2 "Пробег, км"
+    negotiated_price: Optional[float] = None   # C14 "Прогноз ДЦ: закупка" — цена, о которой договорились с клиентом
+    refurbishment_cost: float = 0.0            # C15 "Переподготовка"
+    manager_resale_forecast: Optional[float] = None  # C12 "Прогноз ДЦ: цена продажи" (если не задан — ПЦП по метрике)
 
 
 @dataclass
 class AppraisalResult:
     category: str
     score: int
-    planned_sale_price_rop: float      # B10
-    planned_sale_price_ddc: float      # E10
-    gross_margin_rop: float            # B11
-    gross_margin_ddc: float            # E11
-    purchase_price_rop: float          # B12 — рекомендованный потолок закупки (уровень РОП)
-    purchase_price_ddc: float          # E12 — потолок закупки при согласовании ДДЦ
-    refurbishment: float               # B13/E13
-    gm2_rop: float                     # B14
-    gm2_ddc: float                     # E14
-    negotiated_price: Optional[float]  # C12, если менеджер указал цену
-    approval_status: Optional[str]     # D10-аналог, если negotiated_price задан
-    manager_resale_forecast: Optional[float]  # C10 (введённый или дефолтный = B10)
-    margin_negotiated: Optional[float]        # C11
-    gm2_negotiated: Optional[float]    # C14, если negotiated_price задан
+    mileage_per_year: float            # E3
+    ceiling_coef: float                # E4
+    ceiling_price: float               # E5 — потолок закупки к Авито Оценке
+    planned_sale_price_rop: float      # B12 — ПЦП по метрике
+    planned_sale_price_ddc: float      # E12 — ПЦП с полномочиями ДДЦ
+    gross_margin_rop: float            # B13
+    gross_margin_ddc: float            # E13 = B13
+    purchase_price_rop: float          # B14 — лимит закупки РОП
+    purchase_price_ddc: float          # E14 — предел ДДЦ
+    refurbishment: float               # B15/E15 = C15
+    gm2_rop: float                     # B16
+    gm2_ddc: float                     # E16
+    negotiated_price: Optional[float]  # C14
+    approval_status: Optional[str]     # D12 (если задан C14)
+    manager_resale_forecast: Optional[float]  # C12 (введённый или = B12)
+    margin_negotiated: Optional[float]        # C13 = C12 − C14 − C15
+    gm2_negotiated: Optional[float]    # C16
+
+    @property
+    def can_accept(self) -> bool:
+        """False = лимит закупки 0 (ВП больше, чем позволяет ПЦП) → «Не принимать»."""
+        return self.purchase_price_rop > 0
 
 
-def calc_appraisal(data: AppraisalInput) -> AppraisalResult:
-    category, score = calc_category(data.colors, data.condition, data.extra)
-
+def calc_appraisal(data: AppraisalInput, today: Optional[datetime.date] = None) -> AppraisalResult:
     params = pricing_config.get_params()
-    coef = params["ptsp_coef"].get(category, {"РОП": 0, "ДДЦ": 0})
-    planned_rop = data.avito_price * coef["РОП"]   # B10
-    planned_ddc = data.avito_price * coef["ДДЦ"]   # E10
+    coef_city = ptsp_city(data.city)
+    if not coef_city or coef_city not in params["city_ptsp"]:
+        raise ValueError("Не выбран город")
+    if not data.year or data.mileage is None:
+        raise ValueError("Не заполнены год выпуска или пробег")
 
-    gross_margin_rop = calc_gross_margin(data.avito_price, category, data.reception_type)  # B11
-    gross_margin_ddc = gross_margin_rop  # E11 = B11 в оригинале
+    per_year = mileage_per_year(data.year, data.mileage, today)                       # E3
+    category, score = calc_category(data.colors, data.condition, data.extra, per_year)  # B4, K5
+    street = data.reception_type == STREET_BUYOUT
 
-    refurb = data.refurbishment_cost  # B13 = C13, E13 = C13
+    # E4/E5: потолок закупки к Авито Оценке
+    ceiling_coef = params["ceiling"].get(category, {}).get("street" if street else "default", 0)
+    ceiling_price = _excel_rounddown(data.avito_price * ceiling_coef, -3)
 
-    # B12 = ROUND(B10 - B11 - C13, -3), минимум 5000, если результат < 0
-    raw_rop = round((planned_rop - gross_margin_rop - refurb) / 1000) * 1000
-    purchase_rop = raw_rop if raw_rop >= 0 else 5000
+    # B12/E12: ПЦП = Авито Оценка × (коэф. города и категории − поправка выкупа [+ п.п. ДДЦ])
+    coef = params["city_ptsp"][coef_city].get(category, 0)
+    if street:
+        coef -= params["street_ptsp_minus"].get(category, 0)
+    planned_rop = data.avito_price * coef
+    planned_ddc = data.avito_price * (coef + params["ddc_ptsp_bonus"])
 
-    # E12 = E10 - B11 - C13  (в оригинале без округления и без пола в 5000)
-    purchase_ddc = planned_ddc - gross_margin_rop - refurb
+    gross_margin = calc_gross_margin(planned_rop, category, data.reception_type)  # B13 (= E13)
+    refurb = data.refurbishment_cost or 0.0                                        # C15
 
-    def gm2(purchase_price: float, margin: float) -> float:
-        # GM2 = margin - refurb - fixed_1 - (purchase * rate%) * multiplier - fixed_2
-        f = params["gm2_formula"]
-        rate = f["purchase_rate"]
-        return margin - refurb - f["fixed_1"] - (purchase_price * rate) * f["purchase_rate_multiplier"] - f["fixed_2"]
+    # B14 = MAX(0, MIN(ROUND(B12 − B13 − C15, −3), E5))
+    purchase_rop = max(0.0, min(_excel_round(planned_rop - gross_margin - refurb, -3), ceiling_price))
+    # E14 = MAX(0, MIN(E12 − B13 − C15, E5)) — без округления, как в файле
+    purchase_ddc = max(0.0, min(planned_ddc - gross_margin - refurb, ceiling_price))
 
-    gm2_rop = gm2(purchase_rop, gross_margin_rop)     # B14
-    gm2_ddc = gm2(purchase_ddc, gross_margin_ddc)     # E14
+    f = params["gm2_formula"]
+
+    def gm2(margin_after_refurb: float, purchase_price: float) -> float:
+        # GM2 = ВП − переподготовка − 15 000 − закупка × 1,75% × 1,5 − 40 000
+        return (margin_after_refurb - f["fixed_1"]
+                - (purchase_price * f["purchase_rate"]) * f["purchase_rate_multiplier"] - f["fixed_2"])
+
+    gm2_rop = gm2(gross_margin - refurb, purchase_rop)  # B16
+    gm2_ddc = gm2(gross_margin - refurb, purchase_ddc)  # E16
 
     approval_status = None
-    gm2_negotiated = None
-    margin_negotiated = None
     manager_resale_forecast = None
+    margin_negotiated = None
+    gm2_negotiated = None
     if data.negotiated_price is not None:
-        # D10: сравнение цены, согласованной с клиентом (C12), с потолками B12 / E12
-        if data.negotiated_price <= purchase_rop:
-            approval_status = "Согласование РОП"
-        elif data.negotiated_price <= purchase_ddc:
-            approval_status = "Согласование ДДЦ"
+        c14 = data.negotiated_price
+        # D12: проверки сверху вниз, срабатывает первая подходящая
+        if purchase_rop <= 0:
+            approval_status = STATUS_REJECT
+        elif c14 > ceiling_price:
+            approval_status = STATUS_UK_CEILING
+        elif c14 <= purchase_rop:
+            approval_status = STATUS_OK
+        elif c14 <= purchase_ddc:
+            approval_status = STATUS_DDC
         else:
-            approval_status = "Согласование УК"
+            approval_status = STATUS_UK
 
-        # C10: если менеджер не задал свой прогноз цены перепродажи, берём системный B10
         manager_resale_forecast = (
-            data.manager_resale_forecast
-            if data.manager_resale_forecast is not None
-            else planned_rop
+            data.manager_resale_forecast if data.manager_resale_forecast is not None else planned_rop
         )
-        # C11 = C10 - C12 - C13
-        margin_negotiated = manager_resale_forecast - data.negotiated_price - refurb
-        # C14 = C11 - C13 - fixed_1 - (C12*rate%)*multiplier - fixed_2
-        gm2_negotiated = gm2(data.negotiated_price, margin_negotiated)
+        margin_negotiated = manager_resale_forecast - c14 - refurb   # C13 = C12 − C14 − C15
+        gm2_negotiated = gm2(margin_negotiated, c14)                  # C16 (C13 уже без переподготовки)
 
     return AppraisalResult(
         category=category,
         score=score,
+        mileage_per_year=per_year,
+        ceiling_coef=ceiling_coef,
+        ceiling_price=ceiling_price,
         planned_sale_price_rop=planned_rop,
         planned_sale_price_ddc=planned_ddc,
-        gross_margin_rop=gross_margin_rop,
-        gross_margin_ddc=gross_margin_ddc,
+        gross_margin_rop=gross_margin,
+        gross_margin_ddc=gross_margin,
         purchase_price_rop=purchase_rop,
         purchase_price_ddc=purchase_ddc,
         refurbishment=refurb,

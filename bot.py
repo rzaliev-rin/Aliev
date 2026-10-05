@@ -27,6 +27,7 @@
 Запуск: python bot.py  (long polling, доп. настройка вебхука не нужна)
 """
 import asyncio
+import datetime
 import logging
 from typing import Optional
 from types import SimpleNamespace
@@ -44,7 +45,9 @@ from maxgram.utils.keyboard import InlineKeyboardBuilder
 from config import MAX_BOT_TOKEN, ALLOWED_USER_IDS, ADMIN_USER_IDS, OWNER_USER_ID
 from pricing_engine import (
     AppraisalInput, calc_appraisal, colors_bucket_from_count,
-    get_colors_options, get_condition_options, get_extra_options, RECEPTION_TYPES,
+    get_colors_options, get_condition_options, get_extra_options, get_city_options, RECEPTION_TYPES,
+    city_from_salon_name, ptsp_city, is_young_car, UK_STATUSES, STATUS_REJECT,
+    EXTRA_YOUNG_CAR, EXTRA_NOT_APPLICABLE, METRIC_VERSION,
 )
 from maxposter_client import fetch_appraisal, MaxPosterError
 from sheets_logger import log_appraisal
@@ -72,6 +75,9 @@ class AppraisalStates(StatesGroup):
     manual_vin = State()
     manual_avito = State()
     reception_type = State()
+    city = State()
+    year = State()
+    mileage = State()
     colors = State()
     condition = State()
     extra = State()
@@ -113,18 +119,29 @@ def _maxposter_link(appraisal_id) -> Optional[str]:
     return f"https://app.maxposter.ru/holding/used/appraisals/{appraisal_id}/view"
 
 
+def _city_label(city: Optional[str]) -> str:
+    """«Казань» или «Тойота → коэффициенты города Краснодар»."""
+    if not city:
+        return "—"
+    coef_city = ptsp_city(city)
+    return city if coef_city == city else f"{city} → коэффициенты города {coef_city}"
+
+
 def _vehicle_header(vehicle_info: dict, reception_type: Optional[str] = None) -> str:
-    """Шапка с типом контракта, авто и ссылкой на оценку — идёт в начале
-    и итогового расчёта, и карточки согласования."""
+    """Шапка с городом, типом контракта, авто и ссылкой на оценку — идёт в начале
+    и итогового расчёта, и карточки согласования. Город — первой строкой:
+    по правилам метрики согласующий первым делом проверяет город."""
     vehicle_line = " ".join(
         str(x) for x in [vehicle_info.get("brand"), vehicle_info.get("model"), vehicle_info.get("year")] if x
     )
     lines = []
+    if vehicle_info.get("city"):
+        lines.append(f"🏙 ГОРОД: {_city_label(vehicle_info['city'])}")
     if reception_type:
         lines.append(f"Тип контракта: {reception_type}")
     if vehicle_line:
         lines.append(vehicle_line)
-    if vehicle_info.get("mileage"):
+    if vehicle_info.get("mileage") is not None:
         lines.append(f"Пробег: {_fmt(vehicle_info['mileage'])} км")
     link = _maxposter_link(vehicle_info.get("appraisal_id"))
     if link:
@@ -132,23 +149,76 @@ def _vehicle_header(vehicle_info: dict, reception_type: Optional[str] = None) ->
     return "\n".join(lines)
 
 
+def _appraisal_input(data: dict) -> AppraisalInput:
+    """Входные данные расчёта из состояния диалога (всё, что подтянули из
+    MaxPoster или ввёл оценщик)."""
+    return AppraisalInput(
+        avito_price=data["avito_price"],
+        reception_type=data["reception_type"],
+        colors=data["colors"],
+        condition=data["condition"],
+        extra=data["extra"],
+        city=data.get("city"),
+        year=data.get("year"),
+        mileage=data.get("mileage"),
+        refurbishment_cost=data.get("presale_preparation_cost") or 0.0,
+        manager_resale_forecast=data.get("manager_resale_forecast"),
+        negotiated_price=data.get("negotiated_price"),
+    )
+
+
+def _metrics(result) -> dict:
+    """Ключевые цифры расчёта — сохраняются в сделке для карточек согласования."""
+    return {
+        "version": METRIC_VERSION,
+        "score": result.score,
+        "mileage_per_year": result.mileage_per_year,
+        "ptsp_rop": result.planned_sale_price_rop,
+        "ptsp_ddc": result.planned_sale_price_ddc,
+        "gross_margin": result.gross_margin_rop,
+        "limit_rop": result.purchase_price_rop,
+        "limit_ddc": result.purchase_price_ddc,
+        "ceiling": result.ceiling_price,
+        "refurbishment": result.refurbishment,
+    }
+
+
+def _metrics_lines(metrics: dict) -> list:
+    if not metrics:
+        return []
+    return [
+        f"ПЦП по метрике: {_fmt(metrics.get('ptsp_rop'))} ₽ (ДДЦ: {_fmt(metrics.get('ptsp_ddc'))} ₽)",
+        f"Плановая ВП: {_fmt(metrics.get('gross_margin'))} ₽",
+        f"Лимит РОП: {_fmt(metrics.get('limit_rop'))} ₽ | Предел ДДЦ: {_fmt(metrics.get('limit_ddc'))} ₽",
+        f"Потолок к Авито: {_fmt(metrics.get('ceiling'))} ₽",
+    ]
+
+
 def _result_text(result, avito_price: float, extra_info: dict, vehicle_info: dict, reception_type: Optional[str] = None) -> str:
     header = _vehicle_header(vehicle_info, reception_type)
     lines = [header, ""] if header else []
     lines += [
-        f"Категория: {result.category} (баллы: {result.score})",
+        f"Категория: {result.category} (баллы: {result.score}, пробег в год: {_fmt(result.mileage_per_year)} км)",
         f"Авито-оценка: {_fmt(avito_price)} ₽",
         "",
-        "Плановая цена продажи (расчёт системы):",
-        f"  РОП: {_fmt(result.planned_sale_price_rop)} ₽ | ДДЦ: {_fmt(result.planned_sale_price_ddc)} ₽",
+        f"ПЦП по метрике: {_fmt(result.planned_sale_price_rop)} ₽ | с полномочиями ДДЦ: {_fmt(result.planned_sale_price_ddc)} ₽",
+        f"Плановая ВП: {_fmt(result.gross_margin_rop)} ₽",
+        f"Переподготовка: {_fmt(result.refurbishment)} ₽" if result.refurbishment else "Переподготовка: не запланирована",
         "",
-        "Потолок цены выкупа клиенту:",
-        f"  Согласовано (РОП): до {_fmt(result.purchase_price_rop)} ₽",
-        f"  Согласование ДДЦ: до {_fmt(result.purchase_price_ddc)} ₽",
-        "  Выше — нужно согласование УК",
-        "",
-        f"Целевая валовая прибыль: {_fmt(result.gross_margin_rop)} ₽",
     ]
+    if not result.can_accept:
+        lines += [
+            f"⛔ {STATUS_REJECT}: лимит закупки по метрике = 0 (ВП больше, чем позволяет ПЦП).",
+            "Принять можно только с согласования УК.",
+        ]
+    else:
+        lines += [
+            "Цена выкупа клиенту:",
+            f"  до {_fmt(result.purchase_price_rop)} ₽ — Согласовано (РОП)",
+            f"  до {_fmt(result.purchase_price_ddc)} ₽ — Согласование ДДЦ",
+            f"  выше — Согласование УК; выше потолка {_fmt(result.ceiling_price)} ₽ — только УК",
+            f"GM2 по метрике: {_fmt(result.gm2_rop)} ₽",
+        ]
     if extra_info.get("repair_cost_max"):
         repair_min = extra_info.get("repair_cost_min")
         repair_range = (
@@ -161,6 +231,7 @@ def _result_text(result, avito_price: float, extra_info: dict, vehicle_info: dic
         ]
     if extra_info.get("autoteka_url"):
         lines += [f"Отчёт Автотеки: {extra_info['autoteka_url']}"]
+    lines += ["", f"Метрика v{METRIC_VERSION}"]
     return "\n".join(lines)
 
 
@@ -186,6 +257,10 @@ def condition_kb():
 
 def extra_kb():
     return _kb(get_extra_options(), "extra")
+
+
+def city_kb():
+    return _kb(get_city_options(), "city")
 
 
 def skip_kb(payload: str):
@@ -243,6 +318,7 @@ def _vehicle_info(data: dict) -> dict:
         "appraiser_name": data.get("appraiser_name"),
         "dealer_name": data.get("dealer_name"),
         "appraisal_id": data.get("appraisal_id"),
+        "city": data.get("city"),
     }
 
 
@@ -266,20 +342,24 @@ def pats_done_kb(token: str):
 
 def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_name: str, vin,
                          reception_type: Optional[str] = None, appraiser_sale_cost=None,
-                         presale_preparation_cost=None) -> str:
+                         presale_preparation_cost=None, metrics: Optional[dict] = None) -> str:
+    metrics = metrics or {}
     header = _vehicle_header(vehicle_info, reception_type)
     lines = ["📋 СОГЛАСОВАНИЕ СДЕЛКИ", f"Оценщик: {vehicle_info.get('appraiser_name') or manager_name or '—'}"]
     if header:
         lines.append(header)
     lines += [
         f"VIN: {vin or '—'}",
-        f"Категория: {result.category}",
+        f"Категория: {result.category}"
+        + (f" (баллы: {metrics['score']}, пробег в год: {_fmt(metrics.get('mileage_per_year'))} км)"
+           if metrics.get("score") is not None else ""),
         f"Авито-оценка: {_fmt(appraisal_input.avito_price)} ₽",
     ]
+    lines += _metrics_lines(metrics)
     if appraisal_input.negotiated_price is not None:
         lines.append(f"Запрашиваемая цена выкупа: {_fmt(appraisal_input.negotiated_price)} ₽")
     if appraiser_sale_cost is not None:
-        lines.append(f"ПЦП Оценщика: {_fmt(appraiser_sale_cost)} ₽")
+        lines.append(f"Прогноз цены продажи (ДЦ): {_fmt(appraiser_sale_cost)} ₽")
         prep_for_calc = presale_preparation_cost or 0
         lines.append(
             f"Подготовка: {_fmt(presale_preparation_cost)} ₽" if presale_preparation_cost
@@ -329,6 +409,8 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
         "reception_type": appraisal_input.reception_type,
         "appraiser_sale_cost": appraiser_sale_cost,
         "presale_preparation_cost": presale_preparation_cost,
+        "city": vehicle_info.get("city"),
+        "metrics": _metrics(result),
         "stage": "salon_pending",
     })
 
@@ -342,7 +424,8 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
     text = _approval_card_text(vehicle_info, appraisal_input, result, manager_name, vin,
                                 reception_type=appraisal_input.reception_type,
                                 appraiser_sale_cost=appraiser_sale_cost,
-                                presale_preparation_cost=presale_preparation_cost)
+                                presale_preparation_cost=presale_preparation_cost,
+                                metrics=_metrics(result))
     sent = await _send_to_chat(bot, salon_chat_id, text, keyboard=deal_approval_kb(token))
     if sent:
         return f"\n\n✅ Карточка отправлена на согласование в чат салона «{dealer_name}»."
@@ -404,21 +487,55 @@ async def _deny_and_request_access(message, user_id: int) -> None:
         )
 
 
-async def _proceed_after_condition(state: FSMContext, answer_fn, bot):
-    """После тех.состояния — либо авто-ДТП, либо спрашиваем доп.данные руками."""
+async def _ask_next(state: FSMContext, answer_fn, bot, note: str = ""):
+    """Спрашивает следующий НЕзаполненный шаг. Всё, что уже известно (из
+    MaxPoster, по салону или из прошлых ответов), пропускается — так оценщик
+    нажимает минимум кнопок. note — текст, который показываем перед вопросом
+    (что нашли/подставили автоматически)."""
     data = await state.get_data()
-    accidents_count = data.get("accidents_count")
-    # Пункт ставим автоматически, только если он есть в таблице «Параметры Метрики»:
-    # если его там переименуют, иначе молча получили бы 0 баллов вместо штрафа.
-    if (accidents_count is not None and accidents_count > ACCIDENTS_AUTO_THRESHOLD
-            and ACCIDENTS_AUTO_OPTION in get_extra_options()):
-        await state.update_data(extra=ACCIDENTS_AUTO_OPTION)
-        await _finish_scoring(state, answer_fn, bot, auto_note=(
-            f"\n(автоматически: по данным оценки — {accidents_count} ДТП, это > {ACCIDENTS_AUTO_THRESHOLD})"
-        ))
-    else:
-        await state.set_state(AppraisalStates.extra)
-        await answer_fn(text="Доп. данные?", keyboard=extra_kb())
+    prefix = (note.strip() + "\n\n") if note.strip() else ""
+
+    if not data.get("reception_type"):
+        await state.set_state(AppraisalStates.reception_type)
+        await answer_fn(text=prefix + "Выберите тип приёма:", keyboard=reception_kb())
+        return
+    if not data.get("city") or data["city"] not in get_city_options():
+        await state.set_state(AppraisalStates.city)
+        await answer_fn(
+            text=prefix + "Выберите ГОРОД салона (выбирайте только свой — от него зависит ПЦП):",
+            keyboard=city_kb(),
+        )
+        return
+    if not data.get("year"):
+        await state.set_state(AppraisalStates.year)
+        await answer_fn(text=prefix + "Введите год выпуска (по ПТС), например 2019:")
+        return
+    if data.get("mileage") is None:
+        await state.set_state(AppraisalStates.mileage)
+        await answer_fn(text=prefix + "Введите пробег по одометру, км (например 90000):")
+        return
+    if not data.get("colors"):
+        await state.set_state(AppraisalStates.colors)
+        await answer_fn(text=prefix + "Сколько окрасов?", keyboard=colors_kb())
+        return
+    if not data.get("condition"):
+        await state.set_state(AppraisalStates.condition)
+        await answer_fn(text=prefix + "Техническое состояние?", keyboard=condition_kb())
+        return
+    if not data.get("extra"):
+        accidents_count = data.get("accidents_count")
+        # Пункт ставим автоматически, только если он есть в таблице «Параметры Метрики»:
+        # если его там переименуют, иначе молча получили бы 0 баллов вместо штрафа.
+        if (accidents_count is not None and accidents_count > ACCIDENTS_AUTO_THRESHOLD
+                and ACCIDENTS_AUTO_OPTION in get_extra_options()):
+            await state.update_data(extra=ACCIDENTS_AUTO_OPTION)
+            note = (note + f"\n(доп. данные — автоматически «{ACCIDENTS_AUTO_OPTION}»: "
+                    f"по данным оценки {accidents_count} ДТП)").strip()
+        else:
+            await state.set_state(AppraisalStates.extra)
+            await answer_fn(text=prefix + "Доп. данные?", keyboard=extra_kb())
+            return
+    await _finish_scoring(state, answer_fn, bot, auto_note=("\n\n" + note.strip()) if note.strip() else "")
 
 
 async def _finish_scoring(state: FSMContext, answer_fn, bot, auto_note: str = ""):
@@ -426,13 +543,7 @@ async def _finish_scoring(state: FSMContext, answer_fn, bot, auto_note: str = ""
     план.цену продажи и/или согласованную цену (пропускаем то, что уже
     известно из системы)."""
     data = await state.get_data()
-    appraisal_input = AppraisalInput(
-        avito_price=data["avito_price"],
-        reception_type=data["reception_type"],
-        colors=data["colors"],
-        condition=data["condition"],
-        extra=data["extra"],
-    )
+    appraisal_input = _appraisal_input({**data, "manager_resale_forecast": None, "negotiated_price": None})
     result = calc_appraisal(appraisal_input)
 
     extra_info = {
@@ -454,14 +565,14 @@ async def _finish_scoring(state: FSMContext, answer_fn, bot, auto_note: str = ""
     if planned_default is not None and negotiated_default is not None:
         # оба значения уже есть в системе — сразу показываем на подтверждение
         data = await state.get_data()
-        await _review_or_close(state, answer_fn, data)
+        await _review_or_close(state, answer_fn, data, note=auto_note)
         return
 
     if planned_default is None:
         await state.set_state(AppraisalStates.waiting_planned_sale_price)
         await answer_fn(
             text=header
-            + "\n\nВведите планируемую цену продажи (₽), или нажмите «Пропустить» для расчёта системы.",
+            + "\n\nВведите планируемую цену продажи (₽), или нажмите «Пропустить» — возьму ПЦП по метрике.",
             keyboard=skip_kb("skip_planned"),
         )
         return
@@ -490,22 +601,14 @@ def review_kb():
     return builder
 
 
-async def _review_or_close(state: FSMContext, answer_fn, data: dict):
+async def _review_or_close(state: FSMContext, answer_fn, data: dict, note: str = ""):
     """Показывает статус сделки с ценой выкупа и даёт оценщику выбор:
     отправить на согласование как есть, или поменять цену и посчитать заново.
     Автоматической отправки на согласование больше нет — только по кнопке.
     Шапка (категория/потолок/целевая ВП) пересчитывается и показывается
     заново при каждом вызове — в том числе после «Обновить из MaxPoster» и
     после повторного ввода цены, чтобы картина никогда не была урезанной."""
-    appraisal_input = AppraisalInput(
-        avito_price=data["avito_price"],
-        reception_type=data["reception_type"],
-        colors=data["colors"],
-        condition=data["condition"],
-        extra=data["extra"],
-        manager_resale_forecast=data.get("manager_resale_forecast"),
-        negotiated_price=data.get("negotiated_price"),
-    )
+    appraisal_input = _appraisal_input(data)
     result = calc_appraisal(appraisal_input)
 
     extra_info = {
@@ -514,7 +617,7 @@ async def _review_or_close(state: FSMContext, answer_fn, data: dict):
         "autoteka_url": data.get("autoteka_url"),
     }
     full_header = _result_text(result, appraisal_input.avito_price, extra_info,
-                                _vehicle_info(data), data.get("reception_type"))
+                                _vehicle_info(data), data.get("reception_type")) + note
     prefix = full_header + "\n\n"
 
     if appraisal_input.negotiated_price is None:
@@ -530,35 +633,21 @@ async def _review_or_close(state: FSMContext, answer_fn, data: dict):
         await _log_appraisal_safe(manager_name, data.get("vin"), appraisal_input, result, vehicle_info)
         return
 
-    appraiser_ppp = data.get("appraisal_sale_cost")
-    ppp_line = f"ПЦП Оценщика: {_fmt(appraiser_ppp)} ₽\n" if appraiser_ppp is not None else ""
     appraiser_name = data.get("appraiser_name")
-    appraiser_line = f"Оценщик: {appraiser_name}\n" if appraiser_name else ""
-
-    prep_cost = data.get("presale_preparation_cost")
-    if not prep_cost:  # None или 0
-        prep_line = "Подготовка: расходы не запланированы\n"
-        prep_for_calc = 0
-    else:
-        prep_line = f"Подготовка: {_fmt(prep_cost)} ₽\n"
-        prep_for_calc = prep_cost
-
-    vp_line = ""
-    if appraiser_ppp is not None:
-        vp = appraiser_ppp - appraisal_input.negotiated_price - prep_for_calc
-        vp_line = f"ВП (валовая прибыль): {_fmt(vp)} ₽\n"
-
-    text = (
-        prefix
-        + "СОГЛАСОВАНИЕ СДЕЛКИ\n"
-        + appraiser_line
-        + f"Запрашиваемая цена выкупа: {_fmt(appraisal_input.negotiated_price)} ₽\n"
-        + ppp_line
-        + prep_line
-        + vp_line
-        + f"Статус: {result.approval_status}\n"
-        f"GM2 по факту: {_fmt(result.gm2_negotiated)} ₽"
-    )
+    forecast_source = "ПЦП оценщика" if data.get("manager_resale_forecast") is not None else "ПЦП по метрике"
+    lines = [
+        "СОГЛАСОВАНИЕ СДЕЛКИ",
+        f"Оценщик: {appraiser_name}" if appraiser_name else "",
+        "Прогноз ДЦ:",
+        f"  Цена продажи: {_fmt(result.manager_resale_forecast)} ₽ ({forecast_source})",
+        f"  Запрашиваемая цена выкупа: {_fmt(appraisal_input.negotiated_price)} ₽",
+        f"  Переподготовка: {_fmt(result.refurbishment)} ₽" if result.refurbishment
+        else "  Переподготовка: расходы не запланированы",
+        f"  ВП (валовая прибыль): {_fmt(result.margin_negotiated)} ₽",
+        f"  GM2 прогноз: {_fmt(result.gm2_negotiated)} ₽",
+        f"Статус: {result.approval_status}",
+    ]
+    text = prefix + "\n".join(line for line in lines if line)
     await state.set_state(AppraisalStates.reviewing_result)
     await answer_fn(text=text, keyboard=review_kb())
 
@@ -572,21 +661,13 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
     data = await state.get_data()
     # Сбрасываем сценарий сразу, чтобы повторное нажатие кнопки не создало вторую карточку.
     await state.clear()
-    appraisal_input = AppraisalInput(
-        avito_price=data["avito_price"],
-        reception_type=data["reception_type"],
-        colors=data["colors"],
-        condition=data["condition"],
-        extra=data["extra"],
-        manager_resale_forecast=data.get("manager_resale_forecast"),
-        negotiated_price=data.get("negotiated_price"),
-    )
+    appraisal_input = _appraisal_input(data)
     result = calc_appraisal(appraisal_input)
     manager_name = data.get("_manager_name") or "неизвестно"
     vehicle_info = _vehicle_info(data)
     approval_note = await _submit_for_approval(
         bot, appraisal_input, result, vehicle_info, manager_name, data.get("vin"),
-        appraiser_sale_cost=data.get("appraisal_sale_cost"),
+        appraiser_sale_cost=result.manager_resale_forecast,
         presale_preparation_cost=data.get("presale_preparation_cost"),
         manager_user_id=data.get("_manager_user_id"),
     )
@@ -644,6 +725,9 @@ async def on_update_price(callback, state: FSMContext, bot):
             fresh.appraisal_sale_cost if fresh.appraisal_sale_cost is not None
             else data.get("manager_resale_forecast")
         ),
+        # переподготовку и Авито-оценку тоже могли поправить в MaxPoster
+        presale_preparation_cost=fresh.presale_preparation_cost,
+        avito_price=fresh.avito_price or data.get("avito_price"),
     )
     data = await state.get_data()
     await _review_or_close(state, callback.answer, data)
@@ -910,6 +994,7 @@ def _deal_card_text(deal: dict) -> str:
         reception_type=deal.get("reception_type"),
         appraiser_sale_cost=deal.get("appraiser_sale_cost"),
         presale_preparation_cost=deal.get("presale_preparation_cost"),
+        metrics=deal.get("metrics"),
     )
 
 
@@ -952,7 +1037,7 @@ async def _advance_after_salon_approval(bot, token: str, deal: dict, role: Optio
     status = deal.get("approval_status")
     card = _deal_card_text(deal)
 
-    if status == "Согласование УК":
+    if status in UK_STATUSES:
         approved_role = role or "ДДЦ"
         deals_store.update_deal(token, stage="uk_pending", ddc_approved_role=approved_role)
         uk_ids = approval_hierarchy.get_uk_approvers(deal.get("dealer_name"))
@@ -1108,7 +1193,7 @@ async def on_deal_approve(callback, bot):
     approvers = approval_hierarchy.get_first_stage_approvers(dealer_name, status)
     logger.info("[approve] token=%s user=%s dealer=%r status=%r approvers=%s", token, user_id, dealer_name, status, approvers)
     if not _can_approve(user_id, approvers):
-        role_hint = " (нужен ДДЦ)" if status == "Согласование УК" else ""
+        role_hint = " (нужен ДДЦ)" if status in UK_STATUSES else ""
         logger.info("[approve] token=%s отклонён: user=%s нет в approvers", token, user_id)
         await callback.answer(notification=f"У вас нет прав согласовывать сделку со статусом «{status}»{role_hint}.")
         return
@@ -1134,7 +1219,7 @@ async def on_deal_adjust(callback, bot):
     status = deal.get("approval_status")
     approvers = approval_hierarchy.get_first_stage_approvers(deal.get("dealer_name"), status)
     if not _can_approve(user_id, approvers):
-        role_hint = " (нужен ДДЦ)" if status == "Согласование УК" else ""
+        role_hint = " (нужен ДДЦ)" if status in UK_STATUSES else ""
         await callback.answer(notification=f"У вас нет прав согласовывать сделку со статусом «{status}»{role_hint}.")
         return
 
@@ -1330,6 +1415,56 @@ async def on_bot_added_to_chat(event, bot):
         logger.warning("Не удалось поприветствовать новый чат %s: %s", chat_id, e)
 
 
+def _flatten_json(obj, prefix: str = "", out: Optional[list] = None, max_list_items: int = 2) -> list:
+    """{'a': {'b': 1}, 'c': [..]} -> ['a.b = 1', 'c[0]... ']. Длинные списки обрезаем."""
+    out = [] if out is None else out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _flatten_json(v, f"{prefix}.{k}" if prefix else str(k), out, max_list_items)
+    elif isinstance(obj, list):
+        if not obj:
+            out.append(f"{prefix} = []")
+        for i, v in enumerate(obj[:max_list_items]):
+            _flatten_json(v, f"{prefix}[{i}]", out, max_list_items)
+        if len(obj) > max_list_items:
+            out.append(f"{prefix} … ещё {len(obj) - max_list_items} эл.")
+    else:
+        value = repr(obj)
+        out.append(f"{prefix} = {value[:80] + '…' if len(value) > 80 else value}")
+    return out
+
+
+@router.message(Command("raw"))
+async def cmd_raw(message, command: CommandObject, bot):
+    """[админ] Все поля, которые MaxPoster отдаёт по оценке, — чтобы найти, что
+    ещё можно подставлять автоматически (тип приёма, ПЦП Автохаб, такси и т.п.)."""
+    if not _is_admin(message.sender.user_id):
+        await message.answer(text="Эта команда только для администраторов.")
+        return
+    query = (command.args or "").strip()
+    if not query:
+        await message.answer(text="Использование: /raw <ссылка на оценку | VIN | номер сделки>")
+        return
+    try:
+        data = await asyncio.to_thread(fetch_appraisal, query)
+    except Exception as e:  # noqa: BLE001
+        await message.answer(text=f"Не получилось получить оценку: {e}")
+        return
+    lines = _flatten_json(data.raw)
+    chunk, chunks = "", []
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500:
+            chunks.append(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        chunks.append(chunk)
+    for i, part in enumerate(chunks[:8], 1):
+        await message.answer(text=f"Поля оценки {data.appraisal_id} ({i}/{min(len(chunks), 8)}):\n{part}")
+    if len(chunks) > 8:
+        await message.answer(text=f"…и ещё {len(chunks) - 8} сообщ. — показаны первые 8.")
+
+
 @router.message(Command("register_salon"))
 async def cmd_register_salon(message, command: CommandObject, bot):
     if not _is_admin(message.sender.user_id):
@@ -1439,6 +1574,7 @@ async def on_waiting_link(message, state: FSMContext, bot):
     manager_name = getattr(message.sender, "first_name", None) or str(message.sender.user_id)
 
     if text.lower() in ("вручную", "manual"):
+        await state.clear()  # новая оценка — не тащим ответы из прошлой
         await state.update_data(_manager_name=manager_name, _manager_user_id=message.sender.user_id)
         await state.set_state(AppraisalStates.manual_vin)
         await message.answer(text="Введите ВИН авто:")
@@ -1465,6 +1601,9 @@ async def on_waiting_link(message, state: FSMContext, bot):
     if data.repainted_parts_count is not None:
         colors_bucket = colors_bucket_from_count(data.repainted_parts_count)
 
+    city, city_source = await _resolve_salon_city(data.dealer_name)
+
+    await state.clear()  # новая оценка — не тащим ответы из прошлой
     await state.update_data(
         _manager_name=manager_name,
         _manager_user_id=message.sender.user_id,
@@ -1485,27 +1624,51 @@ async def on_waiting_link(message, state: FSMContext, bot):
         appraiser_name=data.appraiser_name,
         dealer_name=data.dealer_name,
         appraisal_id=data.appraisal_id,
+        city=city,
     )
-    await state.set_state(AppraisalStates.reception_type)
 
-    colors_note = (
-        f"окрасов (эвристика): {data.repainted_parts_count} → «{colors_bucket}»"
-        if colors_bucket else "окрасы определить не удалось, спрошу отдельно"
+    vehicle_line = " ".join(str(x) for x in [data.brand, data.model, data.year] if x)
+    auto = []  # что подставили сами — оценщику не нужно вводить
+    if city:
+        auto.append(f"город — {_city_label(city)} ({city_source})")
+    if data.year:
+        auto.append(f"год — {data.year}")
+    if data.mileage is not None:
+        auto.append(f"пробег — {_fmt(data.mileage)} км")
+    if colors_bucket:
+        auto.append(f"окрасы — «{colors_bucket}» (деталей: {data.repainted_parts_count})")
+    if data.presale_preparation_cost:
+        auto.append(f"переподготовка — {_fmt(data.presale_preparation_cost)} ₽")
+    if data.appraisal_sale_cost is not None:
+        auto.append(f"цена продажи ДЦ — {_fmt(data.appraisal_sale_cost)} ₽")
+    if data.appraisal_purchase_cost is not None:
+        auto.append(f"цена выкупа — {_fmt(data.appraisal_purchase_cost)} ₽")
+    note = (
+        f"Нашёл оценку. {vehicle_line + chr(10) if vehicle_line else ''}"
+        f"ВИН: {data.vin or '—'}, Оценщик: {data.appraiser_name or '—'}\n"
+        f"Салон: {data.dealer_name or '—'}\n"
+        f"Авито-оценка: {_fmt(data.avito_price)} ₽, ДТП: {data.accidents_count}"
+        + ("\n\nИз MaxPoster подставлено: " + "; ".join(auto) + "." if auto else "")
     )
-    vehicle_line = " ".join(
-        str(x) for x in [data.brand, data.model, data.year] if x
-    )
-    await message.answer(
-        text=(
-            f"Нашёл оценку. {vehicle_line + chr(10) if vehicle_line else ''}"
-            f"ВИН: {data.vin or '—'}, "
-            f"Пробег: {_fmt(data.mileage) if data.mileage else '—'} км, "
-            f"Оценщик: {data.appraiser_name or '—'}\n"
-            f"Авито-оценка: {_fmt(data.avito_price)} ₽, "
-            f"ДТП: {data.accidents_count}, {colors_note}.\n\nВыберите тип приёма:"
-        ),
-        keyboard=reception_kb(),
-    )
+    await _ask_next(state, message.answer, bot, note=note)
+
+
+async def _resolve_salon_city(dealer_name: Optional[str]):
+    """Город салона для расчёта ПЦП: колонка «Город» во вкладке «Иерархия
+    согласования», иначе — по названию салона (группы вроде «Тойота» —
+    по ключевым словам). Возвращает (город или None, откуда взяли)."""
+    if not dealer_name:
+        return None, ""
+    options = get_city_options()
+    from_sheet = await asyncio.to_thread(approval_hierarchy.get_salon_city, dealer_name)
+    if from_sheet in options:
+        return from_sheet, "по настройке салона"
+    if from_sheet:
+        logger.warning("Город «%s» салона «%s» не найден в параметрах метрики", from_sheet, dealer_name)
+    by_name = city_from_salon_name(dealer_name)
+    if by_name in options:
+        return by_name, "по названию салона"
+    return None, ""
 
 
 @router.message(StateFilter(AppraisalStates.manual_vin))
@@ -1530,46 +1693,75 @@ async def on_manual_avito(message, state: FSMContext, bot):
         avito_price=avito_price, accidents_count=None, colors=None,
         repair_cost_min=None, repair_cost_max=None, autoteka_url=None,
         appraisal_purchase_cost=None, appraisal_sale_cost=None, presale_preparation_cost=None,
+        city=None, year=None, mileage=None,
     )
-    await state.set_state(AppraisalStates.reception_type)
-    await message.answer(text="Выберите тип приёма:", keyboard=reception_kb())
+    await _ask_next(state, message.answer, bot)
 
 
 @router.message_callback(F.payload.startswith("reception:"), StateFilter(AppraisalStates.reception_type))
 async def on_reception(callback, state: FSMContext, bot):
     value = callback.payload.split(":", 1)[1]
     await state.update_data(reception_type=value)
+    await _ask_next(state, callback.answer, bot, note=f"Тип приёма: {value}")
 
-    data = await state.get_data()
-    if data.get("colors"):
-        # окрасы уже определены по API — сразу к тех.состоянию
-        await state.set_state(AppraisalStates.condition)
-        await callback.answer(text="Техническое состояние?", keyboard=condition_kb())
-    else:
-        await state.set_state(AppraisalStates.colors)
-        await callback.answer(text=f"Тип приёма: {value}\n\nСколько окрасов?", keyboard=colors_kb())
+
+@router.message_callback(F.payload.startswith("city:"), StateFilter(AppraisalStates.city))
+async def on_city(callback, state: FSMContext, bot):
+    value = callback.payload.split(":", 1)[1]
+    if value not in get_city_options():
+        await callback.answer(text="Такого города нет в метрике. Выберите из списка:", keyboard=city_kb())
+        return
+    await state.update_data(city=value)
+    await _ask_next(state, callback.answer, bot, note=f"Город: {_city_label(value)}")
+
+
+@router.message(StateFilter(AppraisalStates.year))
+async def on_year(message, state: FSMContext, bot):
+    text = _text(message)
+    current_year = datetime.date.today().year
+    if not text.isdigit() or not (1950 <= int(text) <= current_year + 1):
+        await message.answer(text=f"Не понял год. Введите год выпуска числом, например {current_year - 5}:")
+        return
+    await state.update_data(year=int(text))
+    await _ask_next(state, message.answer, bot)
+
+
+@router.message(StateFilter(AppraisalStates.mileage))
+async def on_mileage(message, state: FSMContext, bot):
+    text = _text(message).replace(" ", "").replace("\u00a0", "")
+    if not text.isdigit():
+        await message.answer(text="Не понял пробег. Введите число километров, например 90000:")
+        return
+    await state.update_data(mileage=int(text))
+    await _ask_next(state, message.answer, bot)
 
 
 @router.message_callback(F.payload.startswith("colors:"), StateFilter(AppraisalStates.colors))
 async def on_colors(callback, state: FSMContext, bot):
     value = callback.payload.split(":", 1)[1]
     await state.update_data(colors=value)
-    await state.set_state(AppraisalStates.condition)
-    await callback.answer(text=f"Окрасы: {value}\n\nТехническое состояние?", keyboard=condition_kb())
+    await _ask_next(state, callback.answer, bot, note=f"Окрасы: {value}")
 
 
 @router.message_callback(F.payload.startswith("condition:"), StateFilter(AppraisalStates.condition))
 async def on_condition(callback, state: FSMContext, bot):
     value = callback.payload.split(":", 1)[1]
     await state.update_data(condition=value)
-    await _proceed_after_condition(state, callback.answer, bot)
+    await _ask_next(state, callback.answer, bot, note=f"Тех. состояние: {value}")
 
 
 @router.message_callback(F.payload.startswith("extra:"), StateFilter(AppraisalStates.extra))
 async def on_extra(callback, state: FSMContext, bot):
     value = callback.payload.split(":", 1)[1]
+    note = ""
+    data = await state.get_data()
+    # «Не применимо» для авто младше 2 лет — по метрике это «Возраст авто до 2х лет»
+    if (value == EXTRA_NOT_APPLICABLE and is_young_car(data.get("year"))
+            and EXTRA_YOUNG_CAR in get_extra_options()):
+        value = EXTRA_YOUNG_CAR
+        note = f"(доп. данные исправлены на «{EXTRA_YOUNG_CAR}»: год выпуска {data.get('year')})"
     await state.update_data(extra=value)
-    await _finish_scoring(state, callback.answer, bot)
+    await _ask_next(state, callback.answer, bot, note=note)
 
 
 async def _handle_planned_sale_price(text: str, state: FSMContext, answer_fn, bot):
@@ -1654,6 +1846,7 @@ async def _set_commands_menu():
             {"name": "salons", "description": "[админ] Список привязанных салонов"},
             {"name": "register_salon", "description": "[админ] Привязать этот чат к салону"},
             {"name": "register_pats", "description": "[админ] Назначить этот чат общим чатом ПАЦ"},
+            {"name": "raw", "description": "[админ] Все поля оценки из MaxPoster"},
         ])
     except Exception as e:  # noqa: BLE001
         logger.warning("Не удалось задать меню команд: %s", e)
