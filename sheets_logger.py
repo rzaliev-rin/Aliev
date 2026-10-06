@@ -17,27 +17,27 @@ from typing import Optional
 import gspread
 from google.oauth2.service_account import Credentials
 
-from config import GOOGLE_SERVICE_ACCOUNT_FILE, GOOGLE_SHEET_ID, GOOGLE_SHEET_TAB
+from config import GOOGLE_SERVICE_ACCOUNT_FILE, GOOGLE_SHEET_ID, GOOGLE_SHEET_TAB_V2
 from pricing_config import METRIC_VERSION
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# Вкладка истории для метрики v2.0. Старая вкладка (GOOGLE_SHEET_TAB, метрика
+# v1) не трогается: у v2 другой смысл колонок (ПЦП по городу, потолок и т.д.),
+# и смешивать строки двух метрик в одной вкладке нельзя.
+TAB_NAME = GOOGLE_SHEET_TAB_V2
+
 HEADER = [
-    "Дата/время", "Менеджер (MAX)", "VIN", "Марка", "Модель", "Год выпуска", "Пробег", "Оценщик",
-    "Тип приёма",
-    "Авито оценка", "Окрасы", "Тех.состояние", "Доп.данные",
-    "Категория", "Баллы",
-    "План.цена продажи (РОП)", "План.цена продажи (ДДЦ)",
-    "Валовая прибыль", "Лимит закупки РОП", "Предел ДДЦ",
-    "GM2 (РОП)", "GM2 (ДДЦ)",
-    "Согласованная цена", "Статус согласования", "GM2 по факту",
-    # метрика v2.0 — новые колонки добавлены в конец, чтобы старые строки не съехали
-    "Город", "Пробег в год", "Потолок закупки к Авито", "Переподготовка",
-    "Прогноз ДЦ: цена продажи", "ВП по прогнозу ДЦ", "Версия метрики", "Салон",
+    "Дата/время", "Менеджер (MAX)", "Салон", "Город", "VIN", "Марка", "Модель",
+    "Год выпуска", "Пробег", "Пробег в год", "Оценщик", "Тип приёма",
+    "Авито оценка", "Окрасы", "Тех.состояние", "Доп.данные", "Категория", "Баллы",
+    "ПЦП (РОП)", "ПЦП (ДДЦ)", "Плановая ВП", "Потолок к Авито", "Лимит РОП", "Предел ДДЦ",
+    "Переподготовка", "GM2 по метрике", "GM2 (ДДЦ)",
+    "Прогноз ДЦ: цена продажи", "Прогноз ДЦ: закупка", "ВП по прогнозу ДЦ", "GM2 по прогнозу ДЦ",
+    "Статус согласования", "Версия метрики",
 ]
 
 _client_cache = None
-_header_checked = False
 
 
 def _get_worksheet():
@@ -46,22 +46,17 @@ def _get_worksheet():
         creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         _client_cache = gspread.authorize(creds)
 
-    global _header_checked
     sh = _client_cache.open_by_key(GOOGLE_SHEET_ID)
     try:
-        ws = sh.worksheet(GOOGLE_SHEET_TAB)
+        ws = sh.worksheet(TAB_NAME)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=GOOGLE_SHEET_TAB, rows=1000, cols=len(HEADER))
+        ws = sh.add_worksheet(title=TAB_NAME, rows=1000, cols=len(HEADER))
         ws.append_row(HEADER)
-        _header_checked = True
-    if not _header_checked:
-        # Таблица заведена старой версией бота — дописываем заголовки новых колонок
-        if len(ws.row_values(1)) < len(HEADER):
-            if ws.col_count < len(HEADER):
-                ws.add_cols(len(HEADER) - ws.col_count)
-            ws.update(range_name="A1", values=[HEADER])
-        _header_checked = True
     return ws
+
+
+def _blank_if_none(v):
+    return "" if v is None else v
 
 
 def log_appraisal(manager_name: str, vin: Optional[str], data, result, vehicle_info: Optional[dict] = None) -> None:
@@ -77,11 +72,14 @@ def log_appraisal(manager_name: str, vin: Optional[str], data, result, vehicle_i
         ws.append_row([
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             manager_name,
+            vehicle_info.get("dealer_name") or "",
+            getattr(data, "city", None) or "",
             vin or "",
             vehicle_info.get("brand") or "",
             vehicle_info.get("model") or "",
-            vehicle_info.get("year") or "",
-            vehicle_info.get("mileage") or "",
+            data.year or "",
+            data.mileage if data.mileage is not None else "",
+            result.mileage_per_year,
             vehicle_info.get("appraiser_name") or "",
             data.reception_type,
             data.avito_price,
@@ -93,21 +91,18 @@ def log_appraisal(manager_name: str, vin: Optional[str], data, result, vehicle_i
             result.planned_sale_price_rop,
             result.planned_sale_price_ddc,
             result.gross_margin_rop,
+            result.ceiling_price,
             result.purchase_price_rop,
             result.purchase_price_ddc,
+            result.refurbishment,
             result.gm2_rop,
             result.gm2_ddc,
-            result.negotiated_price or "",
+            _blank_if_none(result.manager_resale_forecast),
+            _blank_if_none(result.negotiated_price),
+            _blank_if_none(result.margin_negotiated),
+            _blank_if_none(result.gm2_negotiated),
             result.approval_status or "",
-            result.gm2_negotiated if result.gm2_negotiated is not None else "",
-            getattr(data, "city", None) or "",
-            getattr(result, "mileage_per_year", ""),
-            getattr(result, "ceiling_price", ""),
-            getattr(result, "refurbishment", ""),
-            result.manager_resale_forecast if result.manager_resale_forecast is not None else "",
-            result.margin_negotiated if getattr(result, "margin_negotiated", None) is not None else "",
             METRIC_VERSION,
-            vehicle_info.get("dealer_name") or "",
         ], value_input_option="USER_ENTERED")
         print("[sheets_logger] Строка успешно записана в Google Таблицу", flush=True)
     except Exception as e:  # noqa: BLE001

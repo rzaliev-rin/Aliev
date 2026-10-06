@@ -15,6 +15,8 @@ MAXPOSTER_API_BASE = os.environ.get("MAXPOSTER_API_BASE", "https://api.maxposter
 GOOGLE_SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "История оценок")
+# История оценок по метрике v2.0 — отдельная вкладка (старая остаётся как архив v1)
+GOOGLE_SHEET_TAB_V2 = os.environ.get("GOOGLE_SHEET_TAB_V2", "История оценок v2")
 
 # Владелец бота — единственный, кто может полностью включать/выключать бота
 # для всех остальных (например, если Ринат уйдёт из компании). Не путать
