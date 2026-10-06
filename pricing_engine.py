@@ -12,6 +12,7 @@
 """
 
 import datetime
+import re
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 from typing import Optional
@@ -70,24 +71,41 @@ def ptsp_city(city: Optional[str]) -> Optional[str]:
     return alias["city"] if alias else city
 
 
+def _normalize_name(text: str) -> str:
+    """«3047: Экспокар Н.Новгород!» -> «3047 экспокар н новгород»."""
+    text = str(text).lower().replace("ё", "е")
+    return " ".join(re.split(r"[^0-9a-zа-я]+", text)).strip()
+
+
+def _has_keyword(text: str, keyword: str) -> bool:
+    """Слово в названии начинается с keyword («казан» ловит «Казань», «Казани»);
+    короткие ключи (до 3 букв, например «нн») — только целым словом."""
+    kw = _normalize_name(keyword)
+    if not kw:
+        return False
+    tail = r"(?![0-9a-zа-я])" if len(kw) <= 3 else ""
+    return re.search(r"(?<![0-9a-zа-я])" + re.escape(kw) + tail, text) is not None
+
+
 def city_from_salon_name(dealer_name: Optional[str]) -> Optional[str]:
     """Определяет город (или группу салонов вроде «Тойота») по названию салона
     из MaxPoster. Сначала — группы салонов по ключевым словам (салон Тойота в
-    Казани всё равно считается по коэффициентам Краснодара), затем — название
-    города в тексте (без учёта регистра и окончания: «Казани», «Тюмени»)."""
+    Казани всё равно считается по коэффициентам Краснодара), затем — город по
+    словам из city_keywords (склонения, сокращения, латиница). Если подходят
+    два разных города — None: пусть оценщик выберет сам."""
     if not dealer_name:
         return None
-    text = str(dealer_name).lower().replace("ё", "е")
+    text = _normalize_name(dealer_name)
     params = pricing_config.get_params()
     for alias, rule in params["city_aliases"].items():
-        if any(k and k in text for k in rule.get("keywords") or []):
+        if any(_has_keyword(text, k) for k in rule.get("keywords") or []):
             return alias
+    found = []
     for city in params["city_ptsp"]:
-        name = city.lower().replace("ё", "е")
-        stem = name[:-1] if len(name) > 5 else name
-        if stem in text:
-            return city
-    return None
+        keywords = params.get("city_keywords", {}).get(city) or [city]
+        if any(_has_keyword(text, k) for k in keywords):
+            found.append(city)
+    return found[0] if len(found) == 1 else None
 
 
 def car_age_years(year: Optional[int], today: Optional[datetime.date] = None) -> Optional[int]:

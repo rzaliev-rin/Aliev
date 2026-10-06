@@ -81,9 +81,27 @@ def test_toyota_uses_krasnodar_coefficients():
     assert city_from_salon_name("Тойота Центр Казань") == "Тойота"
     assert city_from_salon_name("3047: TOYOTA Тюмень") == "Тойота"
     assert city_from_salon_name("Экспокар Казань") == "Казань"
-    assert city_from_salon_name("Экспокар в Нижнем Новгороде") is None  # склонение не угадываем — спросим
     assert city_from_salon_name("Экспокар Тюмени") == "Тюмень"
     assert city_from_salon_name("Какой-то салон") is None
+
+
+def test_city_from_salon_name_variants():
+    from pricing_engine import city_from_salon_name
+    cases = {
+        "Экспокар в Нижнем Новгороде": "Нижний Новгород",
+        "!3051: Экспокар Н.Новгород": "Нижний Новгород",
+        "Экспокар НН Мещера": "Нижний Новгород",
+        "Expocar Nizhny Novgorod": "Нижний Новгород",
+        "Экспокар Краснодар (Ростовское ш.)": "Краснодар",
+        "Экспокар Новосиб": "Новосибирск",
+        "Экспокар Волгограде": "Волгоград",
+        "EXPOCAR KAZAN": "Казань",
+        "Экспокар Красноярск": None,          # не путаем с Краснодаром
+        "Экспокар Казань / Тюмень": None,     # два города — спросим
+        "Экспокар Ганновер": None,            # «нн» внутри слова не считается
+    }
+    for name, expected in cases.items():
+        assert city_from_salon_name(name) == expected, (name, city_from_salon_name(name))
 
 
 if __name__ == "__main__":

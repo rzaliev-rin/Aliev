@@ -1668,6 +1668,9 @@ async def _resolve_salon_city(dealer_name: Optional[str]):
     by_name = city_from_salon_name(dealer_name)
     if by_name in options:
         return by_name, "по названию салона"
+    logger.warning("Город не определён по названию салона «%s» — оценщик выберет кнопкой. "
+                   "Допишите вариант написания в «Значение4» на вкладке «Параметры Метрики v2».",
+                   dealer_name)
     return None, ""
 
 

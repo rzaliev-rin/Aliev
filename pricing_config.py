@@ -13,7 +13,7 @@
 Формат вкладки — плоская таблица, ОДНА строка = один параметр, колонки
 (первая строка — заголовки, должны совпадать буквально):
 
-Раздел | Параметр | Значение1 | Значение2 | Значение3
+Раздел | Параметр | Значение1 | Значение2 | Значение3 | Значение4
 
 Разделы (буквально, как в "Раздел"):
   Окрасы                    | вариант окраса      | баллы
@@ -22,6 +22,8 @@
   Пробег в год              | любое название      | до, км в год (пусто = «более») | баллы
   Порог категории           | "Категория А"/"Категория В" | порог баллов (С — всё, что ниже)
   ПЦП города                | город               | % кат. А | % кат. В | % кат. С   (напр. 96 = 96%)
+                              | Значение4 (необязательно): как город пишется в названиях салонов
+                              | MaxPoster, через запятую — начало слова, напр. "новгород, нн, nizhn"
   Коэффициенты другого города | бренд/группа салонов (напр. "Тойота") | город, чьи коэффициенты ПЦП применять ("Краснодар") | слова для поиска в названии салона через запятую ("тойота, toyota")
   Выкуп с улицы: поправка ПЦП | "Категория А/В/С" | минус п.п. к ПЦП города (напр. 6)
   Полномочия ДДЦ            | "+ п.п. к ПЦП"      | п.п. (напр. 3)
@@ -82,6 +84,16 @@ _DEFAULTS = {
         "Нижний Новгород": {"Категория А": 0.97, "Категория В": 0.93, "Категория С": 0.81},
         "Новосибирск": {"Категория А": 0.94, "Категория В": 0.94, "Категория С": 0.84},
         "Тюмень": {"Категория А": 0.98, "Категория В": 0.93, "Категория С": 0.89},
+    },
+    # Как город пишется в названиях салонов MaxPoster: начало слова (ловит
+    # склонения: «казан» -> «Казань», «Казани»); слова до 3 букв — целиком («нн»).
+    "city_keywords": {
+        "Волгоград": ["волгоград", "volgograd"],
+        "Казань": ["казан", "kazan"],
+        "Краснодар": ["краснодар", "krasnodar"],
+        "Нижний Новгород": ["новгород", "нн", "nizhn", "novgorod"],
+        "Новосибирск": ["новосиб", "novosib"],
+        "Тюмень": ["тюмен", "tyumen", "tumen"],
     },
     # Салоны, которые считаются по коэффициентам другого города:
     # {название: {"city": город с коэффициентами, "keywords": [слова в названии салона]}}
@@ -202,6 +214,7 @@ def _load_from_sheet() -> Optional[dict]:
     mileage_score = []
     category_thresholds = []
     city_ptsp = {}
+    city_keywords = {}
     city_aliases = {}
     street_ptsp_minus = {}
     ddc_ptsp_bonus = None
@@ -216,6 +229,7 @@ def _load_from_sheet() -> Optional[dict]:
         v1 = row.get("Значение1")
         v2 = row.get("Значение2")
         v3 = row.get("Значение3")
+        v4 = row.get("Значение4")
 
         if section == "Окрасы":
             colors_score[param] = int(_num(v1, 0))
@@ -233,6 +247,9 @@ def _load_from_sheet() -> Optional[dict]:
                 "Категория В": _pct_to_fraction(v2),
                 "Категория С": _pct_to_fraction(v3),
             }
+            keywords = [k.strip().lower() for k in str(v4 or "").split(",") if k.strip()]
+            if keywords:
+                city_keywords[param] = keywords
         elif section == "Коэффициенты другого города":
             keywords = [k.strip().lower() for k in str(v2 or "").split(",") if k.strip()]
             city_aliases[param] = {"city": str(v1 or "").strip(), "keywords": keywords or [param.lower()]}
@@ -273,6 +290,7 @@ def _load_from_sheet() -> Optional[dict]:
         "mileage_score": sorted(mileage_score) or _DEFAULTS["mileage_score"],
         "category_thresholds": category_thresholds,
         "city_ptsp": city_ptsp or _DEFAULTS["city_ptsp"],
+        "city_keywords": {**_DEFAULTS["city_keywords"], **city_keywords},
         "city_aliases": city_aliases or _DEFAULTS["city_aliases"],
         "street_ptsp_minus": street_ptsp_minus or _DEFAULTS["street_ptsp_minus"],
         "ddc_ptsp_bonus": ddc_ptsp_bonus if ddc_ptsp_bonus is not None else _DEFAULTS["ddc_ptsp_bonus"],
