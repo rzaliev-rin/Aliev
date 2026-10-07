@@ -8,6 +8,7 @@
 """
 import json
 import os
+import time
 import uuid
 from typing import Optional
 
@@ -40,7 +41,8 @@ def _save(data: dict) -> None:
 def create_deal(record: dict) -> str:
     token = uuid.uuid4().hex[:8]
     data = _load()
-    data[token] = record
+    # stage_since — с какого момента сделка на текущем этапе (для напоминаний)
+    data[token] = {**record, "created_at": time.time(), "stage_since": time.time()}
     _save(data)
     return token
 
@@ -52,6 +54,8 @@ def get_deal(token: str) -> Optional[dict]:
 def update_deal(token: str, **kwargs) -> None:
     data = _load()
     if token in data:
+        if "stage" in kwargs and kwargs["stage"] != data[token].get("stage"):
+            kwargs = {**kwargs, "stage_since": time.time(), "reminded_at": None}
         data[token].update(kwargs)
         _save(data)
 
@@ -64,6 +68,10 @@ def find_awaiting(user_id: int):
         if deal.get("awaiting_input_from") == user_id:
             return token, deal
     return None, None
+
+
+def list_deals() -> dict:
+    return _load()
 
 
 def delete_deal(token: str) -> None:

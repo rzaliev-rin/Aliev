@@ -29,6 +29,7 @@
 import asyncio
 import datetime
 import logging
+import time
 from typing import Optional
 from types import SimpleNamespace
 
@@ -42,16 +43,19 @@ from maxgram.fsm.context import FSMContext
 from maxgram.types import BotStarted
 from maxgram.utils.keyboard import InlineKeyboardBuilder
 
-from config import MAX_BOT_TOKEN, ALLOWED_USER_IDS, ADMIN_USER_IDS, OWNER_USER_ID
+from config import (MAX_BOT_TOKEN, ALLOWED_USER_IDS, ADMIN_USER_IDS, OWNER_USER_ID,
+                    REMINDER_AFTER_MINUTES, REMINDER_HOURS)
 from pricing_engine import (
     AppraisalInput, calc_appraisal, colors_bucket_from_count,
     get_colors_options, get_condition_options, get_extra_options, get_salon_options, RECEPTION_TYPES,
     find_salon, salon_label, is_young_car, UK_STATUSES, STATUS_REJECT,
+    STATUS_OK, STATUS_DDC, STATUS_UK, STATUS_UK_CEILING,
     EXTRA_YOUNG_CAR, EXTRA_NOT_APPLICABLE, METRIC_VERSION,
 )
 from maxposter_client import fetch_appraisal, MaxPosterError
 from sheets_logger import log_appraisal
 import access_store
+import appraisals_log
 import dealer_chats
 import deals_store
 import approval_hierarchy
@@ -119,6 +123,24 @@ def _maxposter_link(appraisal_id) -> Optional[str]:
     return f"https://app.maxposter.ru/holding/used/appraisals/{appraisal_id}/view"
 
 
+STATUS_BADGES = {
+    STATUS_OK: "🟢",
+    "Согласование РОП": "🟢",  # сделки, созданные до метрики v2
+    STATUS_DDC: "🟡",
+    STATUS_UK: "🟠",
+    STATUS_UK_CEILING: "🔴",
+    STATUS_REJECT: "⛔",
+}
+
+
+def _status_text(status: Optional[str]) -> str:
+    """«🟢 Согласовано», «🟠 Согласование УК» — цвет виден с одного взгляда."""
+    if not status:
+        return "—"
+    badge = STATUS_BADGES.get(status)
+    return f"{badge} {status}" if badge else status
+
+
 def _vehicle_header(vehicle_info: dict, reception_type: Optional[str] = None) -> str:
     """Шапка с городом, типом контракта, авто и ссылкой на оценку — идёт в начале
     и итогового расчёта, и карточки согласования. Автосалон (город и бренд) —
@@ -134,6 +156,8 @@ def _vehicle_header(vehicle_info: dict, reception_type: Optional[str] = None) ->
     if reception_type:
         lines.append(f"Тип контракта: {reception_type}")
     if vehicle_line:
+        if not (vehicle_info.get("brand") or vehicle_info.get("model")):
+            vehicle_line = f"Год выпуска: {vehicle_line}"
         lines.append(vehicle_line)
     if vehicle_info.get("mileage") is not None:
         lines.append(f"Пробег: {_fmt(vehicle_info['mileage'])} км")
@@ -188,6 +212,19 @@ def _metrics_lines(metrics: dict) -> list:
     ]
 
 
+def _price_ladder(result) -> list:
+    """Лесенка статусов по цене выкупа; совпадающие пороги не дублируем
+    (у категории С лимит РОП, предел ДДЦ и потолок часто равны)."""
+    rop, ddc, ceiling = result.purchase_price_rop, result.purchase_price_ddc, result.ceiling_price
+    lines = [f"🟢 до {_fmt(rop)} ₽ — Согласовано (РОП)"]
+    if round(ddc) > round(rop):
+        lines.append(f"🟡 до {_fmt(ddc)} ₽ — Согласование ДДЦ")
+    if round(ceiling) > round(max(rop, ddc)):
+        lines.append(f"🟠 до {_fmt(ceiling)} ₽ — Согласование УК")
+    lines.append(f"🔴 выше {_fmt(ceiling)} ₽ (потолок к Авито) — только УК")
+    return lines
+
+
 def _result_text(result, avito_price: float, extra_info: dict, vehicle_info: dict, reception_type: Optional[str] = None) -> str:
     header = _vehicle_header(vehicle_info, reception_type)
     lines = [header, ""] if header else []
@@ -208,9 +245,7 @@ def _result_text(result, avito_price: float, extra_info: dict, vehicle_info: dic
     else:
         lines += [
             "Цена выкупа клиенту:",
-            f"  до {_fmt(result.purchase_price_rop)} ₽ — Согласовано (РОП)",
-            f"  до {_fmt(result.purchase_price_ddc)} ₽ — Согласование ДДЦ",
-            f"  выше — Согласование УК; выше потолка {_fmt(result.ceiling_price)} ₽ — только УК",
+            *_price_ladder(result),
             f"GM2 по метрике: {_fmt(result.gm2_rop)} ₽",
         ]
     if extra_info.get("repair_cost_max"):
@@ -269,11 +304,19 @@ def skip_kb(payload: str):
     return builder
 
 
-def new_appraisal_kb():
+def main_menu_kb():
+    """Главное меню: показывается при входе в бота и после каждой оценки."""
     builder = InlineKeyboardBuilder()
     builder.callback(text="🆕 Новая оценка", payload="new_appraisal")
-    builder.adjust(1)
+    builder.callback(text="🧮 Предварительный расчёт", payload="quick_calc")
+    builder.callback(text="📋 Мои оценки", payload="my_appraisals")
+    builder.callback(text="❓ Помощь", payload="help")
+    builder.adjust(1, 1, 2)
     return builder
+
+
+def new_appraisal_kb():
+    return main_menu_kb()
 
 
 def _get_user_id(obj) -> Optional[int]:
@@ -370,7 +413,7 @@ def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_nam
         if appraisal_input.negotiated_price is not None:
             vp = appraiser_sale_cost - appraisal_input.negotiated_price - prep_for_calc
             lines.append(f"ВП (валовая прибыль): {_fmt(vp)} ₽")
-    lines.append(f"Статус: {result.approval_status or '—'}")
+    lines.append(f"Статус: {_status_text(result.approval_status)}")
     if result.gm2_negotiated is not None:
         lines.append(f"GM2 по факту: {_fmt(result.gm2_negotiated)} ₽")
     return "\n".join(line for line in lines if line)
@@ -391,9 +434,9 @@ async def _send_to_chat(bot, chat_id: int, text: str, keyboard=None) -> bool:
 
 async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict, manager_name: str, vin,
                                 appraiser_sale_cost=None, presale_preparation_cost=None,
-                                manager_user_id=None) -> str:
+                                manager_user_id=None) -> tuple:
     """Создаёт карточку согласования и постит её в чат салона (Этап 1).
-    Возвращает короткую заметку для ответа оценщику о том, что произошло."""
+    Возвращает (заметка для ответа оценщику, токен сделки, ушла ли карточка в чат)."""
     dealer_name = vehicle_info.get("dealer_name")
     salon_chat_id = dealer_chats.get_salon_chat_id(dealer_name)
 
@@ -421,7 +464,7 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
             "\n\n⚠️ Салон "
             + (f"«{_salon_name_for_chat(vehicle_info)}» " if dealer_name else "")
             + "не привязан к чату согласования — пока согласуйте по старому процессу."
-        )
+        ), token, False
 
     text = _approval_card_text(vehicle_info, appraisal_input, result, manager_name, vin,
                                 reception_type=appraisal_input.reception_type,
@@ -430,8 +473,9 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
                                 metrics=_metrics(result))
     sent = await _send_to_chat(bot, salon_chat_id, text, keyboard=deal_approval_kb(token))
     if sent:
-        return f"\n\n✅ Карточка отправлена на согласование в чат салона «{_salon_name_for_chat(vehicle_info)}»."
-    return "\n\n⚠️ Не получилось отправить карточку в чат салона — согласуйте по старому процессу."
+        return (f"\n\n✅ Карточка отправлена на согласование в чат салона «{_salon_name_for_chat(vehicle_info)}».\n"
+                "О решении бот напишет вам сюда."), token, True
+    return "\n\n⚠️ Не получилось отправить карточку в чат салона — согласуйте по старому процессу.", token, False
 
 
 def _is_owner(user_id: Optional[int]) -> bool:
@@ -529,7 +573,7 @@ async def _ask_next(state: FSMContext, answer_fn, bot, note: str = ""):
         # Пункт ставим автоматически, только если он есть в таблице «Параметры Метрики»:
         # если его там переименуют, иначе молча получили бы 0 баллов вместо штрафа.
         if (accidents_count is not None and accidents_count > ACCIDENTS_AUTO_THRESHOLD
-                and ACCIDENTS_AUTO_OPTION in get_extra_options()):
+                and ACCIDENTS_AUTO_OPTION in get_extra_options() and not data.get("_extra_manual")):
             await state.update_data(extra=ACCIDENTS_AUTO_OPTION)
             note = (note + f"\n(доп. данные — автоматически «{ACCIDENTS_AUTO_OPTION}»: "
                     f"по данным оценки {accidents_count} ДТП)").strip()
@@ -555,6 +599,22 @@ async def _finish_scoring(state: FSMContext, answer_fn, bot, auto_note: str = ""
     }
     header = _result_text(result, appraisal_input.avito_price, extra_info,
                            _vehicle_info(data), data.get("reception_type")) + auto_note
+
+    if data.get("_quick"):
+        # предварительный расчёт: только показываем лимиты, в согласование ничего не уходит
+        await state.clear()
+        await answer_fn(
+            text="🧮 ПРЕДВАРИТЕЛЬНЫЙ РАСЧЁТ\n\n" + header
+            + "\n\nЭто прикидка — на согласование ничего не отправлено. Для сделки сделайте "
+              "оценку в MaxPoster и нажмите «Новая оценка».",
+            keyboard=main_menu_kb(),
+        )
+        return
+
+    if data.get("negotiated_price") is not None:
+        # пересчёт после правки на экране итога — цены уже введены, сразу к итогу
+        await _review_or_close(state, answer_fn, data, note=auto_note)
+        return
 
     planned_default = data.get("appraisal_sale_cost")
     negotiated_default = data.get("appraisal_purchase_cost")
@@ -595,12 +655,54 @@ async def _log_appraisal_safe(manager_name, vin, appraisal_input, result, vehicl
         logger.error("Не удалось записать оценку в Google Таблицу (VIN %s): %s", vin, e)
 
 
+EDITABLE_FIELDS = {
+    "reception_type": "Тип приёма",
+    "colors": "Окрасы",
+    "condition": "Тех. состояние",
+    "extra": "Доп. данные",
+}
+
+
 def review_kb():
     builder = InlineKeyboardBuilder()
     builder.callback(text="📨 Отправить на согласование", payload="confirm_submit")
     builder.callback(text="🔄 Обновить из MaxPoster", payload="update_price")
-    builder.adjust(1)
+    for field, label in EDITABLE_FIELDS.items():
+        builder.callback(text=f"✏️ {label}", payload=f"edit:{field}")
+    builder.adjust(1, 1, 2, 2)
     return builder
+
+
+def _journal_fields(data: dict, result, appraisal_input) -> dict:
+    """Что пишем в журнал «Мои оценки» / отчёт."""
+    vehicle = " ".join(str(x) for x in [data.get("brand"), data.get("model"), data.get("year")] if x)
+    return {
+        "user_id": data.get("_manager_user_id"),
+        "manager": data.get("_manager_name"),
+        "salon": data.get("salon"),
+        "dealer_name": data.get("dealer_name"),
+        "vehicle": vehicle,
+        "vin": data.get("vin"),
+        "avito_price": appraisal_input.avito_price,
+        "negotiated_price": appraisal_input.negotiated_price,
+        "status": result.approval_status,
+        "category": result.category,
+        "limit_rop": result.purchase_price_rop,
+    }
+
+
+async def _journal_save(state: FSMContext, data: dict, result, appraisal_input) -> None:
+    """Одна запись на оценку: при повторном пересчёте (правка, обновление
+    из MaxPoster) обновляем ту же запись, а не плодим новые."""
+    try:
+        fields = _journal_fields(data, result, appraisal_input)
+        rec_id = data.get("_record_id")
+        if rec_id:
+            appraisals_log.update(rec_id, **fields)
+        else:
+            await state.update_data(_record_id=appraisals_log.add(fields))
+    except Exception as e:  # noqa: BLE001
+        logger.error("Не удалось записать оценку в журнал: %s", e)
 
 
 async def _review_or_close(state: FSMContext, answer_fn, data: dict, note: str = ""):
@@ -612,6 +714,8 @@ async def _review_or_close(state: FSMContext, answer_fn, data: dict, note: str =
     после повторного ввода цены, чтобы картина никогда не была урезанной."""
     appraisal_input = _appraisal_input(data)
     result = calc_appraisal(appraisal_input)
+    await _journal_save(state, data, result, appraisal_input)
+    data = await state.get_data()
 
     extra_info = {
         "repair_cost_min": data.get("repair_cost_min"),
@@ -647,7 +751,7 @@ async def _review_or_close(state: FSMContext, answer_fn, data: dict, note: str =
         else "  Переподготовка: расходы не запланированы",
         f"  ВП (валовая прибыль): {_fmt(result.margin_negotiated)} ₽",
         f"  GM2 прогноз: {_fmt(result.gm2_negotiated)} ₽",
-        f"Статус: {result.approval_status}",
+        f"Статус: {_status_text(result.approval_status)}",
     ]
     text = prefix + "\n".join(line for line in lines if line)
     await state.set_state(AppraisalStates.reviewing_result)
@@ -667,12 +771,19 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
     result = calc_appraisal(appraisal_input)
     manager_name = data.get("_manager_name") or "неизвестно"
     vehicle_info = _vehicle_info(data)
-    approval_note = await _submit_for_approval(
+    approval_note, token, sent = await _submit_for_approval(
         bot, appraisal_input, result, vehicle_info, manager_name, data.get("vin"),
         appraiser_sale_cost=result.manager_resale_forecast,
         presale_preparation_cost=data.get("presale_preparation_cost"),
         manager_user_id=data.get("_manager_user_id"),
     )
+    try:
+        if not data.get("_record_id"):
+            data["_record_id"] = appraisals_log.add(_journal_fields(data, result, appraisal_input))
+        appraisals_log.update(data["_record_id"], token=token, outcome="salon" if sent else "not_sent",
+                              status=result.approval_status, negotiated_price=appraisal_input.negotiated_price)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Не удалось обновить журнал оценок: %s", e)
     await callback.answer(
         text="✅ Отправлено на согласование." + approval_note
         + "\n\nГотово. Чтобы посчитать следующее авто — жмите кнопку ниже.",
@@ -746,10 +857,10 @@ async def on_bot_started(event: BotStarted):
         return
     await event.answer(
         text=(
-            "Привет! Я считаю выкупную цену авто в трейд-ин.\n\n"
-            "Пришлите ссылку на оценку из MaxPoster, VIN или номер сделки, "
-            "или напишите «вручную», чтобы ввести данные без ссылки."
-        )
+            "Привет! Я считаю выкупную цену авто в трейд-ин по метрике АСП.\n\n"
+            "Пришлите ссылку на оценку из MaxPoster, VIN или номер сделки — или выберите действие:"
+        ),
+        keyboard=main_menu_kb(),
     )
 
 
@@ -795,6 +906,7 @@ def admin_menu_kb():
     builder.callback(text="📋 Заявки на доступ", payload="admin_pending")
     builder.callback(text="👥 Пользователи", payload="admin_users")
     builder.callback(text="🏢 Салоны", payload="admin_salons")
+    builder.callback(text="📊 Отчёт за 7 дней", payload="admin_report")
     builder.adjust(1)
     return builder
 
@@ -1045,6 +1157,27 @@ async def _send_to_pats(bot, token: str, deal: dict, approved_role_label: str = 
     return "\n\nОтправлено в ПАЦ." if sent else "\n\n⚠️ Не удалось отправить в ПАЦ, сообщите администратору."
 
 
+def _deal_short(deal: dict) -> str:
+    """«Тюмень Toyota · Kia Rio 2019 · VIN …» — для уведомлений оценщику."""
+    vehicle = deal.get("vehicle") or {}
+    car = " ".join(str(x) for x in [vehicle.get("brand"), vehicle.get("model"), vehicle.get("year")] if x)
+    return " · ".join(x for x in [_deal_salon_label(deal), car, f"VIN {deal['vin']}" if deal.get("vin") else ""] if x)
+
+
+async def _notify_appraiser(bot, token: str, deal: dict, event: str, outcome: Optional[str] = None) -> None:
+    """Пишет оценщику в личку о решении по его сделке и обновляет «Мои оценки»."""
+    try:
+        fields = {"last_event": event}
+        if outcome:
+            fields["outcome"] = outcome
+        appraisals_log.update_by_token(token, **fields)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Не удалось обновить журнал по сделке %s: %s", token, e)
+    user_id = deal.get("manager_user_id")
+    if user_id:
+        await _send_to_user(bot, user_id, f"{event}\n{_deal_short(deal)}")
+
+
 async def _advance_after_salon_approval(bot, token: str, deal: dict, role: Optional[str], approver_name: Optional[str] = None) -> str:
     """Общая логика после согласования на этапе чата салона (только для
     настоящего «Согласовано» — «с корректировкой» обрабатывается отдельно,
@@ -1057,7 +1190,7 @@ async def _advance_after_salon_approval(bot, token: str, deal: dict, role: Optio
         deals_store.update_deal(token, stage="uk_pending", ddc_approved_role=approved_role)
         uk_ids = approval_hierarchy.get_uk_approvers(deal.get("dealer_name"))
         uk_text = (
-            f"Ожидается ваше согласование сделки в рабочем чате «{deal.get('dealer_name') or '—'}».\n\n" + card
+            f"Ожидается ваше согласование сделки в рабочем чате «{_deal_salon_label(deal)}».\n\n" + card
         )
         sent_any = False
         for uk_id in uk_ids:
@@ -1080,11 +1213,15 @@ async def _advance_after_salon_approval(bot, token: str, deal: dict, role: Optio
         else:
             note = "\n\n⚠️ Не удалось отправить УК ни лично, ни в чат — сообщите администратору."
         name_suffix2 = f": {approver_name}" if approver_name else ""
+        await _notify_appraiser(bot, token, deal,
+                                f"✅ Согласовано {approved_role}{name_suffix2}. Сделка ушла на согласование УК.",
+                                outcome="uk")
         return card + f"\n\n✅ Согласовано {approved_role}{name_suffix2}." + note
 
     name_suffix = f": {approver_name}" if approver_name else ""
     final_role_label = f"Согласовано {role}{name_suffix}" if role else "Заявка согласована"
     note = await _send_to_pats(bot, token, deal, approved_role_label=final_role_label)
+    await _notify_appraiser(bot, token, deal, f"✅ {final_role_label}. Сделка ушла на проверку в ПАЦ.", outcome="pats")
     return card + f"\n\n✅ {final_role_label}." + note
 
 
@@ -1093,6 +1230,7 @@ async def _advance_after_uk_approval(bot, token: str, deal: dict, approver_name:
     name_suffix = f": {approver_name}" if approver_name else ""
     final_role_label = f"Согласовано УК{name_suffix}"
     note = await _send_to_pats(bot, token, deal, approved_role_label=final_role_label)
+    await _notify_appraiser(bot, token, deal, f"✅ {final_role_label}. Сделка ушла на проверку в ПАЦ.", outcome="pats")
     return card + f"\n\n✅ {final_role_label}." + note
 
 
@@ -1119,6 +1257,12 @@ async def _return_for_correction(bot, token: str, deal: dict, role: Optional[str
     else:
         note = "\n\n⚠️ Чат салона не зарегистрирован — сообщите оценщику вручную."
 
+    await _notify_appraiser(
+        bot, token, deal,
+        f"🔄 Оценка возвращена на корректировку{role_label}: предложено — цена выкупа "
+        f"{_fmt(deal.get('negotiated_price'))} ₽, ПЦП {_fmt(deal.get('manager_resale_forecast'))} ₽. "
+        "Поправьте цены в MaxPoster и отправьте оценку заново.",
+        outcome="correction")
     card = _deal_card_text(deal)
     deals_store.delete_deal(token)
     return card + "\n\n🔄 Оценка возвращена на корректировку." + note
@@ -1141,6 +1285,7 @@ async def _handle_adjustment_input(message, token: str, deal: dict, bot):
         reposted = bool(salon_chat_id) and await _send_to_chat(bot, salon_chat_id, _deal_card_text(deal), keyboard=kb)
         if not reposted:
             await message.answer(text=_deal_card_text(deal), keyboard=kb)
+        appraisals_log.update_by_token(token, outcome="uk" if prev_stage == "uk_pending" else "salon")
         await message.answer(text="Корректировка отменена, карточка согласования отправлена заново.")
         return
 
@@ -1184,6 +1329,7 @@ async def _request_adjustment(bot, callback, token: str, deal: dict, source: str
         deals_store.update_deal(token, awaiting_input_from=user_id, awaiting_field="price",
                                  awaiting_source=source, stage_before_adjust=deal.get("stage"),
                                  stage="adjusting")
+        appraisals_log.update_by_token(token, outcome="adjusting")
         await callback.answer(text=card + "\n\n🔄 Ожидается ввод новой цены — проверьте личные сообщения от бота.")
     else:
         await callback.answer(notification="Не удалось написать вам лично. Напишите боту что-нибудь в личку и нажмите ещё раз.")
@@ -1262,6 +1408,8 @@ async def on_deal_decline(callback, bot):
     approver_name = _get_user_name(callback)
     name_suffix = f" ({approver_name})" if approver_name else ""
     deals_store.delete_deal(token)
+    await _notify_appraiser(bot, token, deal, f"❌ Отказ в приёме{name_suffix}. Автомобиль не покупаем.",
+                            outcome="declined")
     await callback.answer(text=card + f"\n\n❌ Отказ в приёме{name_suffix}. Автомобиль не будет куплен.")
 
 
@@ -1327,6 +1475,8 @@ async def on_uk_decline(callback, bot):
     approver_name = _get_user_name(callback)
     name_suffix = f" ({approver_name})" if approver_name else ""
     deals_store.delete_deal(token)
+    await _notify_appraiser(bot, token, deal, f"❌ Отказ в приёме{name_suffix}. Автомобиль не покупаем.",
+                            outcome="declined")
     await callback.answer(text=card + f"\n\n❌ Отказ в приёме{name_suffix}. Автомобиль не будет куплен.")
 
 
@@ -1406,6 +1556,9 @@ async def on_pats_done(callback, bot):
         await _send_to_chat(bot, salon_chat_id, card + confirm_line)
 
     deals_store.delete_deal(token)
+    await _notify_appraiser(bot, token, deal,
+                            f"🏁 ПАЦ подтвердил приёмку ({pats_confirmer}). Не забудьте нажать «Согласовать» в Автохабе.",
+                            outcome="accepted")
     await callback.answer(text=pats_card + confirm_line)
 
 
@@ -1480,6 +1633,72 @@ async def cmd_raw(message, command: CommandObject, bot):
         await message.answer(text=f"…и ещё {len(chunks) - 8} сообщ. — показаны первые 8.")
 
 
+def _build_report(records: list, days: int) -> str:
+    """Отчёт по салонам: сколько оценок, куда ушли статусы, чем закончилось, закупка к Авито."""
+    if not records:
+        return f"📊 За {days} дн. оценок нет (учитываются оценки, сделанные в этой версии бота)."
+    groups = {}
+    for r in records:
+        key = salon_label(r["salon"]) if r.get("salon") else (r.get("dealer_name") or "Без салона")
+        groups.setdefault(key, []).append(r)
+
+    def block(name, recs):
+        sent = [r for r in recs if r.get("outcome") != "not_sent"]
+        by_status = {}
+        for r in sent:
+            by_status[r.get("status")] = by_status.get(r.get("status"), 0) + 1
+        ratios = [r["negotiated_price"] / r["avito_price"] for r in sent
+                  if r.get("negotiated_price") and r.get("avito_price")]
+        in_work = sum(1 for r in sent if r.get("outcome") in ("salon", "uk", "adjusting", "pats"))
+        lines = [
+            f"🏢 {name}",
+            f"   оценок: {len(recs)} · отправлено: {len(sent)}",
+        ]
+        if sent:
+            lines.append("   " + " · ".join(f"{_status_text(st)}: {n}" for st, n in
+                                            sorted(by_status.items(), key=lambda x: -x[1])))
+            lines.append(
+                f"   принято ПАЦ: {sum(1 for r in sent if r.get('outcome') == 'accepted')} · "
+                f"в работе: {in_work} · "
+                f"корректировка: {sum(1 for r in sent if r.get('outcome') == 'correction')} · "
+                f"отказ: {sum(1 for r in sent if r.get('outcome') == 'declined')}"
+            )
+        if ratios:
+            lines.append(f"   цена выкупа к Авито: в среднем {sum(ratios) / len(ratios) * 100:.1f}%")
+        return lines
+
+    out = [f"📊 ОТЧЁТ ЗА {days} ДН.", ""]
+    for name in sorted(groups, key=lambda n: -len(groups[n])):
+        out += block(name, groups[name]) + [""]
+    out += block("ВСЕГО", records)
+    return "\n".join(out)
+
+
+@router.message_callback(F.payload == "admin_report")
+async def on_admin_report(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await callback.answer(notification="Только для администраторов.")
+        return
+    await callback.answer(text=_build_report(appraisals_log.since(7), 7)[:3900])
+
+
+@router.message(Command("report"))
+async def cmd_report(message, command: CommandObject, bot):
+    """[админ] /report — за 7 дней, /report 30 — за 30 дней."""
+    if not _is_admin(message.sender.user_id):
+        await message.answer(text="Эта команда только для администраторов.")
+        return
+    arg = (command.args or "").strip()
+    days = int(arg) if arg.isdigit() and 0 < int(arg) <= 366 else 7
+    text = _build_report(appraisals_log.since(days), days)
+    while text:  # длинный отчёт — несколькими сообщениями
+        chunk = text[:3800]
+        if len(text) > 3800 and "\n" in chunk:
+            chunk = chunk[:chunk.rfind("\n")]
+        await message.answer(text=chunk)
+        text = text[len(chunk):].lstrip("\n")
+
+
 @router.message(Command("register_salon"))
 async def cmd_register_salon(message, command: CommandObject, bot):
     if not _is_admin(message.sender.user_id):
@@ -1541,6 +1760,124 @@ def _is_private_chat(message) -> bool:
     if chat_id is not None and user_id is not None:
         return chat_id == user_id
     return True  # не смогли определить — не блокируем, чтобы не сломать личку
+
+
+HELP_TEXT = (
+    "❓ КАК ПОЛЬЗОВАТЬСЯ БОТОМ\n\n"
+    "🆕 Новая оценка — пришлите ссылку на оценку из MaxPoster (или VIN, номер сделки, «вручную»). "
+    "Бот сам подставит автосалон, год, пробег, окрасы, ДТП, переподготовку и цены из MaxPoster, "
+    "спросит недостающее кнопками и покажет расчёт. На согласование карточка уходит только по кнопке "
+    "«Отправить на согласование».\n\n"
+    "✏️ На экране итога можно исправить тип приёма, окрасы, тех. состояние и доп. данные — "
+    "бот пересчитает статус.\n\n"
+    "🧮 Предварительный расчёт — быстрая прикидка без MaxPoster: Авито-оценка, год, пробег и пара кнопок. "
+    "Ничего не отправляется.\n\n"
+    "📋 Мои оценки — последние 10 оценок и где сейчас каждая сделка. О решениях согласующих бот "
+    "пишет вам сам.\n\n"
+    "Статусы: 🟢 Согласовано (РОП) · 🟡 Согласование ДДЦ · 🟠 Согласование УК · "
+    "🔴 выше потолка к Авито (только УК) · ⛔ Не принимать.\n\n"
+    "Команды: /new — новая оценка, /calc — предварительный расчёт, /my — мои оценки, /menu — меню, "
+    "/myid — ваш ID в MAX."
+)
+
+
+def _format_my_appraisals(records: list) -> str:
+    if not records:
+        return "📋 У вас пока нет оценок, сделанных в этой версии бота."
+    lines = [f"📋 МОИ ОЦЕНКИ (последние {len(records)})", ""]
+    for i, r in enumerate(records, 1):
+        ts = (r.get("ts") or "")[:16]
+        when = f"{ts[8:10]}.{ts[5:7]} {ts[11:16]}" if len(ts) >= 16 else ts
+        head = " · ".join(x for x in [when, salon_label(r.get("salon")) if r.get("salon") else r.get("dealer_name"),
+                                      r.get("vehicle") or r.get("vin")] if x)
+        lines.append(f"{i}. {head}")
+        outcome = appraisals_log.OUTCOME_TEXT.get(r.get("outcome"), r.get("outcome") or "")
+        if r.get("negotiated_price"):
+            lines.append(f"   {_fmt(r['negotiated_price'])} ₽ · {_status_text(r.get('status'))} → {outcome}")
+        else:
+            lines.append(f"   расчёт: лимит РОП {_fmt(r.get('limit_rop'))} ₽ · {outcome}")
+        if r.get("last_event"):
+            lines.append(f"   {r['last_event']}")
+    return "\n".join(lines)
+
+
+async def _check_private_access(message) -> bool:
+    if not _is_private_chat(message):
+        return False
+    if not _allowed(message.sender.user_id):
+        await _deny_and_request_access(message, message.sender.user_id)
+        return False
+    return True
+
+
+async def _start_quick_calc(state: FSMContext, answer_fn, user_id, user_name):
+    await state.clear()
+    await state.update_data(_quick=True, _manager_user_id=user_id, _manager_name=user_name)
+    await state.set_state(AppraisalStates.manual_avito)
+    await answer_fn(text="🧮 ПРЕДВАРИТЕЛЬНЫЙ РАСЧЁТ\n\nВведите Авито-оценку автомобиля (₽), например 1200000:")
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message, bot):
+    if await _check_private_access(message):
+        await message.answer(text="Выберите действие:", keyboard=main_menu_kb())
+
+
+@router.message(Command("help"))
+async def cmd_help(message, bot):
+    if await _check_private_access(message):
+        await message.answer(text=HELP_TEXT, keyboard=main_menu_kb())
+
+
+@router.message(Command("my"))
+async def cmd_my(message, bot):
+    if await _check_private_access(message):
+        records = appraisals_log.for_user(message.sender.user_id)
+        await message.answer(text=_format_my_appraisals(records), keyboard=main_menu_kb())
+
+
+@router.message(Command("calc"))
+async def cmd_calc(message, state: FSMContext, bot):
+    if await _check_private_access(message):
+        await _start_quick_calc(state, message.answer, message.sender.user_id,
+                                getattr(message.sender, "first_name", None) or str(message.sender.user_id))
+
+
+@router.message_callback(F.payload == "help")
+async def on_help(callback, bot):
+    await callback.answer(text=HELP_TEXT, keyboard=main_menu_kb())
+
+
+@router.message_callback(F.payload == "my_appraisals")
+async def on_my_appraisals(callback, bot):
+    user_id = _get_user_id(callback)
+    if not _allowed(user_id):
+        await callback.answer(text=f"У вас нет доступа к этому боту. Ваш ID: {user_id}.")
+        return
+    await callback.answer(text=_format_my_appraisals(appraisals_log.for_user(user_id)), keyboard=main_menu_kb())
+
+
+@router.message_callback(F.payload == "quick_calc")
+async def on_quick_calc(callback, state: FSMContext, bot):
+    user_id = _get_user_id(callback)
+    if not _allowed(user_id):
+        await callback.answer(text=f"У вас нет доступа к этому боту. Ваш ID: {user_id}.")
+        return
+    await _start_quick_calc(state, callback.answer, user_id, _get_user_name(callback) or str(user_id))
+
+
+@router.message_callback(F.payload.startswith("edit:"), StateFilter(AppraisalStates.reviewing_result))
+async def on_edit_field(callback, state: FSMContext, bot):
+    """Исправить один ответ на экране итога без новой оценки: бот спросит только его
+    и сразу вернётся к итогу с пересчитанным статусом."""
+    field = callback.payload.split(":", 1)[1]
+    if field not in EDITABLE_FIELDS:
+        return
+    update = {field: None}
+    if field == "extra":
+        update["_extra_manual"] = True  # не подставлять «Более 3х ДТП» автоматически повторно
+    await state.update_data(**update)
+    await _ask_next(state, callback.answer, bot, note=f"✏️ Исправляем: {EDITABLE_FIELDS[field]}")
 
 
 @router.message(Command("new"))
@@ -1838,10 +2175,78 @@ async def on_waiting_negotiated_skip(callback, state: FSMContext, bot):
 async def fallback(message, bot):
     if not _is_private_chat(message):
         return
-    await message.answer(text="Пожалуйста, воспользуйтесь кнопками выше, либо введите /new для новой оценки.")
+    await message.answer(text="Воспользуйтесь кнопками выше или меню ниже.", keyboard=main_menu_kb())
 
 
 dp.include_router(router)
+
+
+# ---------------------------------------------------------------------------
+# Напоминания: сделка долго ждёт решения -> повторно присылаем карточку с кнопками
+# ---------------------------------------------------------------------------
+REMINDER_CHECK_EVERY_SECONDS = 10 * 60
+
+
+def _waiting_text(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int(seconds % 3600 // 60)
+    return f"{hours} ч {minutes} мин" if hours else f"{minutes} мин"
+
+
+async def _remind_deal(bot, token: str, deal: dict, waited: float) -> bool:
+    stage = deal.get("stage")
+    prefix = f"⏰ НАПОМИНАНИЕ: сделка ждёт решения {_waiting_text(waited)}\n\n"
+    if stage == "salon_pending":
+        chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
+        return bool(chat_id) and await _send_to_chat(bot, chat_id, prefix + _deal_card_text(deal),
+                                                     keyboard=deal_approval_kb(token))
+    if stage == "uk_pending":
+        text = prefix + _deal_card_text(deal)
+        sent = False
+        for uk_id in approval_hierarchy.get_uk_approvers(deal.get("dealer_name")):
+            sent = await _send_to_user(bot, uk_id, text, keyboard=uk_approval_kb(token)) or sent
+        if not sent:
+            chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
+            sent = bool(chat_id) and await _send_to_chat(bot, chat_id, text, keyboard=uk_approval_kb(token))
+        return sent
+    if stage == "pats_pending":
+        chat_id = dealer_chats.get_pats_chat_id()
+        return bool(chat_id) and await _send_to_chat(
+            bot, chat_id, prefix + _pats_card_text(deal, deal.get("final_approved_by_role")),
+            keyboard=pats_done_kb(token))
+    return False
+
+
+async def _check_reminders(bot) -> None:
+    now = time.time()
+    if not (REMINDER_HOURS[0] <= datetime.datetime.now().hour < REMINDER_HOURS[1]):
+        return
+    after = REMINDER_AFTER_MINUTES * 60
+    for token, deal in deals_store.list_deals().items():
+        if deal.get("stage") not in ("salon_pending", "uk_pending", "pats_pending"):
+            continue
+        since = deal.get("stage_since")
+        if not since:  # сделка из версии без отметок времени — считаем с этого момента
+            deals_store.update_deal(token, stage_since=now)
+            continue
+        last = deal.get("reminded_at") or since
+        if now - last < after:
+            continue
+        if await _remind_deal(bot, token, deal, now - since):
+            logger.info("[reminder] token=%s stage=%s напоминание отправлено", token, deal.get("stage"))
+        deals_store.update_deal(token, reminded_at=now)
+
+
+async def _reminder_loop(bot) -> None:
+    if REMINDER_AFTER_MINUTES <= 0:
+        logger.info("Напоминания согласующим выключены (REMINDER_AFTER_MINUTES=0)")
+        return
+    while True:
+        await asyncio.sleep(REMINDER_CHECK_EVERY_SECONDS)
+        try:
+            await _check_reminders(bot)
+        except Exception:  # noqa: BLE001
+            logger.exception("Ошибка при проверке напоминаний")
 
 
 async def _set_commands_menu():
@@ -1849,7 +2254,11 @@ async def _set_commands_menu():
     запоминать команды — они появятся со своими описаниями в списке."""
     try:
         await bot.set_my_commands([
+            {"name": "menu", "description": "Главное меню"},
             {"name": "new", "description": "Начать новую оценку"},
+            {"name": "calc", "description": "Предварительный расчёт (без отправки)"},
+            {"name": "my", "description": "Мои оценки и их статусы"},
+            {"name": "help", "description": "Как пользоваться ботом"},
             {"name": "myid", "description": "Узнать свой ID в MAX"},
             {"name": "admin", "description": "Меню администратора (заявки/пользователи/салоны)"},
             {"name": "pending", "description": "[админ] Заявки на доступ"},
@@ -1858,6 +2267,7 @@ async def _set_commands_menu():
             {"name": "register_salon", "description": "[админ] Привязать этот чат к салону"},
             {"name": "register_pats", "description": "[админ] Назначить этот чат общим чатом ПАЦ"},
             {"name": "raw", "description": "[админ] Все поля оценки из MaxPoster"},
+            {"name": "report", "description": "[админ] Отчёт по салонам за 7 дней (/report 30 — за 30)"},
         ])
     except Exception as e:  # noqa: BLE001
         logger.warning("Не удалось задать меню команд: %s", e)
@@ -1865,6 +2275,7 @@ async def _set_commands_menu():
 
 async def _main():
     await _set_commands_menu()
+    reminder_task = asyncio.create_task(_reminder_loop(bot))  # noqa: F841 — живёт, пока работает бот
     await dp.start_polling(bot)
 
 
