@@ -7,12 +7,7 @@
 Google Таблице, что и история оценок. Формат вкладки (первая строка —
 заголовки, должны совпадать буквально):
 
-Салон | РОП ID | РОП Имя | ДДЦ ID | ДДЦ Имя | УК ID | УК Имя | Город
-
-"Город" (необязательно) — город салона для расчёта ПЦП: один из городов
-вкладки «Параметры Метрики v2» или группа салонов вроде «Тойота». Если
-пусто — бот определит город по названию салона, а если не сможет —
-спросит у оценщика кнопками.
+Салон | РОП ID | РОП Имя | ДДЦ ID | ДДЦ Имя | УК ID | УК Имя
 
 "Салон" — название точно как dealer.companyName в MaxPoster (то же самое,
 что вы указывали в /register_salon). ID — числовые ID пользователей MAX
@@ -52,7 +47,7 @@ from config import GOOGLE_SERVICE_ACCOUNT_FILE, GOOGLE_SHEET_ID
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TAB_NAME = "Иерархия согласования"
-HEADER = ["Салон", "РОП ID", "РОП Имя", "ДДЦ ID", "ДДЦ Имя", "УК ID", "УК Имя", "Город"]
+HEADER = ["Салон", "РОП ID", "РОП Имя", "ДДЦ ID", "ДДЦ Имя", "УК ID", "УК Имя"]
 
 ROWS_CACHE_TTL_SECONDS = 60
 
@@ -151,21 +146,6 @@ def get_uk_approvers(dealer_name: Optional[str]) -> set:
         return _ids_from_cell(row.get("УК ID"))
 
     return set()
-
-
-def get_salon_city(dealer_name: Optional[str]) -> Optional[str]:
-    """Город салона из колонки «Город» (пусто/нет колонки/ошибка чтения -> None)."""
-    if not dealer_name:
-        return None
-    try:
-        rows = _get_rows()
-    except Exception as e:  # noqa: BLE001
-        print(f"[approval_hierarchy] Не удалось прочитать вкладку «{TAB_NAME}»: {e}", flush=True)
-        return None
-    for row in rows:
-        if normalize_salon_name(row.get("Салон", "")) == normalize_salon_name(dealer_name):
-            return str(row.get("Город") or "").strip() or None
-    return None
 
 
 def get_pats_approvers() -> set:

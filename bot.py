@@ -45,8 +45,8 @@ from maxgram.utils.keyboard import InlineKeyboardBuilder
 from config import MAX_BOT_TOKEN, ALLOWED_USER_IDS, ADMIN_USER_IDS, OWNER_USER_ID
 from pricing_engine import (
     AppraisalInput, calc_appraisal, colors_bucket_from_count,
-    get_colors_options, get_condition_options, get_extra_options, get_city_options, RECEPTION_TYPES,
-    city_from_salon_name, ptsp_city, is_young_car, UK_STATUSES, STATUS_REJECT,
+    get_colors_options, get_condition_options, get_extra_options, get_salon_options, RECEPTION_TYPES,
+    find_salon, salon_label, is_young_car, UK_STATUSES, STATUS_REJECT,
     EXTRA_YOUNG_CAR, EXTRA_NOT_APPLICABLE, METRIC_VERSION,
 )
 from maxposter_client import fetch_appraisal, MaxPosterError
@@ -75,7 +75,7 @@ class AppraisalStates(StatesGroup):
     manual_vin = State()
     manual_avito = State()
     reception_type = State()
-    city = State()
+    salon = State()
     year = State()
     mileage = State()
     colors = State()
@@ -119,24 +119,18 @@ def _maxposter_link(appraisal_id) -> Optional[str]:
     return f"https://app.maxposter.ru/holding/used/appraisals/{appraisal_id}/view"
 
 
-def _city_label(city: Optional[str]) -> str:
-    """«Казань» или «Тойота → коэффициенты города Краснодар»."""
-    if not city:
-        return "—"
-    coef_city = ptsp_city(city)
-    return city if coef_city == city else f"{city} → коэффициенты города {coef_city}"
-
-
 def _vehicle_header(vehicle_info: dict, reception_type: Optional[str] = None) -> str:
     """Шапка с городом, типом контракта, авто и ссылкой на оценку — идёт в начале
-    и итогового расчёта, и карточки согласования. Город — первой строкой:
-    по правилам метрики согласующий первым делом проверяет город."""
+    и итогового расчёта, и карточки согласования. Автосалон (город и бренд) —
+    первой строкой: от него зависит ПЦП, согласующий проверяет его первым."""
     vehicle_line = " ".join(
         str(x) for x in [vehicle_info.get("brand"), vehicle_info.get("model"), vehicle_info.get("year")] if x
     )
     lines = []
-    if vehicle_info.get("city"):
-        lines.append(f"🏙 ГОРОД: {_city_label(vehicle_info['city'])}")
+    if vehicle_info.get("salon"):
+        lines.append(f"🏢 Автосалон: {salon_label(vehicle_info['salon'])}")
+    elif vehicle_info.get("city"):  # сделки, созданные до перехода на ПЦП автосалона
+        lines.append(f"🏢 Город: {vehicle_info['city']}")
     if reception_type:
         lines.append(f"Тип контракта: {reception_type}")
     if vehicle_line:
@@ -158,7 +152,7 @@ def _appraisal_input(data: dict) -> AppraisalInput:
         colors=data["colors"],
         condition=data["condition"],
         extra=data["extra"],
-        city=data.get("city"),
+        salon=data.get("salon"),
         year=data.get("year"),
         mileage=data.get("mileage"),
         refurbishment_cost=data.get("presale_preparation_cost") or 0.0,
@@ -259,8 +253,13 @@ def extra_kb():
     return _kb(get_extra_options(), "extra")
 
 
-def city_kb():
-    return _kb(get_city_options(), "city")
+def salon_kb():
+    """Кнопки салонов: подпись «Тюмень Toyota», в payload — название из таблицы."""
+    builder = InlineKeyboardBuilder()
+    for name in get_salon_options():
+        builder.callback(text=salon_label(name), payload=f"salon:{name}")
+    builder.adjust(1)
+    return builder
 
 
 def skip_kb(payload: str):
@@ -318,7 +317,7 @@ def _vehicle_info(data: dict) -> dict:
         "appraiser_name": data.get("appraiser_name"),
         "dealer_name": data.get("dealer_name"),
         "appraisal_id": data.get("appraisal_id"),
-        "city": data.get("city"),
+        "salon": data.get("salon"),
     }
 
 
@@ -345,9 +344,12 @@ def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_nam
                          presale_preparation_cost=None, metrics: Optional[dict] = None) -> str:
     metrics = metrics or {}
     header = _vehicle_header(vehicle_info, reception_type)
-    lines = ["📋 СОГЛАСОВАНИЕ СДЕЛКИ", f"Оценщик: {vehicle_info.get('appraiser_name') or manager_name or '—'}"]
-    if header:
-        lines.append(header)
+    # шапка начинается с автосалона, оценщик — сразу под ней
+    header_lines = header.split("\n") if header else []
+    salon_lines = [ln for ln in header_lines if ln.startswith("🏢")]
+    rest = [ln for ln in header_lines if not ln.startswith("🏢")]
+    lines = ["📋 СОГЛАСОВАНИЕ СДЕЛКИ", *salon_lines,
+             f"Оценщик: {vehicle_info.get('appraiser_name') or manager_name or '—'}", *rest]
     lines += [
         f"VIN: {vin or '—'}",
         f"Категория: {result.category}"
@@ -409,7 +411,7 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
         "reception_type": appraisal_input.reception_type,
         "appraiser_sale_cost": appraiser_sale_cost,
         "presale_preparation_cost": presale_preparation_cost,
-        "city": vehicle_info.get("city"),
+        "salon": vehicle_info.get("salon"),
         "metrics": _metrics(result),
         "stage": "salon_pending",
     })
@@ -417,7 +419,7 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
     if not salon_chat_id:
         return (
             "\n\n⚠️ Салон "
-            + (f"«{dealer_name}» " if dealer_name else "")
+            + (f"«{_salon_name_for_chat(vehicle_info)}» " if dealer_name else "")
             + "не привязан к чату согласования — пока согласуйте по старому процессу."
         )
 
@@ -428,7 +430,7 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
                                 metrics=_metrics(result))
     sent = await _send_to_chat(bot, salon_chat_id, text, keyboard=deal_approval_kb(token))
     if sent:
-        return f"\n\n✅ Карточка отправлена на согласование в чат салона «{dealer_name}»."
+        return f"\n\n✅ Карточка отправлена на согласование в чат салона «{_salon_name_for_chat(vehicle_info)}»."
     return "\n\n⚠️ Не получилось отправить карточку в чат салона — согласуйте по старому процессу."
 
 
@@ -499,11 +501,11 @@ async def _ask_next(state: FSMContext, answer_fn, bot, note: str = ""):
         await state.set_state(AppraisalStates.reception_type)
         await answer_fn(text=prefix + "Выберите тип приёма:", keyboard=reception_kb())
         return
-    if not data.get("city") or data["city"] not in get_city_options():
-        await state.set_state(AppraisalStates.city)
+    if not data.get("salon") or data["salon"] not in get_salon_options():
+        await state.set_state(AppraisalStates.salon)
         await answer_fn(
-            text=prefix + "Выберите ГОРОД салона (выбирайте только свой — от него зависит ПЦП):",
-            keyboard=city_kb(),
+            text=prefix + "Выберите АВТОСАЛОН (только свой — от него зависит ПЦП):",
+            keyboard=salon_kb(),
         )
         return
     if not data.get("year"):
@@ -998,13 +1000,26 @@ def _deal_card_text(deal: dict) -> str:
     )
 
 
+def _salon_name_for_chat(vehicle_info: dict) -> str:
+    """«Тюмень Toyota» вместо «10089: !АСП Тюмень Toyota действующий»."""
+    if vehicle_info.get("salon"):
+        return salon_label(vehicle_info["salon"])
+    return vehicle_info.get("dealer_name") or "—"
+
+
+def _deal_salon_label(deal: dict) -> str:
+    if deal.get("salon"):
+        return salon_label(deal["salon"])
+    return deal.get("dealer_name") or "—"
+
+
 def _pats_card_text(deal: dict, approved_role_label: str = "") -> str:
     status_line = f"Статус: {approved_role_label}\n" if approved_role_label else ""
     link = _maxposter_link((deal.get("vehicle") or {}).get("appraisal_id"))
     link_line = f"Оценка в MaxPoster: {link}\n" if link else ""
     return (
         "📋 НА ПОДТВЕРЖДЕНИЕ В АВТОХАБ (ПАЦ)\n"
-        f"Салон: {deal.get('dealer_name') or '—'}\n"
+        f"🏢 Автосалон: {_deal_salon_label(deal)}\n"
         f"VIN: {deal.get('vin') or '—'}\n"
         + link_line +
         f"Оценщик: {(deal.get('vehicle') or {}).get('appraiser_name') or deal.get('manager_name') or '—'}\n"
@@ -1601,7 +1616,7 @@ async def on_waiting_link(message, state: FSMContext, bot):
     if data.repainted_parts_count is not None:
         colors_bucket = colors_bucket_from_count(data.repainted_parts_count)
 
-    city, city_source = await _resolve_salon_city(data.dealer_name)
+    salon = _resolve_salon(data.dealer_name)
 
     await state.clear()  # новая оценка — не тащим ответы из прошлой
     await state.update_data(
@@ -1624,13 +1639,11 @@ async def on_waiting_link(message, state: FSMContext, bot):
         appraiser_name=data.appraiser_name,
         dealer_name=data.dealer_name,
         appraisal_id=data.appraisal_id,
-        city=city,
+        salon=salon,
     )
 
     vehicle_line = " ".join(str(x) for x in [data.brand, data.model, data.year] if x)
     auto = []  # что подставили сами — оценщику не нужно вводить
-    if city:
-        auto.append(f"город — {_city_label(city)} ({city_source})")
     if data.year:
         auto.append(f"год — {data.year}")
     if data.mileage is not None:
@@ -1643,35 +1656,25 @@ async def on_waiting_link(message, state: FSMContext, bot):
         auto.append(f"цена продажи ДЦ — {_fmt(data.appraisal_sale_cost)} ₽")
     if data.appraisal_purchase_cost is not None:
         auto.append(f"цена выкупа — {_fmt(data.appraisal_purchase_cost)} ₽")
+    salon_line = (f"🏢 Автосалон: {salon_label(salon)}" if salon
+                  else f"🏢 Автосалон: {data.dealer_name or '—'} (нет в таблице — выберите ниже)")
     note = (
-        f"Нашёл оценку. {vehicle_line + chr(10) if vehicle_line else ''}"
+        f"Нашёл оценку.\n{salon_line}\n{vehicle_line + chr(10) if vehicle_line else ''}"
         f"ВИН: {data.vin or '—'}, Оценщик: {data.appraiser_name or '—'}\n"
-        f"Салон: {data.dealer_name or '—'}\n"
         f"Авито-оценка: {_fmt(data.avito_price)} ₽, ДТП: {data.accidents_count}"
         + ("\n\nИз MaxPoster подставлено: " + "; ".join(auto) + "." if auto else "")
     )
     await _ask_next(state, message.answer, bot, note=note)
 
 
-async def _resolve_salon_city(dealer_name: Optional[str]):
-    """Город салона для расчёта ПЦП: колонка «Город» во вкладке «Иерархия
-    согласования», иначе — по названию салона (группы вроде «Тойота» —
-    по ключевым словам). Возвращает (город или None, откуда взяли)."""
-    if not dealer_name:
-        return None, ""
-    options = get_city_options()
-    from_sheet = await asyncio.to_thread(approval_hierarchy.get_salon_city, dealer_name)
-    if from_sheet in options:
-        return from_sheet, "по настройке салона"
-    if from_sheet:
-        logger.warning("Город «%s» салона «%s» не найден в параметрах метрики", from_sheet, dealer_name)
-    by_name = city_from_salon_name(dealer_name)
-    if by_name in options:
-        return by_name, "по названию салона"
-    logger.warning("Город не определён по названию салона «%s» — оценщик выберет кнопкой. "
-                   "Допишите вариант написания в «Значение4» на вкладке «Параметры Метрики v2».",
-                   dealer_name)
-    return None, ""
+def _resolve_salon(dealer_name: Optional[str]) -> Optional[str]:
+    """Салон из таблицы «ПЦП автосалона» по названию из MaxPoster. Если его там
+    нет — оценщик выберет кнопкой, а в лог пишем подсказку для администратора."""
+    salon = find_salon(dealer_name)
+    if dealer_name and not salon:
+        logger.warning("Салона «%s» нет в разделе «ПЦП автосалона» вкладки «Параметры Метрики v2» — "
+                       "оценщик выберет салон кнопкой. Добавьте строку с этим названием.", dealer_name)
+    return salon
 
 
 @router.message(StateFilter(AppraisalStates.manual_vin))
@@ -1696,7 +1699,7 @@ async def on_manual_avito(message, state: FSMContext, bot):
         avito_price=avito_price, accidents_count=None, colors=None,
         repair_cost_min=None, repair_cost_max=None, autoteka_url=None,
         appraisal_purchase_cost=None, appraisal_sale_cost=None, presale_preparation_cost=None,
-        city=None, year=None, mileage=None,
+        salon=None, year=None, mileage=None,
     )
     await _ask_next(state, message.answer, bot)
 
@@ -1708,14 +1711,19 @@ async def on_reception(callback, state: FSMContext, bot):
     await _ask_next(state, callback.answer, bot, note=f"Тип приёма: {value}")
 
 
-@router.message_callback(F.payload.startswith("city:"), StateFilter(AppraisalStates.city))
-async def on_city(callback, state: FSMContext, bot):
+@router.message_callback(F.payload.startswith("salon:"), StateFilter(AppraisalStates.salon))
+async def on_salon(callback, state: FSMContext, bot):
     value = callback.payload.split(":", 1)[1]
-    if value not in get_city_options():
-        await callback.answer(text="Такого города нет в метрике. Выберите из списка:", keyboard=city_kb())
+    if value not in get_salon_options():
+        await callback.answer(text="Такого салона нет в таблице. Выберите из списка:", keyboard=salon_kb())
         return
-    await state.update_data(city=value)
-    await _ask_next(state, callback.answer, bot, note=f"Город: {_city_label(value)}")
+    data = await state.get_data()
+    update = {"salon": value}
+    if not data.get("dealer_name"):
+        # ручной ввод: салон из таблицы = салон для маршрутизации карточки согласования
+        update["dealer_name"] = value
+    await state.update_data(**update)
+    await _ask_next(state, callback.answer, bot, note=f"Автосалон: {salon_label(value)}")
 
 
 @router.message(StateFilter(AppraisalStates.year))

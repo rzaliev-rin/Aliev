@@ -7,7 +7,7 @@
 в комментариях указаны ячейки. Главное правило:
     закупка = ПЦП − плановая ВП − переподготовка (но не выше потолка к Авито Оценке).
 
-Все нормы (баллы, пробег, ПЦП по городам, доходность, потолок, GM2) берутся
+Все нормы (баллы, пробег, ПЦП по автосалонам, доходность, потолок, GM2) берутся
 из pricing_config.get_params() — их можно менять в Google Таблице без правки кода.
 """
 
@@ -59,53 +59,54 @@ def get_extra_options() -> list:
     return list(pricing_config.get_params()["extra_score"].keys())
 
 
-def get_city_options() -> list:
-    """Города + группы салонов со своими коэффициентами (например, «Тойота»)."""
-    params = pricing_config.get_params()
-    return list(params["city_ptsp"].keys()) + list(params["city_aliases"].keys())
+def get_salon_options() -> list:
+    """Названия автосалонов (как в MaxPoster) из таблицы «ПЦП автосалона»."""
+    return list(pricing_config.get_params()["salons"].keys())
 
 
-def ptsp_city(city: Optional[str]) -> Optional[str]:
-    """Город, чьи коэффициенты ПЦП применяются: «Тойота» -> «Краснодар», «Казань» -> «Казань»."""
-    alias = pricing_config.get_params()["city_aliases"].get(city or "")
-    return alias["city"] if alias else city
+def salon_info(salon: Optional[str]) -> dict:
+    """{"ptsp": {...}, "city": ..., "brand": ...} или {} для неизвестного салона."""
+    return pricing_config.get_params()["salons"].get(salon or "", {})
 
 
-def _normalize_name(text: str) -> str:
-    """«3047: Экспокар Н.Новгород!» -> «3047 экспокар н новгород»."""
-    text = str(text).lower().replace("ё", "е")
-    return " ".join(re.split(r"[^0-9a-zа-я]+", text)).strip()
+def salon_label(salon: Optional[str]) -> str:
+    """Как показывать салон: «Тюмень Toyota» (город и бренд из таблицы);
+    если их не заполнили — название из MaxPoster без номера."""
+    if not salon:
+        return "—"
+    info = salon_info(salon)
+    label = " ".join(x for x in (info.get("city"), info.get("brand")) if x)
+    return label or re.sub(r"^\s*\d+\s*[:\-–]\s*!*\s*", "", str(salon)).strip() or str(salon)
 
 
-def _has_keyword(text: str, keyword: str) -> bool:
-    """Слово в названии начинается с keyword («казан» ловит «Казань», «Казани»);
-    короткие ключи (до 3 букв, например «нн») — только целым словом."""
-    kw = _normalize_name(keyword)
-    if not kw:
-        return False
-    tail = r"(?![0-9a-zа-я])" if len(kw) <= 3 else ""
-    return re.search(r"(?<![0-9a-zа-я])" + re.escape(kw) + tail, text) is not None
+def _normalize_salon(name) -> str:
+    """«10089: !АСП Тюмень Toyota действующий» -> «асп тюмень toyota действующий»:
+    без номера и «!» в начале, без регистра и лишних пробелов."""
+    if not name:
+        return ""
+    s = str(name).strip().lower().replace("ё", "е")
+    while True:
+        new_s = re.sub(r"^!+\s*", "", s)
+        new_s = re.sub(r"^\d+\s*[:\-–]\s*", "", new_s).strip()
+        if new_s == s:
+            break
+        s = new_s
+    return " ".join(s.split())
 
 
-def city_from_salon_name(dealer_name: Optional[str]) -> Optional[str]:
-    """Определяет город (или группу салонов вроде «Тойота») по названию салона
-    из MaxPoster. Сначала — группы салонов по ключевым словам (салон Тойота в
-    Казани всё равно считается по коэффициентам Краснодара), затем — город по
-    словам из city_keywords (склонения, сокращения, латиница). Если подходят
-    два разных города — None: пусть оценщик выберет сам."""
+def find_salon(dealer_name: Optional[str]) -> Optional[str]:
+    """Салон из таблицы «ПЦП автосалона» по названию из MaxPoster
+    (dealer.companyName). Номер и «!» в начале не важны. None — салона нет в таблице."""
     if not dealer_name:
         return None
-    text = _normalize_name(dealer_name)
-    params = pricing_config.get_params()
-    for alias, rule in params["city_aliases"].items():
-        if any(_has_keyword(text, k) for k in rule.get("keywords") or []):
-            return alias
-    found = []
-    for city in params["city_ptsp"]:
-        keywords = params.get("city_keywords", {}).get(city) or [city]
-        if any(_has_keyword(text, k) for k in keywords):
-            found.append(city)
-    return found[0] if len(found) == 1 else None
+    salons = pricing_config.get_params()["salons"]
+    if dealer_name in salons:
+        return dealer_name
+    target = _normalize_salon(dealer_name)
+    for name in salons:
+        if _normalize_salon(name) == target:
+            return name
+    return None
 
 
 def car_age_years(year: Optional[int], today: Optional[datetime.date] = None) -> Optional[int]:
@@ -205,7 +206,7 @@ class AppraisalInput:
     colors: str                 # B1 "Окрасы"
     condition: str              # B2 "Тех. состояние"
     extra: str                  # B3 "Доп. данные"
-    city: Optional[str] = None  # B10 "ГОРОД"
+    salon: Optional[str] = None  # B10 "ГОРОД" -> автосалон из таблицы «ПЦП автосалона»
     year: Optional[int] = None  # E1 "Год выпуска"
     mileage: Optional[float] = None  # E2 "Пробег, км"
     negotiated_price: Optional[float] = None   # C14 "Прогноз ДЦ: закупка" — цена, о которой договорились с клиентом
@@ -243,9 +244,8 @@ class AppraisalResult:
 
 def calc_appraisal(data: AppraisalInput, today: Optional[datetime.date] = None) -> AppraisalResult:
     params = pricing_config.get_params()
-    coef_city = ptsp_city(data.city)
-    if not coef_city or coef_city not in params["city_ptsp"]:
-        raise ValueError("Не выбран город")
+    if not data.salon or data.salon not in params["salons"]:
+        raise ValueError("Не выбран автосалон")
     if not data.year or data.mileage is None:
         raise ValueError("Не заполнены год выпуска или пробег")
 
@@ -257,8 +257,8 @@ def calc_appraisal(data: AppraisalInput, today: Optional[datetime.date] = None) 
     ceiling_coef = params["ceiling"].get(category, {}).get("street" if street else "default", 0)
     ceiling_price = _excel_rounddown(data.avito_price * ceiling_coef, -3)
 
-    # B12/E12: ПЦП = Авито Оценка × (коэф. города и категории − поправка выкупа [+ п.п. ДДЦ])
-    coef = params["city_ptsp"][coef_city].get(category, 0)
+    # B12/E12: ПЦП = Авито Оценка × (коэф. салона и категории − поправка выкупа [+ п.п. ДДЦ])
+    coef = params["salons"][data.salon]["ptsp"].get(category, 0)
     if street:
         coef -= params["street_ptsp_minus"].get(category, 0)
     planned_rop = data.avito_price * coef

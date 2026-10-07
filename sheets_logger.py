@@ -19,6 +19,7 @@ from google.oauth2.service_account import Credentials
 
 from config import GOOGLE_SERVICE_ACCOUNT_FILE, GOOGLE_SHEET_ID, GOOGLE_SHEET_TAB_V2
 from pricing_config import METRIC_VERSION
+from pricing_engine import salon_info
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -72,8 +73,8 @@ def log_appraisal(manager_name: str, vin: Optional[str], data, result, vehicle_i
         ws.append_row([
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             manager_name,
-            vehicle_info.get("dealer_name") or "",
-            getattr(data, "city", None) or "",
+            vehicle_info.get("dealer_name") or getattr(data, "salon", None) or "",
+            salon_info(getattr(data, "salon", None)).get("city") or "",
             vin or "",
             vehicle_info.get("brand") or "",
             vehicle_info.get("model") or "",
