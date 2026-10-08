@@ -63,17 +63,24 @@ BACKUP_KEEP_DAYS = int(os.environ.get("BACKUP_KEEP_DAYS", "14") or 14)
 DUPLICATE_DAYS = int(os.environ.get("DUPLICATE_DAYS", "7") or 7)
 
 # --- Поля MaxPoster, которых нет в стандартном наборе (уточняются по выводу /raw) ---
-# Дата Авито-оценки/осмотра: путь к полю в ответе MaxPoster (например "createdAt"); пусто — автопоиск
-MAXPOSTER_APPRAISAL_DATE_FIELD = os.environ.get("MAXPOSTER_APPRAISAL_DATE_FIELD", "").strip()
+# Значения по умолчанию сверены по /raw оценки 8753604 (08.10.2026).
+# Дата Авито-оценки/осмотра: путь к полю в ответе MaxPoster; пусто в .env — inspection.finishedAt
+MAXPOSTER_APPRAISAL_DATE_FIELD = (os.environ.get("MAXPOSTER_APPRAISAL_DATE_FIELD", "").strip() or "inspection.finishedAt")
 # Авито-оценка старше стольких дней — предупреждение (по метрике оценка нужна на день осмотра)
 AVITO_MAX_AGE_DAYS = int(os.environ.get("AVITO_MAX_AGE_DAYS", "3") or 3)
 # Тип приёма: путь к полю и соответствие значений, например
-# MAXPOSTER_RECEPTION_FIELD=purchaseType
-# MAXPOSTER_RECEPTION_MAP=trade_in:Trade-In,trade_up:Trade-Up,buyout:Выкуп с улицы,pi:Trade-In на ПИ
-MAXPOSTER_RECEPTION_FIELD = os.environ.get("MAXPOSTER_RECEPTION_FIELD", "").strip()
+# MAXPOSTER_RECEPTION_FIELD=acquisitionSource
+# MAXPOSTER_RECEPTION_MAP=trade_in_new:Trade-In,<значение>:Выкуп с улицы,...
+# Значения из .env дополняют (и при совпадении заменяют) соответствия по умолчанию.
+# Неизвестное значение — бот спросит тип приёма у оценщика кнопками.
+MAXPOSTER_RECEPTION_FIELD = (os.environ.get("MAXPOSTER_RECEPTION_FIELD", "").strip() or "acquisitionSource")
 MAXPOSTER_RECEPTION_MAP = {
+    "trade_in_new": "Trade-In",  # «Трейд-ин новый» в интерфейсе MaxPoster
+}
+MAXPOSTER_RECEPTION_MAP.update({
     k.strip().lower(): v.strip()
     for k, v in (pair.split(":", 1) for pair in os.environ.get("MAXPOSTER_RECEPTION_MAP", "").split(",") if ":" in pair)
-}
-# ПЦП Автохаб (справочно, для «цена выкупа к ПЦП Автохаб»): путь к полю
-MAXPOSTER_AUTOHUB_PTSP_FIELD = os.environ.get("MAXPOSTER_AUTOHUB_PTSP_FIELD", "").strip()
+})
+# ПЦП Автохаб (справочно, для «цена выкупа к ПЦП Автохаб»): путь к полю.
+# maxposterSaleCost = 1 025 600 — в интерфейсе показан округлённо как 1 026 000.
+MAXPOSTER_AUTOHUB_PTSP_FIELD = (os.environ.get("MAXPOSTER_AUTOHUB_PTSP_FIELD", "").strip() or "maxposterSaleCost")

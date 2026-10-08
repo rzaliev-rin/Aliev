@@ -70,7 +70,7 @@ class AppraisalData:
 
 # Где искать дату оценки, если MAXPOSTER_APPRAISAL_DATE_FIELD не задан
 APPRAISAL_DATE_CANDIDATES = [
-    "inspection.date", "inspection.createdAt", "inspectedAt", "inspectionDate",
+    "inspection.finishedAt", "inspection.startedAt", "inspection.date", "inspection.createdAt", "inspectedAt", "inspectionDate",
     "imvDate", "imvUpdatedAt", "imv_date", "appraisalDate", "createdAt", "created", "date",
 ]
 
@@ -111,7 +111,9 @@ def parse_date(value: Any) -> Optional[datetime.datetime]:
 def _extra_fields(data: dict) -> dict:
     """Дата оценки, тип приёма и ПЦП Автохаб — по путям из .env (или автопоиск даты)."""
     result = {}
-    paths = [MAXPOSTER_APPRAISAL_DATE_FIELD] if MAXPOSTER_APPRAISAL_DATE_FIELD else APPRAISAL_DATE_CANDIDATES
+    # сначала поле из настроек, при его отсутствии (осмотр не завершён) — автопоиск
+    paths = [MAXPOSTER_APPRAISAL_DATE_FIELD] if MAXPOSTER_APPRAISAL_DATE_FIELD else []
+    paths += [p for p in APPRAISAL_DATE_CANDIDATES if p not in paths]
     for path in paths:
         dt = parse_date(get_path(data, path))
         if dt:
