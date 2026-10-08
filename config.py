@@ -77,11 +77,21 @@ MAXPOSTER_RECEPTION_FIELD = (os.environ.get("MAXPOSTER_RECEPTION_FIELD", "").str
 MAXPOSTER_RECEPTION_MAP = {
     "trade_in_new": "Trade-In",  # «Трейд-ин новый» в интерфейсе MaxPoster
     "trade_in_used": "Trade-Up",  # «Трейд-ин с пробегом» = Trade-Up (оценка 8737839)
+    # «Выкуп» и «Комиссия»: точный код ещё не видели в /raw — частые варианты;
+    # кроме того, любое значение со словом buy/выкуп считается выкупом, commiss/комис — комиссией
+    "buyout": "Выкуп с улицы", "buy_out": "Выкуп с улицы", "buyback": "Выкуп с улицы",
+    "purchase": "Выкуп с улицы", "redemption": "Выкуп с улицы",
+    "commission": "Комиссия", "consignment": "Комиссия",
 }
 MAXPOSTER_RECEPTION_MAP.update({
     k.strip().lower(): v.strip()
     for k, v in (pair.split(":", 1) for pair in os.environ.get("MAXPOSTER_RECEPTION_MAP", "").split(",") if ":" in pair)
 })
+# Особые соответствия для бренда салона (бренд — из названия салона в MaxPoster).
+# Toyota (Тюмень, Екатеринбург): «Трейд-ин новый» = Trade-In на ПИ.
+MAXPOSTER_RECEPTION_BRAND_MAP = {
+    "toyota": {"trade_in_new": "Trade-In на ПИ"},
+}
 # ПЦП Автохаб (справочно, для «цена выкупа к ПЦП Автохаб»): путь к полю.
 # maxposterSaleCost = 1 025 600 — в интерфейсе показан округлённо как 1 026 000.
 MAXPOSTER_AUTOHUB_PTSP_FIELD = (os.environ.get("MAXPOSTER_AUTOHUB_PTSP_FIELD", "").strip() or "maxposterSaleCost")

@@ -52,11 +52,11 @@ from config import (MAX_BOT_TOKEN, ALLOWED_USER_IDS, ADMIN_USER_IDS, OWNER_USER_
 from pricing_engine import (
     AppraisalInput, calc_appraisal, colors_bucket_from_count,
     get_colors_options, get_condition_options, get_extra_options, get_salon_options, RECEPTION_TYPES,
-    find_salon, salon_label, is_young_car, UK_STATUSES, STATUS_REJECT,
-    STATUS_OK, STATUS_DDC, STATUS_UK, STATUS_UK_CEILING,
+    find_salon, salon_label, salon_info, is_young_car, UK_STATUSES, STATUS_REJECT,
+    STATUS_OK, STATUS_DDC, STATUS_UK, STATUS_UK_CEILING, STATUS_COMMISSION, COMMISSION,
     EXTRA_YOUNG_CAR, EXTRA_NOT_APPLICABLE, METRIC_VERSION,
 )
-from maxposter_client import fetch_appraisal, MaxPosterError
+from maxposter_client import fetch_appraisal, MaxPosterError, map_reception
 from sheets_logger import log_appraisal
 import access_store
 import appraisals_log
@@ -134,6 +134,7 @@ STATUS_BADGES = {
     STATUS_UK: "🟠",
     STATUS_UK_CEILING: "🔴",
     STATUS_REJECT: "⛔",
+    STATUS_COMMISSION: "🔵",
 }
 
 
@@ -241,7 +242,12 @@ def _result_text(result, avito_price: float, extra_info: dict, vehicle_info: dic
         f"Переподготовка: {_fmt(result.refurbishment)} ₽" if result.refurbishment else "Переподготовка: не запланирована",
         "",
     ]
-    if not result.can_accept:
+    if reception_type == COMMISSION:
+        lines += [
+            "🔵 Комиссия: согласование по метрике не требуется — подтверждают РОП (в чате салона) и ПАЦ.",
+            *(["Справочно, цена выкупа по метрике:", *_price_ladder(result)] if result.can_accept else []),
+        ]
+    elif not result.can_accept:
         lines += [
             f"⛔ {STATUS_REJECT}: лимит закупки по метрике = 0 (ВП больше, чем позволяет ПЦП).",
             "Принять можно только с согласования УК.",
@@ -424,7 +430,9 @@ def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_nam
     ]
     lines += _metrics_lines(metrics)
     if appraisal_input.negotiated_price is not None:
-        lines.append(f"Запрашиваемая цена выкупа: {_fmt(appraisal_input.negotiated_price)} ₽")
+        price_label = "Цена комиссии (клиенту)" if appraisal_input.reception_type == COMMISSION \
+            else "Запрашиваемая цена выкупа"
+        lines.append(f"{price_label}: {_fmt(appraisal_input.negotiated_price)} ₽")
     if appraiser_sale_cost is not None:
         lines.append(f"Прогноз цены продажи (ДЦ): {_fmt(appraiser_sale_cost)} ₽")
         prep_for_calc = presale_preparation_cost or 0
@@ -832,7 +840,8 @@ async def _review_or_close(state: FSMContext, answer_fn, data: dict, note: str =
         f"Оценщик: {appraiser_name}" if appraiser_name else "",
         "Прогноз ДЦ:",
         f"  Цена продажи: {_fmt(result.manager_resale_forecast)} ₽ ({forecast_source})",
-        f"  Запрашиваемая цена выкупа: {_fmt(appraisal_input.negotiated_price)} ₽",
+        ("  Цена комиссии (клиенту)" if appraisal_input.reception_type == COMMISSION
+         else "  Запрашиваемая цена выкупа") + f": {_fmt(appraisal_input.negotiated_price)} ₽",
         f"  Переподготовка: {_fmt(result.refurbishment)} ₽" if result.refurbishment
         else "  Переподготовка: расходы не запланированы",
         f"  ВП (валовая прибыль): {_fmt(result.margin_negotiated)} ₽",
@@ -2062,7 +2071,7 @@ async def cmd_raw(message, command: CommandObject, bot):
 
 
 REPORT_CATEGORIES = [("Категория А", "А"), ("Категория В", "В"), ("Категория С", "С")]
-REPORT_STATUSES = [STATUS_OK, STATUS_DDC, STATUS_UK, STATUS_UK_CEILING, STATUS_REJECT]
+REPORT_STATUSES = [STATUS_OK, STATUS_DDC, STATUS_UK, STATUS_UK_CEILING, STATUS_REJECT, STATUS_COMMISSION]
 
 
 def _pct(part: float, whole: float) -> str:
@@ -2418,6 +2427,9 @@ async def on_waiting_link(message, state: FSMContext, bot):
         colors_bucket = colors_bucket_from_count(data.repainted_parts_count)
 
     salon = _resolve_salon(data.dealer_name)
+    # тип приёма с учётом бренда салона (Toyota: «Трейд-ин новый» = Trade-In на ПИ)
+    if data.reception_raw:
+        data.reception_type = map_reception(data.reception_raw, salon_info(salon).get("brand") if salon else None)
 
     await state.clear()  # новая оценка — не тащим ответы из прошлой
     await state.update_data(
@@ -2444,6 +2456,7 @@ async def on_waiting_link(message, state: FSMContext, bot):
         appraisal_date=data.appraisal_date.isoformat() if data.appraisal_date else None,
         autohub_ptsp=data.autohub_ptsp,
         reception_type=data.reception_type if data.reception_type in RECEPTION_TYPES else None,
+        _reception_raw=data.reception_raw if data.reception_type in RECEPTION_TYPES else None,
     )
 
     vehicle_line = " ".join(str(x) for x in [data.brand, data.model, data.year] if x)
@@ -2518,7 +2531,7 @@ async def on_manual_avito(message, state: FSMContext, bot):
 @router.message_callback(F.payload.startswith("reception:"), StateFilter(AppraisalStates.reception_type))
 async def on_reception(callback, state: FSMContext, bot):
     value = callback.payload.split(":", 1)[1]
-    await state.update_data(reception_type=value)
+    await state.update_data(reception_type=value, _reception_raw=None)  # выбран вручную — не переопределяем
     await _ask_next(state, callback.answer, bot, note=f"Тип приёма: {value}")
 
 
@@ -2530,6 +2543,9 @@ async def on_salon(callback, state: FSMContext, bot):
         return
     data = await state.get_data()
     update = {"salon": value}
+    if data.get("_reception_raw"):  # тип приёма из MaxPoster — пересчитываем под бренд выбранного салона
+        update["reception_type"] = map_reception(data["_reception_raw"], salon_info(value).get("brand")) \
+            or data.get("reception_type")
     if not data.get("dealer_name"):
         # ручной ввод: салон из таблицы = салон для маршрутизации карточки согласования
         update["dealer_name"] = value
@@ -2785,7 +2801,7 @@ def _digest_targets(deal: dict) -> set:
     """Кто должен принять решение по сделке сейчас (минимальная нужная роль)."""
     stage, status, dealer = deal.get("stage"), deal.get("approval_status"), deal.get("dealer_name")
     if stage == "salon_pending":
-        if status == STATUS_OK:
+        if status in (STATUS_OK, STATUS_COMMISSION):
             return (approval_hierarchy.get_role_ids(dealer, "РОП")
                     or approval_hierarchy.get_role_ids(dealer, "ДДЦ"))
         return approval_hierarchy.get_role_ids(dealer, "ДДЦ")  # ДДЦ и первый этап статусов УК

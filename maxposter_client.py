@@ -22,7 +22,8 @@ from typing import Any, Optional
 import requests
 
 from config import (MAXPOSTER_API_BASE, MAXPOSTER_API_KEY, MAXPOSTER_APPRAISAL_DATE_FIELD,
-                    MAXPOSTER_AUTOHUB_PTSP_FIELD, MAXPOSTER_RECEPTION_FIELD, MAXPOSTER_RECEPTION_MAP)
+                    MAXPOSTER_AUTOHUB_PTSP_FIELD, MAXPOSTER_RECEPTION_FIELD, MAXPOSTER_RECEPTION_MAP,
+                    MAXPOSTER_RECEPTION_BRAND_MAP)
 
 APPRAISAL_LINK_RE = re.compile(r"appraisals/(\d+)")
 VIN_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")  # VIN: 17 симв., без I/O/Q
@@ -108,6 +109,23 @@ def parse_date(value: Any) -> Optional[datetime.datetime]:
         return None
 
 
+def map_reception(raw_value: Any, brand: Optional[str] = None) -> Optional[str]:
+    """Тип приёма из MaxPoster -> тип по метрике (с учётом бренда салона)."""
+    key = str(raw_value or "").strip().lower()
+    if not key:
+        return None
+    by_brand = MAXPOSTER_RECEPTION_BRAND_MAP.get((brand or "").strip().lower(), {})
+    if key in by_brand:
+        return by_brand[key]
+    if key in MAXPOSTER_RECEPTION_MAP:
+        return MAXPOSTER_RECEPTION_MAP[key]
+    if "buy" in key or "выкуп" in key:
+        return "Выкуп с улицы"
+    if "commiss" in key or "комис" in key:
+        return "Комиссия"
+    return None
+
+
 def _extra_fields(data: dict) -> dict:
     """Дата оценки, тип приёма и ПЦП Автохаб — по путям из .env (или автопоиск даты)."""
     result = {}
@@ -125,7 +143,7 @@ def _extra_fields(data: dict) -> dict:
             raw_value = raw_value.get("name") or raw_value.get("code") or raw_value.get("id")
         if raw_value not in (None, ""):
             result["reception_raw"] = str(raw_value)
-            result["reception_type"] = MAXPOSTER_RECEPTION_MAP.get(str(raw_value).strip().lower())
+            result["reception_type"] = map_reception(raw_value)
     if MAXPOSTER_AUTOHUB_PTSP_FIELD:
         value = get_path(data, MAXPOSTER_AUTOHUB_PTSP_FIELD)
         try:

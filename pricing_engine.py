@@ -21,8 +21,10 @@ import pricing_config
 
 METRIC_VERSION = pricing_config.METRIC_VERSION
 
-RECEPTION_TYPES = ["Trade-In", "Trade-Up", "Выкуп с улицы", "Trade-In на ПИ"]
+RECEPTION_TYPES = ["Trade-In", "Trade-Up", "Выкуп с улицы", "Trade-In на ПИ", "Комиссия"]
 STREET_BUYOUT = "Выкуп с улицы"
+# Комиссия: согласование по метрике не нужно — только подтверждение РОП (в чате салона) и ПАЦ
+COMMISSION = "Комиссия"
 
 # Статусы согласования (ячейка D12)
 STATUS_OK = "Согласовано"
@@ -30,6 +32,7 @@ STATUS_DDC = "Согласование ДДЦ"
 STATUS_UK = "Согласование УК"
 STATUS_UK_CEILING = "Согласование УК (выше потолка)"
 STATUS_REJECT = "Не принимать"
+STATUS_COMMISSION = "Комиссия: подтверждение РОП"
 # Статусы, которые решает УК (первый этап в чате салона — ДДЦ, затем УК лично)
 UK_STATUSES = {STATUS_UK, STATUS_UK_CEILING, STATUS_REJECT}
 
@@ -289,7 +292,9 @@ def calc_appraisal(data: AppraisalInput, today: Optional[datetime.date] = None) 
     if data.negotiated_price is not None:
         c14 = data.negotiated_price
         # D12: проверки сверху вниз, срабатывает первая подходящая
-        if purchase_rop <= 0:
+        if data.reception_type == COMMISSION:
+            approval_status = STATUS_COMMISSION  # лимиты метрики — справочно, решают РОП и ПАЦ
+        elif purchase_rop <= 0:
             approval_status = STATUS_REJECT
         elif c14 > ceiling_price:
             approval_status = STATUS_UK_CEILING
