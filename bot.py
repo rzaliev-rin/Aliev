@@ -887,26 +887,136 @@ async def cmd_myid(message, bot):
     await message.answer(text=f"Ваш ID в MAX: {message.sender.user_id}")
 
 
+# ---------------------------------------------------------------------------
+# Списки «Пользователи» и «Заявки на доступ» — постранично.
+# У MAX лимит 30 рядов кнопок в одном сообщении: при большем списке сообщение
+# отклонялось, и по кнопке «Пользователи» в /admin ничего не появлялось.
+# ---------------------------------------------------------------------------
+LIST_PAGE_SIZE = 8
+
+
+def _short(text: str, limit: int = 22) -> str:
+    text = str(text or "").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _page_slice(items: list, page: int):
+    pages = max(1, (len(items) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+    page = min(max(page, 0), pages - 1)
+    return items[page * LIST_PAGE_SIZE:(page + 1) * LIST_PAGE_SIZE], page, pages
+
+
+def _nav_row(builder, prefix: str, page: int, pages: int) -> int:
+    """Кнопки «◀ ▶» (если страниц больше одной) и «В меню». Возвращает число кнопок в ряду."""
+    count = 0
+    if pages > 1:
+        if page > 0:
+            builder.callback(text="◀ Назад", payload=f"{prefix}:{page - 1}")
+            count += 1
+        if page < pages - 1:
+            builder.callback(text="Вперёд ▶", payload=f"{prefix}:{page + 1}")
+            count += 1
+    builder.callback(text="⬅ В меню", payload="admin_menu")
+    return count + 1
+
+
+def _users_view(page: int = 0, note: str = ""):
+    allowed = list(access_store.list_allowed().items())
+    chunk, page, pages = _page_slice(allowed, page)
+    lines = ([note, ""] if note else []) + [f"👥 ПОЛЬЗОВАТЕЛИ С ДОСТУПОМ: {len(allowed)}"]
+    if ADMIN_USER_IDS:
+        lines.append("Администраторы (ID): " + ", ".join(str(x) for x in ADMIN_USER_IDS))
+    builder = InlineKeyboardBuilder()
+    if not allowed:
+        lines.append("\nОценщики: пока никого не одобрено.")
+        sizes = []
+    else:
+        if pages > 1:
+            lines.append(f"Страница {page + 1} из {pages}")
+        lines.append("\nНажмите «Убрать», если человек уволился:")
+        start = page * LIST_PAGE_SIZE
+        for i, (uid, info) in enumerate(chunk, start + 1):
+            name = info.get("name") or "без имени"
+            lines.append(f"{i}. {name} — ID {uid}")
+            builder.callback(text=f"🗑 {_short(name)}", payload=f"revoke_user:{uid}:{page}")
+        sizes = [2] * (len(chunk) // 2) + ([1] if len(chunk) % 2 else [])
+    sizes.append(_nav_row(builder, "admin_users_p", page, pages))
+    builder.adjust(*sizes)
+    return "\n".join(lines), builder
+
+
+def _pending_view(page: int = 0, note: str = ""):
+    pending = list(access_store.list_pending().items())
+    chunk, page, pages = _page_slice(pending, page)
+    lines = ([note, ""] if note else []) + [f"📋 ЗАЯВКИ НА ДОСТУП: {len(pending)}"]
+    builder = InlineKeyboardBuilder()
+    sizes = []
+    if not pending:
+        lines.append("Новых заявок нет.")
+    else:
+        if pages > 1:
+            lines.append(f"Страница {page + 1} из {pages}")
+        start = page * LIST_PAGE_SIZE
+        for i, (uid, info) in enumerate(chunk, start + 1):
+            name = info.get("name") or "без имени"
+            lines.append(f"{i}. {name} — ID {uid}, {info.get('requested_at') or ''}")
+            builder.callback(text=f"✅ {_short(name, 16)}", payload=f"approve:{uid}:{page}")
+            builder.callback(text="❌ Отклонить", payload=f"deny:{uid}:{page}")
+            sizes.append(2)
+        if len(pending) > 1:
+            builder.callback(text=f"✅ Одобрить всех ({len(pending)})", payload="approve_all_ask")
+            sizes.append(1)
+    sizes.append(_nav_row(builder, "admin_pending_p", page, pages))
+    builder.adjust(*sizes)
+    return "\n".join(lines), builder
+
+
+async def _safe_answer(answer_fn, text: str, keyboard=None) -> None:
+    """Если MAX отклонит сообщение с кнопками — показываем хотя бы текст, а не тишину."""
+    try:
+        await answer_fn(text=text[:3900], keyboard=keyboard)
+    except Exception as e:  # noqa: BLE001
+        logger.error("MAX отклонил сообщение с кнопками (%s) — отправляю без кнопок", e)
+        await answer_fn(text=text[:3900])
+
+
+def _page_arg(payload: str, index: int) -> int:
+    parts = payload.split(":")
+    return int(parts[index]) if len(parts) > index and parts[index].lstrip("-").isdigit() else 0
+
+
 @router.message(Command("users"))
 async def cmd_users(message, bot):
     if not _is_admin(message.sender.user_id):
         await message.answer(text="Эта команда только для администраторов.")
         return
-    allowed = access_store.list_allowed()
-    lines = ["Пользователи с доступом к боту:"]
-    if ADMIN_USER_IDS:
-        lines.append("Администраторы: " + ", ".join(str(x) for x in ADMIN_USER_IDS))
-    builder = InlineKeyboardBuilder()
-    if allowed:
-        lines.append("\nМенеджеры (нажмите «Убрать», если человек уволился):")
-        for uid, info in allowed.items():
-            name = info.get("name") or "без имени"
-            lines.append(f"  {uid} — {name}")
-            builder.callback(text=f"🗑 Убрать {name or uid}", payload=f"revoke_user:{uid}")
-        builder.adjust(1)
-    else:
-        lines.append("\nМенеджеры: пока никого не одобрено.")
-    await message.answer(text="\n".join(lines), keyboard=builder if allowed else None)
+    await _safe_answer(message.answer, *_users_view(0))
+
+
+@router.message(Command("pending"))
+async def cmd_pending(message, bot):
+    if not _is_admin(message.sender.user_id):
+        await message.answer(text="Эта команда только для администраторов.")
+        return
+    await _safe_answer(message.answer, *_pending_view(0))
+
+
+@router.message_callback(F.payload == "admin_users")
+@router.message_callback(F.payload.startswith("admin_users_p:"))
+async def on_admin_users(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await _toast(callback, "Только для администраторов.")
+        return
+    await _safe_answer(callback.answer, *_users_view(_page_arg(callback.payload, 1)))
+
+
+@router.message_callback(F.payload == "admin_pending")
+@router.message_callback(F.payload.startswith("admin_pending_p:"))
+async def on_admin_pending(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await _toast(callback, "Только для администраторов.")
+        return
+    await _safe_answer(callback.answer, *_pending_view(_page_arg(callback.payload, 1)))
 
 
 @router.message_callback(F.payload.startswith("revoke_user:"))
@@ -914,19 +1024,133 @@ async def on_revoke_user(callback, bot):
     if not _is_admin(_get_user_id(callback)):
         await _toast(callback, "Только для администраторов.")
         return
-    uid = int(callback.payload.split(":", 1)[1])
+    uid = int(callback.payload.split(":")[1])
+    name = (access_store.list_allowed().get(str(uid)) or {}).get("name") or uid
     access_store.revoke(uid)
-    await callback.answer(text=f"Готово, доступ для {uid} закрыт.")
+    await _safe_answer(callback.answer, *_users_view(_page_arg(callback.payload, 2),
+                                                     note=f"✅ Доступ для «{name}» закрыт."))
 
 
-def admin_menu_kb():
+@router.message_callback(F.payload.startswith("approve:"))
+async def on_approve_callback(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await _toast(callback, "Только для администраторов.")
+        return
+    uid = int(callback.payload.split(":")[1])
+    name = (access_store.list_pending().get(str(uid)) or {}).get("name") or uid
+    access_store.approve(uid)
+    await _safe_answer(callback.answer, *_pending_view(_page_arg(callback.payload, 2),
+                                                       note=f"✅ Доступ для «{name}» открыт."))
+
+
+@router.message_callback(F.payload == "approve_all_ask")
+async def on_approve_all_ask(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await _toast(callback, "Только для администраторов.")
+        return
+    pending = access_store.list_pending()
+    if not pending:
+        await _safe_answer(callback.answer, *_pending_view(0))
+        return
+    names = [f"• {info.get('name') or 'без имени'} — ID {uid}" for uid, info in list(pending.items())[:40]]
+    more = f"\n…и ещё {len(pending) - 40}" if len(pending) > 40 else ""
+    builder = InlineKeyboardBuilder()
+    builder.callback(text=f"✅ Да, одобрить всех ({len(pending)})", payload="approve_all")
+    builder.callback(text="Назад к заявкам", payload="admin_pending")
+    builder.adjust(1)
+    await _safe_answer(callback.answer, f"Открыть доступ всем {len(pending)}?\n\n" + "\n".join(names) + more,
+                       builder)
+
+
+@router.message_callback(F.payload == "approve_all")
+async def on_approve_all(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await _toast(callback, "Только для администраторов.")
+        return
+    pending = list(access_store.list_pending())
+    for uid in pending:
+        access_store.approve(int(uid))
+    await _safe_answer(callback.answer, *_pending_view(0, note=f"✅ Доступ открыт: {len(pending)} чел."))
+
+
+@router.message_callback(F.payload.startswith("deny:"))
+async def on_deny_callback(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await _toast(callback, "Только для администраторов.")
+        return
+    uid = int(callback.payload.split(":")[1])
+    name = (access_store.list_pending().get(str(uid)) or {}).get("name") or uid
+    access_store.deny(uid)
+    await _safe_answer(callback.answer, *_pending_view(_page_arg(callback.payload, 2),
+                                                       note=f"❌ Заявка «{name}» отклонена."))
+
+
+def admin_menu_kb(user_id: Optional[int] = None):
     builder = InlineKeyboardBuilder()
     builder.callback(text="📋 Заявки на доступ", payload="admin_pending")
     builder.callback(text="👥 Пользователи", payload="admin_users")
     builder.callback(text="🏢 Салоны", payload="admin_salons")
     builder.callback(text="📊 Отчёт за 7 дней", payload="admin_report")
+    if _is_owner(user_id):
+        if access_store.is_bot_enabled():
+            builder.callback(text="⏸ Остановить бота", payload="bot_stop_ask")
+        else:
+            builder.callback(text="▶️ Запустить бота", payload="bot_start")
     builder.adjust(1)
     return builder
+
+
+def _admin_menu_text() -> str:
+    state = "🟢 работает" if access_store.is_bot_enabled() else "🔴 остановлен"
+    return f"Меню администратора. Бот: {state}."
+
+
+BOT_TITLE = "Бот «Метрика_оценка АСП»"
+
+
+def _connected_chats() -> list:
+    """Все подключённые чаты: салоны + ПАЦ, без повторов."""
+    ids = list(dealer_chats.list_salons().values())
+    if dealer_chats.get_pats_chat_id():
+        ids.append(dealer_chats.get_pats_chat_id())
+    seen, result = set(), []
+    for cid in ids:
+        if cid and cid not in seen:
+            seen.add(cid)
+            result.append(cid)
+    return result
+
+
+async def _close_open_deals(bot, reason: str) -> int:
+    """Закрывает ВСЕ незавершённые заявки на согласование: по ним больше не будет
+    ни напоминаний, ни действий кнопок. Оценщикам — уведомление в личку."""
+    deals = deals_store.list_deals()
+    for token, deal in deals.items():
+        deals_store.delete_deal(token)
+        await _notify_appraiser(bot, token, deal,
+                                f"⛔ Заявка закрыта: {reason}. После включения бота отправьте оценку заново.",
+                                outcome="closed")
+    return len(deals)
+
+
+async def _set_bot_running(bot, running: bool) -> str:
+    """Остановка/запуск бота: флаг, закрытие незавершённых заявок, оповещение чатов."""
+    closed = await _close_open_deals(bot, "бот был остановлен администратором" if not running
+                                     else "бот перезапущен администратором")
+    access_store.set_bot_enabled(running)
+    if running:
+        text = f"✅ {BOT_TITLE} снова работает. Можно делать оценки и отправлять их на согласование."
+    else:
+        text = (f"⛔ {BOT_TITLE} отключён администратором. Оценки и согласования временно не работают."
+                + ("\nНезавершённые заявки закрыты — после включения бота отправьте оценки заново."
+                   if closed else ""))
+    notified = 0
+    for chat_id in _connected_chats():
+        if await _send_to_chat(bot, chat_id, text):
+            notified += 1
+    logger.info("[bot_state] running=%s closed_deals=%s notified_chats=%s", running, closed, notified)
+    return (("🟢 Бот запущен." if running else "🔴 Бот остановлен — пользоваться им можете только вы.")
+            + f"\nОповещено чатов: {notified}. Закрыто незавершённых заявок: {closed}.")
 
 
 @router.message(Command("disable_all"))
@@ -934,14 +1158,10 @@ async def cmd_disable_all(message, bot):
     if not _is_owner(message.sender.user_id):
         await message.answer(text="Эта команда доступна только владельцу бота.")
         return
-    access_store.set_bot_enabled(False)
-    await message.answer(
-        text=(
-            "🔴 Бот отключён для всех, кроме вас. Никто (включая других "
-            "администраторов) больше не сможет им пользоваться, пока вы не "
-            "включите его обратно командой /enable_all."
-        )
-    )
+    if not access_store.is_bot_enabled():
+        await message.answer(text="Бот уже остановлен. Запустить: /enable_all или кнопка в /admin.")
+        return
+    await message.answer(text=await _set_bot_running(bot, False))
 
 
 @router.message(Command("enable_all"))
@@ -949,8 +1169,10 @@ async def cmd_enable_all(message, bot):
     if not _is_owner(message.sender.user_id):
         await message.answer(text="Эта команда доступна только владельцу бота.")
         return
-    access_store.set_bot_enabled(True)
-    await message.answer(text="🟢 Бот снова доступен всем, у кого был доступ.")
+    if access_store.is_bot_enabled():
+        await message.answer(text="Бот уже работает.")
+        return
+    await message.answer(text=await _set_bot_running(bot, True))
 
 
 @router.message(Command("admin"))
@@ -958,48 +1180,60 @@ async def cmd_admin(message, bot):
     if not _is_admin(message.sender.user_id):
         await message.answer(text="Эта команда только для администраторов.")
         return
-    await message.answer(text="Меню администратора:", keyboard=admin_menu_kb())
+    await message.answer(text=_admin_menu_text(), keyboard=admin_menu_kb(message.sender.user_id))
 
 
-@router.message_callback(F.payload == "admin_pending")
-async def on_admin_pending(callback, bot):
-    if not _is_admin(_get_user_id(callback)):
+@router.message_callback(F.payload == "admin_menu")
+async def on_admin_menu(callback, bot):
+    user_id = _get_user_id(callback)
+    if not _is_admin(user_id):
         await _toast(callback, "Только для администраторов.")
         return
-    pending = access_store.list_pending()
-    if not pending:
-        await callback.answer(text="Заявок на доступ нет.")
+    await callback.answer(text=_admin_menu_text(), keyboard=admin_menu_kb(user_id))
+
+
+@router.message_callback(F.payload == "bot_stop_ask")
+async def on_bot_stop_ask(callback, bot):
+    if not _is_owner(_get_user_id(callback)):
+        await _toast(callback, "Останавливать бота может только владелец.")
         return
+    open_deals = len(deals_store.list_deals())
     builder = InlineKeyboardBuilder()
-    lines = ["Заявки на доступ:"]
-    for uid, info in pending.items():
-        lines.append(f"  {uid} — {info.get('name') or 'без имени'}, {info.get('requested_at')}")
-        builder.callback(text=f"✅ Одобрить {uid}", payload=f"approve:{uid}")
-        builder.callback(text=f"❌ Отклонить {uid}", payload=f"deny:{uid}")
+    builder.callback(text="⏸ Да, остановить", payload="bot_stop")
+    builder.callback(text="Отмена", payload="admin_menu")
     builder.adjust(2)
-    await callback.answer(text="\n".join(lines), keyboard=builder)
+    await callback.answer(
+        text=("Остановить бота?\n\n"
+              f"• во все подключённые чаты ({len(_connected_chats())}) уйдёт сообщение «бот отключён»;\n"
+              f"• незавершённые заявки на согласование ({open_deals}) будут закрыты, оценщики получат уведомление;\n"
+              "• пользоваться ботом сможете только вы, пока не запустите его снова."),
+        keyboard=builder)
 
 
-@router.message_callback(F.payload == "admin_users")
-async def on_admin_users(callback, bot):
-    if not _is_admin(_get_user_id(callback)):
-        await _toast(callback, "Только для администраторов.")
+@router.message_callback(F.payload == "bot_stop")
+async def on_bot_stop(callback, bot):
+    user_id = _get_user_id(callback)
+    if not _is_owner(user_id):
+        await _toast(callback, "Останавливать бота может только владелец.")
         return
-    allowed = access_store.list_allowed()
-    lines = ["Пользователи с доступом к боту:"]
-    if ADMIN_USER_IDS:
-        lines.append("Администраторы: " + ", ".join(str(x) for x in ADMIN_USER_IDS))
-    builder = InlineKeyboardBuilder()
-    if allowed:
-        lines.append("\nМенеджеры (нажмите «Убрать», если человек уволился):")
-        for uid, info in allowed.items():
-            name = info.get("name") or "без имени"
-            lines.append(f"  {uid} — {name}")
-            builder.callback(text=f"🗑 Убрать {name or uid}", payload=f"revoke_user:{uid}")
-        builder.adjust(1)
-    else:
-        lines.append("\nМенеджеры: пока никого не одобрено.")
-    await callback.answer(text="\n".join(lines), keyboard=builder if allowed else None)
+    if not access_store.is_bot_enabled():
+        await callback.answer(text=_admin_menu_text(), keyboard=admin_menu_kb(user_id))
+        return
+    result = await _set_bot_running(bot, False)
+    await callback.answer(text=result + "\n\n" + _admin_menu_text(), keyboard=admin_menu_kb(user_id))
+
+
+@router.message_callback(F.payload == "bot_start")
+async def on_bot_start(callback, bot):
+    user_id = _get_user_id(callback)
+    if not _is_owner(user_id):
+        await _toast(callback, "Запускать бота может только владелец.")
+        return
+    if access_store.is_bot_enabled():
+        await callback.answer(text=_admin_menu_text(), keyboard=admin_menu_kb(user_id))
+        return
+    result = await _set_bot_running(bot, True)
+    await callback.answer(text=result + "\n\n" + _admin_menu_text(), keyboard=admin_menu_kb(user_id))
 
 
 @router.message_callback(F.payload == "admin_salons")
@@ -1017,46 +1251,6 @@ async def on_admin_salons(callback, bot):
         lines.append("  (пока нет)")
     lines.append(f"\nЧат ПАЦ: {pats_id if pats_id else '(не задан)'}")
     await callback.answer(text="\n".join(lines))
-
-
-@router.message(Command("pending"))
-async def cmd_pending(message, bot):
-    if not _is_admin(message.sender.user_id):
-        await message.answer(text="Эта команда только для администраторов.")
-        return
-    pending = access_store.list_pending()
-    if not pending:
-        await message.answer(text="Заявок на доступ нет.")
-        return
-
-    builder = InlineKeyboardBuilder()
-    lines = ["Заявки на доступ:"]
-    for uid, info in pending.items():
-        lines.append(f"  {uid} — {info.get('name') or 'без имени'}, {info.get('requested_at')}")
-        builder.callback(text=f"✅ Одобрить {uid}", payload=f"approve:{uid}")
-        builder.callback(text=f"❌ Отклонить {uid}", payload=f"deny:{uid}")
-    builder.adjust(2)
-    await message.answer(text="\n".join(lines), keyboard=builder)
-
-
-@router.message_callback(F.payload.startswith("approve:"))
-async def on_approve_callback(callback, bot):
-    if not _is_admin(_get_user_id(callback)):
-        await _toast(callback, "Только для администраторов.")
-        return
-    uid = int(callback.payload.split(":", 1)[1])
-    access_store.approve(uid)
-    await callback.answer(text=f"Готово, доступ для {uid} открыт.")
-
-
-@router.message_callback(F.payload.startswith("deny:"))
-async def on_deny_callback(callback, bot):
-    if not _is_admin(_get_user_id(callback)):
-        await _toast(callback, "Только для администраторов.")
-        return
-    uid = int(callback.payload.split(":", 1)[1])
-    access_store.deny(uid)
-    await callback.answer(text=f"Заявка {uid} отклонена.")
 
 
 @router.message(Command("approve"))
@@ -1359,7 +1553,7 @@ async def on_deal_approve(callback, bot):
     deal = deals_store.get_deal(token)
     if not deal:
         logger.info("[approve] token=%s не найден в deals_store (возможно, уже обработан)", token)
-        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Заявка уже обработана или закрыта — действий не требуется.")
         return
     if deal.get("stage") != "salon_pending":
         # Кто-то уже нажал кнопку раньше — не отправляем в ПАЦ повторно.
@@ -1388,7 +1582,7 @@ async def on_deal_adjust(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Заявка уже обработана или закрыта — действий не требуется.")
         return
     if deal.get("stage") != "salon_pending":
         await _toast(callback, _already_processed_text(deal))
@@ -1410,7 +1604,7 @@ async def on_deal_decline(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Заявка уже обработана или закрыта — действий не требуется.")
         return
     if deal.get("stage") != "salon_pending":
         await _toast(callback, _already_processed_text(deal))
@@ -1436,7 +1630,7 @@ async def on_uk_approve(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Заявка уже обработана или закрыта — действий не требуется.")
         return
     if deal.get("stage") != "uk_pending":
         await _toast(callback, _already_processed_text(deal))
@@ -1457,7 +1651,7 @@ async def on_uk_adjust(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Заявка уже обработана или закрыта — действий не требуется.")
         return
     if deal.get("stage") != "uk_pending":
         await _toast(callback, _already_processed_text(deal))
@@ -1477,7 +1671,7 @@ async def on_uk_decline(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Заявка уже обработана или закрыта — действий не требуется.")
         return
     if deal.get("stage") != "uk_pending":
         await _toast(callback, _already_processed_text(deal))
@@ -1515,7 +1709,7 @@ async def _send_pats_request(callback, bot, kind: str) -> None:
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Заявка уже обработана или закрыта — действий не требуется.")
         return
 
     user_id = _get_user_id(callback)
@@ -1555,7 +1749,7 @@ async def on_pats_done(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Заявка уже обработана или закрыта — действий не требуется.")
         return
 
     user_id = _get_user_id(callback)
@@ -2246,6 +2440,8 @@ async def _check_reminders(bot) -> None:
     - сделка ждёт на этапе дольше REMINDER_AFTER_MINUTES, но меньше суток;
     - по этому этапу ещё не напоминали (reminded_stage)."""
     now = time.time()
+    if not access_store.is_bot_enabled():
+        return
     if not (REMINDER_HOURS[0] <= datetime.datetime.now().hour < REMINDER_HOURS[1]):
         return
     after = REMINDER_AFTER_MINUTES * 60
