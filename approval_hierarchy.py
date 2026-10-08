@@ -148,6 +148,20 @@ def get_uk_approvers(dealer_name: Optional[str]) -> set:
     return set()
 
 
+def get_role_ids(dealer_name: Optional[str], role: str) -> set:
+    """ID сотрудников роли «РОП» / «ДДЦ» / «УК» в салоне (для утренней сводки)."""
+    column = {"РОП": "РОП ID", "ДДЦ": "ДДЦ ID", "УК": "УК ID"}[role]
+    try:
+        rows = _get_rows()
+    except Exception as e:  # noqa: BLE001
+        print(f"[approval_hierarchy] Не удалось прочитать вкладку «{TAB_NAME}»: {e}", flush=True)
+        return set()
+    for row in rows:
+        if normalize_salon_name(row.get("Салон", "")) == normalize_salon_name(dealer_name):
+            return _ids_from_cell(row.get(column))
+    return set()
+
+
 def get_pats_approvers() -> set:
     """ID сотрудников, которым разрешено подтверждать приёмку в общем чате
     ПАЦ. Настраивается отдельной строкой на той же вкладке «Иерархия

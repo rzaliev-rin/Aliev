@@ -12,3 +12,6 @@ dealer_chats.json
 *.zip
 *.json.tmp
 appraisals_log.json
+ops_state.json
+bot_running.flag
+backups/

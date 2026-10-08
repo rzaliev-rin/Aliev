@@ -27,6 +27,9 @@
 Запуск: python bot.py  (long polling, доп. настройка вебхука не нужна)
 """
 import asyncio
+import os
+import json
+import re
 import datetime
 import logging
 import time
@@ -44,7 +47,8 @@ from maxgram.types import BotStarted
 from maxgram.utils.keyboard import InlineKeyboardBuilder
 
 from config import (MAX_BOT_TOKEN, ALLOWED_USER_IDS, ADMIN_USER_IDS, OWNER_USER_ID,
-                    REMINDER_AFTER_MINUTES, REMINDER_HOURS)
+                    REMINDER_AFTER_MINUTES, REMINDER_HOURS, DIGEST_TIME, REPORT_WEEKDAY, REPORT_TIME,
+                    REPORT_USER_IDS, BACKUP_TIME, BACKUP_KEEP_DAYS, DUPLICATE_DAYS, AVITO_MAX_AGE_DAYS)
 from pricing_engine import (
     AppraisalInput, calc_appraisal, colors_bucket_from_count,
     get_colors_options, get_condition_options, get_extra_options, get_salon_options, RECEPTION_TYPES,
@@ -401,7 +405,8 @@ def pats_done_kb(token: str):
 
 def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_name: str, vin,
                          reception_type: Optional[str] = None, appraiser_sale_cost=None,
-                         presale_preparation_cost=None, metrics: Optional[dict] = None) -> str:
+                         presale_preparation_cost=None, metrics: Optional[dict] = None,
+                         warnings: Optional[list] = None, autohub_ptsp=None) -> str:
     metrics = metrics or {}
     header = _vehicle_header(vehicle_info, reception_type)
     # шапка начинается с автосалона, оценщик — сразу под ней
@@ -430,9 +435,11 @@ def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_nam
         if appraisal_input.negotiated_price is not None:
             vp = appraiser_sale_cost - appraisal_input.negotiated_price - prep_for_calc
             lines.append(f"ВП (валовая прибыль): {_fmt(vp)} ₽")
+    lines.append(_autohub_line(autohub_ptsp, appraisal_input.negotiated_price).strip())
     lines.append(f"Статус: {_status_text(result.approval_status)}")
     if result.gm2_negotiated is not None:
         lines.append(f"GM2 по факту: {_fmt(result.gm2_negotiated)} ₽")
+    lines += list(warnings or [])
     return "\n".join(line for line in lines if line)
 
 
@@ -451,7 +458,8 @@ async def _send_to_chat(bot, chat_id: int, text: str, keyboard=None) -> bool:
 
 async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict, manager_name: str, vin,
                                 appraiser_sale_cost=None, presale_preparation_cost=None,
-                                manager_user_id=None) -> tuple:
+                                manager_user_id=None, warnings: Optional[list] = None,
+                                autohub_ptsp=None) -> tuple:
     """Создаёт карточку согласования и постит её в чат салона (Этап 1).
     Возвращает (заметка для ответа оценщику, токен сделки, ушла ли карточка в чат)."""
     dealer_name = vehicle_info.get("dealer_name")
@@ -473,6 +481,8 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
         "presale_preparation_cost": presale_preparation_cost,
         "salon": vehicle_info.get("salon"),
         "metrics": _metrics(result),
+        "warnings": list(warnings or []),
+        "autohub_ptsp": autohub_ptsp,
         "stage": "salon_pending",
     })
 
@@ -487,7 +497,7 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
                                 reception_type=appraisal_input.reception_type,
                                 appraiser_sale_cost=appraiser_sale_cost,
                                 presale_preparation_cost=presale_preparation_cost,
-                                metrics=_metrics(result))
+                                metrics=_metrics(result), warnings=warnings, autohub_ptsp=autohub_ptsp)
     sent = await _send_to_chat(bot, salon_chat_id, text, keyboard=deal_approval_kb(token))
     if sent:
         deals_store.update_deal(token, card_sent=True)  # только такие сделки попадают в напоминания
@@ -691,6 +701,61 @@ def review_kb():
     return builder
 
 
+def _autohub_line(autohub_ptsp, negotiated_price) -> str:
+    """«ПЦП Автохаб: 1 100 000 ₽ · цена выкупа к ПЦП Автохаб: 78%» (справочно, B6/B7 метрики)."""
+    if not autohub_ptsp:
+        return ""
+    ratio = f" · цена выкупа к ПЦП Автохаб: {negotiated_price / autohub_ptsp * 100:.0f}%" if negotiated_price else ""
+    return f"  ПЦП Автохаб: {_fmt(autohub_ptsp)} ₽{ratio}"
+
+
+def _norm_vin(vin) -> str:
+    return re.sub(r"\s+", "", str(vin or "")).upper()
+
+
+def _vin_duplicates(vin, exclude_record_id: Optional[str] = None, exclude_token: Optional[str] = None):
+    """(открытые заявки с этим VIN, оценки этого VIN за DUPLICATE_DAYS дней)."""
+    key = _norm_vin(vin)
+    if len(key) < 5:  # «5688» и прочие обрывки VIN не сравниваем — слишком много ложных совпадений
+        return [], []
+    open_deals = [(t, d) for t, d in deals_store.list_deals().items()
+                  if _norm_vin(d.get("vin")) == key and t != exclude_token]
+    open_tokens = {t for t, _ in open_deals}
+    recent = [r for r in appraisals_log.since(DUPLICATE_DAYS)
+              if _norm_vin(r.get("vin")) == key and r.get("id") != exclude_record_id
+              and r.get("token") not in open_tokens]
+    return open_deals, recent
+
+
+def _appraisal_warnings(data: dict) -> list:
+    """Предупреждения для оценщика и согласующих: повторный VIN, устаревшая Авито-оценка."""
+    lines = []
+    open_deals, recent = _vin_duplicates(data.get("vin"), data.get("_record_id"))
+    for token, deal in open_deals[:3]:
+        appraiser = (deal.get("vehicle") or {}).get("appraiser_name") or deal.get("manager_name") or "—"
+        lines.append(f"⚠️ По этому VIN уже есть заявка на согласовании: {_deal_salon_label(deal)}, "
+                     f"{_fmt(deal.get('negotiated_price'))} ₽, {_status_text(deal.get('approval_status'))}, "
+                     f"{STAGE_TEXT.get(deal.get('stage'), deal.get('stage'))}, оценщик {appraiser}.")
+    for r in recent[-3:]:
+        ts = (r.get("ts") or "")[:10]
+        when = f"{ts[8:10]}.{ts[5:7]}" if len(ts) == 10 else ts
+        outcome = appraisals_log.OUTCOME_TEXT.get(r.get("outcome"), r.get("outcome") or "")
+        price = f"{_fmt(r['negotiated_price'])} ₽, " if r.get("negotiated_price") else ""
+        lines.append(f"ℹ️ Этот VIN уже оценивали {when}: {r.get('manager') or '—'}, "
+                     f"{salon_label(r['salon']) if r.get('salon') else (r.get('dealer_name') or '—')}, "
+                     f"{price}{outcome}.")
+    if data.get("appraisal_date"):
+        try:
+            dt = datetime.datetime.fromisoformat(data["appraisal_date"])
+            age = (datetime.datetime.now() - dt).days
+            if age > AVITO_MAX_AGE_DAYS:
+                lines.append(f"⚠️ Оценка в MaxPoster от {dt:%d.%m.%Y} ({age} дн. назад) — по метрике Авито-оценка "
+                             "нужна на день осмотра. Обновите её в MaxPoster.")
+        except ValueError:
+            pass
+    return lines
+
+
 def _journal_fields(data: dict, result, appraisal_input) -> dict:
     """Что пишем в журнал «Мои оценки» / отчёт."""
     vehicle = " ".join(str(x) for x in [data.get("brand"), data.get("model"), data.get("year")] if x)
@@ -706,6 +771,9 @@ def _journal_fields(data: dict, result, appraisal_input) -> dict:
         "status": result.approval_status,
         "category": result.category,
         "limit_rop": result.purchase_price_rop,
+        "ptsp_rop": result.planned_sale_price_rop,          # ПЦП по метрике
+        "forecast": result.manager_resale_forecast,         # ПЦП ДЦ (прогноз цены продажи)
+        "reception_type": appraisal_input.reception_type,
     }
 
 
@@ -769,8 +837,10 @@ async def _review_or_close(state: FSMContext, answer_fn, data: dict, note: str =
         else "  Переподготовка: расходы не запланированы",
         f"  ВП (валовая прибыль): {_fmt(result.margin_negotiated)} ₽",
         f"  GM2 прогноз: {_fmt(result.gm2_negotiated)} ₽",
+        _autohub_line(data.get("autohub_ptsp"), appraisal_input.negotiated_price),
         f"Статус: {_status_text(result.approval_status)}",
     ]
+    lines += [""] + _appraisal_warnings(data)
     text = prefix + "\n".join(line for line in lines if line)
     await state.set_state(AppraisalStates.reviewing_result)
     await answer_fn(text=text, keyboard=review_kb())
@@ -783,6 +853,20 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
         await callback.answer(text="У вас больше нет доступа к боту — карточка не отправлена.")
         return
     data = await state.get_data()
+    open_deals, _ = _vin_duplicates(data.get("vin"), data.get("_record_id"))
+    if open_deals and not data.get("_dup_ok"):
+        # по этому VIN уже идёт согласование — переспрашиваем, чтобы не плодить дубли
+        builder = InlineKeyboardBuilder()
+        builder.callback(text="📨 Всё равно отправить", payload="confirm_submit_dup")
+        builder.callback(text="Не отправлять", payload="dup_cancel")
+        builder.adjust(1)
+        await callback.answer(
+            text="\n".join(_appraisal_warnings(data))
+            + "\n\nОтправить ещё одну заявку по этому VIN? Если цена изменилась, лучше дождаться решения "
+              "по первой или попросить администратора закрыть её («⏳ Оценки в очереди»).",
+            keyboard=builder)
+        return
+    warnings = _appraisal_warnings(data)
     # Сбрасываем сценарий сразу, чтобы повторное нажатие кнопки не создало вторую карточку.
     await state.clear()
     appraisal_input = _appraisal_input(data)
@@ -794,6 +878,8 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
         appraiser_sale_cost=result.manager_resale_forecast,
         presale_preparation_cost=data.get("presale_preparation_cost"),
         manager_user_id=data.get("_manager_user_id"),
+        warnings=warnings,
+        autohub_ptsp=data.get("autohub_ptsp"),
     )
     try:
         if not data.get("_record_id"):
@@ -808,6 +894,18 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
         keyboard=new_appraisal_kb(),
     )
     await _log_appraisal_safe(manager_name, data.get("vin"), appraisal_input, result, vehicle_info)
+
+
+@router.message_callback(F.payload == "confirm_submit_dup", StateFilter(AppraisalStates.reviewing_result))
+async def on_confirm_submit_dup(callback, state: FSMContext, bot):
+    await state.update_data(_dup_ok=True)
+    await on_confirm_submit(callback, state, bot)
+
+
+@router.message_callback(F.payload == "dup_cancel", StateFilter(AppraisalStates.reviewing_result))
+async def on_dup_cancel(callback, state: FSMContext, bot):
+    data = await state.get_data()
+    await _review_or_close(state, callback.answer, data, note="\n\nЗаявка не отправлена.")
 
 
 @router.message_callback(F.payload == "update_price", StateFilter(AppraisalStates.reviewing_result))
@@ -1436,6 +1534,8 @@ def _deal_card_text(deal: dict) -> str:
         appraiser_sale_cost=deal.get("appraiser_sale_cost"),
         presale_preparation_cost=deal.get("presale_preparation_cost"),
         metrics=deal.get("metrics"),
+        warnings=deal.get("warnings"),
+        autohub_ptsp=deal.get("autohub_ptsp"),
     )
 
 
@@ -1961,44 +2061,80 @@ async def cmd_raw(message, command: CommandObject, bot):
         await message.answer(text=f"…и ещё {len(chunks) - 8} сообщ. — показаны первые 8.")
 
 
+REPORT_CATEGORIES = [("Категория А", "А"), ("Категория В", "В"), ("Категория С", "С")]
+REPORT_STATUSES = [STATUS_OK, STATUS_DDC, STATUS_UK, STATUS_UK_CEILING, STATUS_REJECT]
+
+
+def _pct(part: float, whole: float) -> str:
+    return f"{part / whole * 100:.0f}%" if whole else "—"
+
+
+def _avg_ratio(records: list, field: str) -> Optional[float]:
+    vals = [r[field] / r["avito_price"] for r in records if r.get(field) and r.get("avito_price")]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _report_block(recs: list, detailed: bool) -> list:
+    total = len(recs)
+    sent = [r for r in recs if r.get("outcome") != "not_sent"]
+    with_status = [r for r in recs if r.get("status")]
+    lines = [f"Оценок всего: {total} · отправлено на согласование: {len(sent)} ({_pct(len(sent), total)})"]
+
+    cat_counts = {code: sum(1 for r in recs if r.get("category") == name) for name, code in REPORT_CATEGORIES}
+    lines.append("Категории: " + " · ".join(f"{code} — {n} ({_pct(n, total)})" for code, n in cat_counts.items()))
+
+    if with_status:
+        status_counts = [(st, sum(1 for r in with_status if r.get("status") == st)) for st in REPORT_STATUSES]
+        if detailed:
+            lines.append(f"Уровни согласования (из {len(with_status)} с ценой выкупа):")
+            lines += [f"   {_status_text(st)} — {n} ({_pct(n, len(with_status))})" for st, n in status_counts]
+        else:
+            lines.append("Согласование: " + " · ".join(
+                f"{STATUS_BADGES.get(st, '')}{n} ({_pct(n, len(with_status))})" for st, n in status_counts if n))
+
+    if detailed:
+        lines.append("ПЦП к Авито-оценке, в среднем:")
+        for name, code in REPORT_CATEGORIES:
+            cat = [r for r in recs if r.get("category") == name]
+            if not cat:
+                continue
+            metric, forecast = _avg_ratio(cat, "ptsp_rop"), _avg_ratio(cat, "forecast")
+            parts = []
+            if metric is not None:
+                parts.append(f"по метрике {metric * 100:.1f}%")
+            if forecast is not None:
+                parts.append(f"прогноз ДЦ {forecast * 100:.1f}%")
+            lines.append(f"   {code} — " + (" · ".join(parts) if parts else "нет данных") + f" (оценок: {len(cat)})")
+        buyout = _avg_ratio(with_status, "negotiated_price")
+        if buyout is not None:
+            lines.append(f"Цена выкупа к Авито-оценке: в среднем {buyout * 100:.1f}%")
+        if sent:
+            lines.append(
+                f"Итог: принято ПАЦ {sum(1 for r in sent if r.get('outcome') == 'accepted')} · "
+                f"в работе {sum(1 for r in sent if r.get('outcome') in ('salon', 'uk', 'adjusting', 'pats'))} · "
+                f"корректировка {sum(1 for r in sent if r.get('outcome') == 'correction')} · "
+                f"отказ {sum(1 for r in sent if r.get('outcome') == 'declined')} · "
+                f"закрыто {sum(1 for r in sent if r.get('outcome') == 'closed')}")
+    return lines
+
+
 def _build_report(records: list, days: int) -> str:
-    """Отчёт по салонам: сколько оценок, куда ушли статусы, чем закончилось, закупка к Авито."""
+    """Отчёт: всего оценок, категории (кол-во и доли), уровни согласования (кол-во и доли),
+    ПЦП к Авито-оценке по категориям; ниже — коротко по каждому салону."""
+    end = datetime.date.today()
+    start = end - datetime.timedelta(days=days - 1)
+    head = f"📊 ОТЧЁТ ЗА {days} ДН. ({start:%d.%m}–{end:%d.%m})"
     if not records:
-        return f"📊 За {days} дн. оценок нет (учитываются оценки, сделанные в этой версии бота)."
+        return head + "\n\nОценок нет (учитываются оценки, сделанные в текущей версии бота)."
+    out = [head, ""] + _report_block(records, detailed=True)
     groups = {}
     for r in records:
         key = salon_label(r["salon"]) if r.get("salon") else (r.get("dealer_name") or "Без салона")
         groups.setdefault(key, []).append(r)
-
-    def block(name, recs):
-        sent = [r for r in recs if r.get("outcome") != "not_sent"]
-        by_status = {}
-        for r in sent:
-            by_status[r.get("status")] = by_status.get(r.get("status"), 0) + 1
-        ratios = [r["negotiated_price"] / r["avito_price"] for r in sent
-                  if r.get("negotiated_price") and r.get("avito_price")]
-        in_work = sum(1 for r in sent if r.get("outcome") in ("salon", "uk", "adjusting", "pats"))
-        lines = [
-            f"🏢 {name}",
-            f"   оценок: {len(recs)} · отправлено: {len(sent)}",
-        ]
-        if sent:
-            lines.append("   " + " · ".join(f"{_status_text(st)}: {n}" for st, n in
-                                            sorted(by_status.items(), key=lambda x: -x[1])))
-            lines.append(
-                f"   принято ПАЦ: {sum(1 for r in sent if r.get('outcome') == 'accepted')} · "
-                f"в работе: {in_work} · "
-                f"корректировка: {sum(1 for r in sent if r.get('outcome') == 'correction')} · "
-                f"отказ: {sum(1 for r in sent if r.get('outcome') == 'declined')}"
-            )
-        if ratios:
-            lines.append(f"   цена выкупа к Авито: в среднем {sum(ratios) / len(ratios) * 100:.1f}%")
-        return lines
-
-    out = [f"📊 ОТЧЁТ ЗА {days} ДН.", ""]
-    for name in sorted(groups, key=lambda n: -len(groups[n])):
-        out += block(name, groups[name]) + [""]
-    out += block("ВСЕГО", records)
+    if groups:
+        out += ["", "ПО САЛОНАМ"]
+        for name in sorted(groups, key=lambda n: -len(groups[n])):
+            out += ["", f"🏢 {name}"] + [f"   {line}" for line in _report_block(groups[name], detailed=False)]
     return "\n".join(out)
 
 
@@ -2305,6 +2441,9 @@ async def on_waiting_link(message, state: FSMContext, bot):
         dealer_name=data.dealer_name,
         appraisal_id=data.appraisal_id,
         salon=salon,
+        appraisal_date=data.appraisal_date.isoformat() if data.appraisal_date else None,
+        autohub_ptsp=data.autohub_ptsp,
+        reception_type=data.reception_type if data.reception_type in RECEPTION_TYPES else None,
     )
 
     vehicle_line = " ".join(str(x) for x in [data.brand, data.model, data.year] if x)
@@ -2321,6 +2460,12 @@ async def on_waiting_link(message, state: FSMContext, bot):
         auto.append(f"цена продажи ДЦ — {_fmt(data.appraisal_sale_cost)} ₽")
     if data.appraisal_purchase_cost is not None:
         auto.append(f"цена выкупа — {_fmt(data.appraisal_purchase_cost)} ₽")
+    if data.reception_type in RECEPTION_TYPES:
+        auto.append(f"тип приёма — {data.reception_type}")
+    elif data.reception_raw:
+        logger.warning("Тип приёма из MaxPoster «%s» не сопоставлен — добавьте его в MAXPOSTER_RECEPTION_MAP",
+                       data.reception_raw)
+    warnings = _appraisal_warnings(await state.get_data())
     salon_line = (f"🏢 Автосалон: {salon_label(salon)}" if salon
                   else f"🏢 Автосалон: {data.dealer_name or '—'} (нет в таблице — выберите ниже)")
     note = (
@@ -2328,6 +2473,7 @@ async def on_waiting_link(message, state: FSMContext, bot):
         f"ВИН: {data.vin or '—'}, Оценщик: {data.appraiser_name or '—'}\n"
         f"Авито-оценка: {_fmt(data.avito_price)} ₽, ДТП: {data.accidents_count}"
         + ("\n\nИз MaxPoster подставлено: " + "; ".join(auto) + "." if auto else "")
+        + ("\n\n" + "\n".join(warnings) if warnings else "")
     )
     await _ask_next(state, message.answer, bot, note=note)
 
@@ -2590,6 +2736,216 @@ async def _reminder_loop(bot) -> None:
             logger.exception("Ошибка при проверке напоминаний")
 
 
+# ---------------------------------------------------------------------------
+# Расписание: утренняя сводка, недельный отчёт, резервная копия
+# ---------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OPS_STATE_PATH = os.path.join(BASE_DIR, "ops_state.json")
+RUN_FLAG_PATH = os.path.join(BASE_DIR, "bot_running.flag")
+BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+BACKUP_FILES = ["access_store.json", "deals_store.json", "dealer_chats.json", "appraisals_log.json"]
+
+
+def _ops_state() -> dict:
+    try:
+        with open(OPS_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _ops_mark(job: str, day: str) -> None:
+    state = _ops_state()
+    state[job] = day
+    tmp = OPS_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, OPS_STATE_PATH)
+
+
+def _due(job: str, hhmm: str, weekday: Optional[int] = None) -> bool:
+    """Пора ли запускать задачу сегодня: время наступило, сегодня ещё не запускали.
+    Если бот был выключен в 9:00 и включился позже — задача выполнится при включении
+    (в тот же день)."""
+    if not hhmm or hhmm in ("0", "-", "off"):
+        return False
+    try:
+        h, m = (int(x) for x in hhmm.split(":"))
+    except ValueError:
+        return False
+    now = datetime.datetime.now()
+    if weekday is not None and now.weekday() != weekday:
+        return False
+    if (now.hour, now.minute) < (h, m):
+        return False
+    return _ops_state().get(job) != now.date().isoformat()
+
+
+def _digest_targets(deal: dict) -> set:
+    """Кто должен принять решение по сделке сейчас (минимальная нужная роль)."""
+    stage, status, dealer = deal.get("stage"), deal.get("approval_status"), deal.get("dealer_name")
+    if stage == "salon_pending":
+        if status == STATUS_OK:
+            return (approval_hierarchy.get_role_ids(dealer, "РОП")
+                    or approval_hierarchy.get_role_ids(dealer, "ДДЦ"))
+        return approval_hierarchy.get_role_ids(dealer, "ДДЦ")  # ДДЦ и первый этап статусов УК
+    if stage == "uk_pending":
+        return approval_hierarchy.get_uk_approvers(dealer)
+    if stage == "pats_pending":
+        return approval_hierarchy.get_pats_approvers()
+    return set()
+
+
+async def _send_digest(bot) -> int:
+    """Утренняя сводка: каждому согласующему — список того, что ждёт именно его решения."""
+    now = time.time()
+    per_user = {}
+    for token, deal in _queue_items_raw():
+        if not deal.get("card_sent"):  # только сделки, реально ушедшие в работу
+            continue
+        for uid in await asyncio.to_thread(_digest_targets, deal):
+            per_user.setdefault(uid, []).append(deal)
+    sent = 0
+    for uid, deals in per_user.items():
+        lines = [f"☀️ Доброе утро! Ждут вашего решения: {len(deals)}", ""]
+        for i, deal in enumerate(deals[:15], 1):
+            vehicle = deal.get("vehicle") or {}
+            car = " ".join(str(x) for x in [vehicle.get("brand"), vehicle.get("model"), vehicle.get("year")] if x)
+            since = deal.get("stage_since") or deal.get("created_at") or now
+            lines.append(f"{i}. 🏢 {_deal_salon_label(deal)}" + (f" · {car}" if car else ""))
+            lines.append(f"   {_fmt(deal.get('negotiated_price'))} ₽ · {_status_text(deal.get('approval_status'))} · "
+                         f"ждёт {_waiting_text(now - since)}")
+        if len(deals) > 15:
+            lines.append(f"…и ещё {len(deals) - 15}")
+        lines += ["", "Карточки с кнопками — в рабочих чатах салонов (УК — в личных сообщениях)."]
+        if await _send_to_user(bot, uid, "\n".join(lines)):
+            sent += 1
+    return sent
+
+
+def _queue_items_raw() -> list:
+    return [(t, d) for t, d in deals_store.list_deals().items()
+            if d.get("stage") in ("salon_pending", "uk_pending", "pats_pending")]
+
+
+def _make_backup() -> Optional[str]:
+    """Архив данных бота в backups/ (без .env и ключей). Старые архивы удаляются."""
+    import zipfile
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    path = os.path.join(BACKUP_DIR, f"maxbot_backup_{datetime.datetime.now():%Y-%m-%d_%H%M}.zip")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in BACKUP_FILES:
+            src = os.path.join(BASE_DIR, name)
+            if os.path.exists(src):
+                zf.write(src, arcname=name)
+    border = time.time() - BACKUP_KEEP_DAYS * 86400
+    for old in os.listdir(BACKUP_DIR):
+        full = os.path.join(BACKUP_DIR, old)
+        if old.startswith("maxbot_backup_") and old.endswith(".zip") and os.path.getmtime(full) < border:
+            os.remove(full)
+    return path
+
+
+async def _send_file_to_user(bot, user_id: int, path: str, text: str) -> bool:
+    """Отправка файла в личку. MAX обрабатывает загруженный файл не мгновенно —
+    при ответе «attachment not ready» повторяем несколько раз."""
+    from maxgram.types import FileAttachmentRequest
+    try:
+        with open(path, "rb") as f:
+            token = await bot.upload_file("file", f.read(), filename=os.path.basename(path))
+    except Exception as e:  # noqa: BLE001
+        logger.error("Не удалось загрузить файл %s в MAX: %s", path, e)
+        return False
+    for attempt in range(5):
+        try:
+            await bot.send_message(user_id=user_id, text=text,
+                                   attachments=[FileAttachmentRequest(payload={"token": token})])
+            return True
+        except Exception as e:  # noqa: BLE001
+            if "not.ready" in str(e) or "not ready" in str(e):
+                await asyncio.sleep(2 + attempt * 2)
+                continue
+            logger.error("Не удалось отправить файл %s: %s", path, e)
+            return False
+    return False
+
+
+async def _run_backup(bot) -> str:
+    path = await asyncio.to_thread(_make_backup)
+    size_kb = os.path.getsize(path) // 1024 + 1
+    sent = await _send_file_to_user(
+        bot, OWNER_USER_ID, path,
+        f"💾 Резервная копия данных бота за {datetime.datetime.now():%d.%m.%Y} ({size_kb} КБ): доступы, "
+        "заявки, привязки чатов, журнал оценок. Токенов и ключей в архиве нет. Сохраните файл.")
+    return f"копия {os.path.basename(path)} ({size_kb} КБ), " + ("отправлена владельцу" if sent
+                                                                else "сохранена на сервере, в MAX не ушла")
+
+
+async def _scheduler_tick(bot) -> None:
+    today = datetime.date.today().isoformat()
+    if access_store.is_bot_enabled() and _due("digest", DIGEST_TIME):
+        _ops_mark("digest", today)
+        logger.info("[schedule] утренняя сводка: отправлено %s", await _send_digest(bot))
+    if _due("weekly_report", REPORT_TIME, weekday=REPORT_WEEKDAY):
+        _ops_mark("weekly_report", today)
+        text = "🗓 Еженедельный отчёт\n\n" + _build_report(appraisals_log.since(7), 7)
+        for uid in REPORT_USER_IDS:
+            await _send_to_user(bot, uid, text[:3900])
+        logger.info("[schedule] недельный отчёт отправлен: %s", REPORT_USER_IDS)
+    if _due("backup", BACKUP_TIME):
+        _ops_mark("backup", today)
+        logger.info("[schedule] %s", await _run_backup(bot))
+
+
+async def _scheduler_loop(bot) -> None:
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await _scheduler_tick(bot)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Ошибка в расписании")
+            await _alert_owner(bot, f"Ошибка в расписании (сводка/отчёт/копия): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Надёжность: сообщения владельцу о запуске, сбое, ошибках
+# ---------------------------------------------------------------------------
+_last_alerts = {}
+
+
+async def _alert_owner(bot, text: str, key: Optional[str] = None) -> None:
+    """Сообщение владельцу; одинаковые — не чаще раза в 10 минут."""
+    key = key or text[:80]
+    now = time.time()
+    if now - _last_alerts.get(key, 0) < 600:
+        return
+    _last_alerts[key] = now
+    await _send_to_user(bot, OWNER_USER_ID, f"🛠 {BOT_TITLE}: {text}"[:3900])
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message, bot):
+    """[владелец] Резервная копия прямо сейчас (обычно приходит сама каждый день)."""
+    if not _is_owner(message.sender.user_id):
+        await message.answer(text="Эта команда доступна только владельцу бота.")
+        return
+    await message.answer(text="Делаю резервную копию…")
+    await message.answer(text="💾 " + await _run_backup(bot))
+
+
+@router.errors()
+async def on_error(event, bot=None):
+    """Любая необработанная ошибка в обработчике: в лог и владельцу (без спама)."""
+    exc = getattr(event, "exception", event)
+    logger.exception("Необработанная ошибка: %r", exc, exc_info=exc)
+    try:
+        await _alert_owner(bot or globals()["bot"], f"ошибка при обработке сообщения: {type(exc).__name__}: {exc}",
+                           key=type(exc).__name__)
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
 async def _set_commands_menu():
     """Заполняет нативное меню команд MAX (кнопка '/'), чтобы не нужно было
     запоминать команды — они появятся со своими описаниями в списке."""
@@ -2609,6 +2965,7 @@ async def _set_commands_menu():
             {"name": "register_pats", "description": "[админ] Назначить этот чат общим чатом ПАЦ"},
             {"name": "raw", "description": "[админ] Все поля оценки из MaxPoster"},
             {"name": "queue", "description": "[админ] Оценки в очереди на согласование"},
+            {"name": "backup", "description": "[владелец] Резервная копия данных прямо сейчас"},
             {"name": "report", "description": "[админ] Отчёт по салонам за 7 дней (/report 30 — за 30)"},
         ])
     except Exception as e:  # noqa: BLE001
@@ -2616,9 +2973,23 @@ async def _set_commands_menu():
 
 
 async def _main():
+    crashed_before = os.path.exists(RUN_FLAG_PATH)  # флаг не удалён — прошлый запуск завершился аварийно
+    with open(RUN_FLAG_PATH, "w") as f:
+        f.write(str(time.time()))
     await _set_commands_menu()
-    reminder_task = asyncio.create_task(_reminder_loop(bot))  # noqa: F841 — живёт, пока работает бот
-    await dp.start_polling(bot)
+    if crashed_before:
+        await _alert_owner(bot, "⚠️ бот был перезапущен после сбоя (прошлая работа завершилась аварийно). "
+                                "Сейчас всё работает.", key="startup")
+    else:
+        await _alert_owner(bot, "✅ бот запущен.", key="startup")
+    background = [asyncio.create_task(_reminder_loop(bot)), asyncio.create_task(_scheduler_loop(bot))]  # noqa: F841
+    try:
+        await dp.start_polling(bot)  # штатная остановка (systemctl stop/restart) — сюда возвращаемся
+    finally:
+        try:
+            os.remove(RUN_FLAG_PATH)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

@@ -44,3 +44,36 @@ ALLOWED_USER_IDS = {
 REMINDER_AFTER_MINUTES = int(os.environ.get("REMINDER_AFTER_MINUTES", "60") or 0)
 _hours = os.environ.get("REMINDER_HOURS", "9-21").split("-")
 REMINDER_HOURS = (int(_hours[0]), int(_hours[1])) if len(_hours) == 2 else (9, 21)
+
+# --- Расписание (время сервера, ЧЧ:ММ; пусто — выключено) ---
+# Утренняя сводка согласующим: что ждёт именно их решения
+DIGEST_TIME = os.environ.get("DIGEST_TIME", "09:00").strip()
+# Недельный отчёт: день недели (0 — понедельник) и время
+REPORT_WEEKDAY = int(os.environ.get("REPORT_WEEKDAY", "0") or 0)
+REPORT_TIME = os.environ.get("REPORT_TIME", "09:00").strip()
+# Кому слать недельный отчёт (MAX ID через запятую); пусто — только владельцу
+REPORT_USER_IDS = {
+    int(x) for x in os.environ.get("REPORT_USER_IDS", "").split(",") if x.strip().isdigit()
+} or {OWNER_USER_ID}
+# Резервная копия данных бота (доступы, сделки, чаты, журнал) владельцу в MAX
+BACKUP_TIME = os.environ.get("BACKUP_TIME", "21:30").strip()
+BACKUP_KEEP_DAYS = int(os.environ.get("BACKUP_KEEP_DAYS", "14") or 14)
+
+# Повторная оценка: за сколько дней искать оценки того же VIN
+DUPLICATE_DAYS = int(os.environ.get("DUPLICATE_DAYS", "7") or 7)
+
+# --- Поля MaxPoster, которых нет в стандартном наборе (уточняются по выводу /raw) ---
+# Дата Авито-оценки/осмотра: путь к полю в ответе MaxPoster (например "createdAt"); пусто — автопоиск
+MAXPOSTER_APPRAISAL_DATE_FIELD = os.environ.get("MAXPOSTER_APPRAISAL_DATE_FIELD", "").strip()
+# Авито-оценка старше стольких дней — предупреждение (по метрике оценка нужна на день осмотра)
+AVITO_MAX_AGE_DAYS = int(os.environ.get("AVITO_MAX_AGE_DAYS", "3") or 3)
+# Тип приёма: путь к полю и соответствие значений, например
+# MAXPOSTER_RECEPTION_FIELD=purchaseType
+# MAXPOSTER_RECEPTION_MAP=trade_in:Trade-In,trade_up:Trade-Up,buyout:Выкуп с улицы,pi:Trade-In на ПИ
+MAXPOSTER_RECEPTION_FIELD = os.environ.get("MAXPOSTER_RECEPTION_FIELD", "").strip()
+MAXPOSTER_RECEPTION_MAP = {
+    k.strip().lower(): v.strip()
+    for k, v in (pair.split(":", 1) for pair in os.environ.get("MAXPOSTER_RECEPTION_MAP", "").split(",") if ":" in pair)
+}
+# ПЦП Автохаб (справочно, для «цена выкупа к ПЦП Автохаб»): путь к полю
+MAXPOSTER_AUTOHUB_PTSP_FIELD = os.environ.get("MAXPOSTER_AUTOHUB_PTSP_FIELD", "").strip()

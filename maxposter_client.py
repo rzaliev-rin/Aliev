@@ -14,13 +14,15 @@
     (см. count_repainted_parts), а "скручен" оставляем как ссылку на
     отчёт Автотеки для ручного просмотра менеджером.
 """
+import datetime
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 
-from config import MAXPOSTER_API_BASE, MAXPOSTER_API_KEY
+from config import (MAXPOSTER_API_BASE, MAXPOSTER_API_KEY, MAXPOSTER_APPRAISAL_DATE_FIELD,
+                    MAXPOSTER_AUTOHUB_PTSP_FIELD, MAXPOSTER_RECEPTION_FIELD, MAXPOSTER_RECEPTION_MAP)
 
 APPRAISAL_LINK_RE = re.compile(r"appraisals/(\d+)")
 VIN_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")  # VIN: 17 симв., без I/O/Q
@@ -58,6 +60,77 @@ class AppraisalData:
     appraiser_name: Optional[str]    # Фамилия Имя оценщика
     dealer_name: Optional[str]       # Название автосалона (для маршрутизации согласования)
     raw: dict = field(repr=False)   # полный сырой ответ — на случай, если понадобятся другие поля
+    # Поля, путь к которым задаётся в .env (см. config.py) — уточняются по выводу /raw
+    appraisal_date: Optional[datetime.datetime] = None  # дата оценки/осмотра
+    appraisal_date_field: Optional[str] = None          # из какого поля взята дата
+    reception_raw: Optional[str] = None                 # тип приёма как в MaxPoster
+    reception_type: Optional[str] = None                # тип приёма в терминах метрики
+    autohub_ptsp: Optional[float] = None                # ПЦП Автохаб (справочно)
+
+
+# Где искать дату оценки, если MAXPOSTER_APPRAISAL_DATE_FIELD не задан
+APPRAISAL_DATE_CANDIDATES = [
+    "inspection.date", "inspection.createdAt", "inspectedAt", "inspectionDate",
+    "imvDate", "imvUpdatedAt", "imv_date", "appraisalDate", "createdAt", "created", "date",
+]
+
+
+def get_path(data: Any, path: str) -> Any:
+    """get_path({"a": {"b": 1}}, "a.b") -> 1; для списков — индекс: "items.0.name"."""
+    cur = data
+    for part in path.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def parse_date(value: Any) -> Optional[datetime.datetime]:
+    """ISO-строка, «дд.мм.гггг», unix-время в секундах или миллисекундах."""
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            ts = float(value) / (1000 if value > 1e11 else 1)
+            return datetime.datetime.fromtimestamp(ts)
+        text = str(value).strip()
+        m = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})", text)
+        if m:
+            return datetime.datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        dt = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt.astimezone().replace(tzinfo=None) if dt.tzinfo else dt
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def _extra_fields(data: dict) -> dict:
+    """Дата оценки, тип приёма и ПЦП Автохаб — по путям из .env (или автопоиск даты)."""
+    result = {}
+    paths = [MAXPOSTER_APPRAISAL_DATE_FIELD] if MAXPOSTER_APPRAISAL_DATE_FIELD else APPRAISAL_DATE_CANDIDATES
+    for path in paths:
+        dt = parse_date(get_path(data, path))
+        if dt:
+            result["appraisal_date"], result["appraisal_date_field"] = dt, path
+            break
+    if MAXPOSTER_RECEPTION_FIELD:
+        raw_value = get_path(data, MAXPOSTER_RECEPTION_FIELD)
+        if isinstance(raw_value, dict):  # бывает {"id": .., "name": ..}
+            raw_value = raw_value.get("name") or raw_value.get("code") or raw_value.get("id")
+        if raw_value not in (None, ""):
+            result["reception_raw"] = str(raw_value)
+            result["reception_type"] = MAXPOSTER_RECEPTION_MAP.get(str(raw_value).strip().lower())
+    if MAXPOSTER_AUTOHUB_PTSP_FIELD:
+        value = get_path(data, MAXPOSTER_AUTOHUB_PTSP_FIELD)
+        try:
+            result["autohub_ptsp"] = float(value) if value not in (None, "") else None
+        except (TypeError, ValueError):
+            pass
+    return result
 
 
 def extract_search_query(text: str) -> Optional[tuple]:
@@ -209,4 +282,5 @@ def fetch_appraisal(query: str) -> AppraisalData:
         appraiser_name=appraiser_name,
         dealer_name=dealer_obj.get("companyName"),
         raw=data,
+        **_extra_fields(data),
     )
