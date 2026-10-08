@@ -55,7 +55,7 @@ def update_deal(token: str, **kwargs) -> None:
     data = _load()
     if token in data:
         if "stage" in kwargs and kwargs["stage"] != data[token].get("stage"):
-            kwargs = {**kwargs, "stage_since": time.time(), "reminded_at": None}
+            kwargs = {**kwargs, "stage_since": time.time()}
         data[token].update(kwargs)
         _save(data)
 

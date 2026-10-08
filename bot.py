@@ -473,6 +473,7 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
                                 metrics=_metrics(result))
     sent = await _send_to_chat(bot, salon_chat_id, text, keyboard=deal_approval_kb(token))
     if sent:
+        deals_store.update_deal(token, card_sent=True)  # только такие сделки попадают в напоминания
         return (f"\n\n✅ Карточка отправлена на согласование в чат салона «{_salon_name_for_chat(vehicle_info)}».\n"
                 "О решении бот напишет вам сюда."), token, True
     return "\n\n⚠️ Не получилось отправить карточку в чат салона — согласуйте по старому процессу.", token, False
@@ -2217,24 +2218,35 @@ async def _remind_deal(bot, token: str, deal: dict, waited: float) -> bool:
     return False
 
 
+REMINDER_MAX_AGE_SECONDS = 24 * 60 * 60  # сделки, которые ждут дольше суток, не трогаем
+
+
 async def _check_reminders(bot) -> None:
+    """Одно напоминание на этап сделки, и только если:
+    - сделка создана этой версией бота и её карточка действительно ушла в чат
+      (card_sent) — старые и «согласуйте по старому процессу» сделки из файла
+      не трогаем никогда;
+    - сделка ждёт на этапе дольше REMINDER_AFTER_MINUTES, но меньше суток;
+    - по этому этапу ещё не напоминали (reminded_stage)."""
     now = time.time()
     if not (REMINDER_HOURS[0] <= datetime.datetime.now().hour < REMINDER_HOURS[1]):
         return
     after = REMINDER_AFTER_MINUTES * 60
     for token, deal in deals_store.list_deals().items():
-        if deal.get("stage") not in ("salon_pending", "uk_pending", "pats_pending"):
+        stage = deal.get("stage")
+        if stage not in ("salon_pending", "uk_pending", "pats_pending"):
             continue
-        since = deal.get("stage_since")
-        if not since:  # сделка из версии без отметок времени — считаем с этого момента
-            deals_store.update_deal(token, stage_since=now)
+        if not deal.get("card_sent") or not deal.get("stage_since"):
             continue
-        last = deal.get("reminded_at") or since
-        if now - last < after:
+        if deal.get("reminded_stage") == stage:
             continue
-        if await _remind_deal(bot, token, deal, now - since):
-            logger.info("[reminder] token=%s stage=%s напоминание отправлено", token, deal.get("stage"))
-        deals_store.update_deal(token, reminded_at=now)
+        waited = now - deal["stage_since"]
+        if waited < after or waited > REMINDER_MAX_AGE_SECONDS:
+            continue
+        # отмечаем ДО отправки: даже если отправка сорвётся, повторов не будет
+        deals_store.update_deal(token, reminded_stage=stage)
+        if await _remind_deal(bot, token, deal, waited):
+            logger.info("[reminder] token=%s stage=%s напоминание отправлено", token, stage)
 
 
 async def _reminder_loop(bot) -> None:

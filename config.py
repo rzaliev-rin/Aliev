@@ -37,9 +37,10 @@ ALLOWED_USER_IDS = {
     int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip().isdigit()
 }
 
-# Напоминания согласующим: если сделка ждёт решения дольше REMINDER_AFTER_MINUTES,
-# бот повторно присылает карточку с кнопками. Только в рабочие часы (время сервера),
-# REMINDER_HOURS="9-21" — с 9:00 до 21:00. REMINDER_AFTER_MINUTES=0 — выключить.
-REMINDER_AFTER_MINUTES = int(os.environ.get("REMINDER_AFTER_MINUTES", "120") or 0)
+# Напоминание согласующим: если сделка ждёт решения дольше REMINDER_AFTER_MINUTES,
+# бот ОДИН раз повторно присылает карточку с кнопками (на каждом этапе: салон, УК, ПАЦ).
+# Только в рабочие часы (время сервера), REMINDER_HOURS="9-21" — с 9:00 до 21:00.
+# REMINDER_AFTER_MINUTES=0 — выключить напоминания полностью.
+REMINDER_AFTER_MINUTES = int(os.environ.get("REMINDER_AFTER_MINUTES", "60") or 0)
 _hours = os.environ.get("REMINDER_HOURS", "9-21").split("-")
 REMINDER_HOURS = (int(_hours[0]), int(_hours[1])) if len(_hours) == 2 else (9, 21)
