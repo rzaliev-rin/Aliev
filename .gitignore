@@ -15,3 +15,6 @@ appraisals_log.json
 ops_state.json
 bot_running.flag
 backups/
+
+# copies of files for the user to download (already in the repo root)
+dist/
