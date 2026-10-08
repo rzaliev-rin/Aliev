@@ -1091,6 +1091,7 @@ def admin_menu_kb(user_id: Optional[int] = None):
     builder.callback(text="👥 Пользователи", payload="admin_users")
     builder.callback(text="🏢 Салоны", payload="admin_salons")
     builder.callback(text="📊 Отчёт за 7 дней", payload="admin_report")
+    builder.callback(text="⏳ Оценки в очереди", payload="admin_queue")
     if _is_owner(user_id):
         if access_store.is_bot_enabled():
             builder.callback(text="⏸ Остановить бота", payload="bot_stop_ask")
@@ -1190,6 +1191,120 @@ async def on_admin_menu(callback, bot):
         await _toast(callback, "Только для администраторов.")
         return
     await callback.answer(text=_admin_menu_text(), keyboard=admin_menu_kb(user_id))
+
+
+# ---------------------------------------------------------------------------
+# Очередь: какие заявки ждут согласования и сколько
+# ---------------------------------------------------------------------------
+STAGE_TEXT = {
+    "salon_pending": "в чате салона (РОП/ДДЦ)",
+    "uk_pending": "у УК",
+    "pats_pending": "в ПАЦ",
+    "adjusting": "корректировка у согласующего",
+}
+
+
+def _queue_items() -> list:
+    """[(token, deal, ждёт_секунд или None)] — самые долгие сверху."""
+    now = time.time()
+    items = []
+    for token, deal in deals_store.list_deals().items():
+        since = deal.get("stage_since") or deal.get("created_at")
+        items.append((token, deal, (now - since) if since else None))
+    # старые сделки без отметки времени — в самом верху (они самые давние)
+    items.sort(key=lambda x: -(x[2] if x[2] is not None else float("inf")))
+    return items
+
+
+def _queue_view(page: int = 0, note: str = ""):
+    items = _queue_items()
+    chunk, page, pages = _page_slice(items, page)
+    lines = ([note, ""] if note else []) + [f"⏳ ОЦЕНКИ В ОЧЕРЕДИ: {len(items)}"]
+    builder = InlineKeyboardBuilder()
+    sizes = []
+    if not items:
+        lines.append("Незавершённых заявок нет.")
+    else:
+        if pages > 1:
+            lines.append(f"Страница {page + 1} из {pages}")
+        start = page * LIST_PAGE_SIZE
+        for i, (token, deal, waited) in enumerate(chunk, start + 1):
+            vehicle = deal.get("vehicle") or {}
+            car = " ".join(str(x) for x in [vehicle.get("brand"), vehicle.get("model"), vehicle.get("year")] if x)
+            appraiser = vehicle.get("appraiser_name") or deal.get("manager_name") or "—"
+            wait = _waiting_text(waited) if waited is not None else "давно (старая версия бота)"
+            price = f"{_fmt(deal['negotiated_price'])} ₽" if deal.get("negotiated_price") else "цена —"
+            lines += [
+                "",
+                f"{i}. 🏢 {_deal_salon_label(deal)}" + (f" · {car}" if car else ""),
+                f"   {price} · {_status_text(deal.get('approval_status'))}",
+                f"   ⏳ {STAGE_TEXT.get(deal.get('stage'), deal.get('stage') or '—')}, ждёт {wait}",
+                f"   оценщик: {appraiser}" + (f" · VIN {deal['vin']}" if deal.get("vin") else ""),
+            ]
+            builder.callback(text=f"✖ Закрыть №{i}", payload=f"queue_close_ask:{token}:{page}")
+        sizes = [2] * (len(chunk) // 2) + ([1] if len(chunk) % 2 else [])
+    builder.callback(text="🔄 Обновить", payload=f"admin_queue_p:{page}")
+    sizes.append(1)
+    sizes.append(_nav_row(builder, "admin_queue_p", page, pages))
+    builder.adjust(*sizes)
+    return "\n".join(lines), builder
+
+
+@router.message(Command("queue"))
+async def cmd_queue(message, bot):
+    if not _is_admin(message.sender.user_id):
+        await message.answer(text="Эта команда только для администраторов.")
+        return
+    await _safe_answer(message.answer, *_queue_view(0))
+
+
+@router.message_callback(F.payload == "admin_queue")
+@router.message_callback(F.payload.startswith("admin_queue_p:"))
+async def on_admin_queue(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await _toast(callback, "Только для администраторов.")
+        return
+    await _safe_answer(callback.answer, *_queue_view(_page_arg(callback.payload, 1)))
+
+
+@router.message_callback(F.payload.startswith("queue_close_ask:"))
+async def on_queue_close_ask(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await _toast(callback, "Только для администраторов.")
+        return
+    _, token, *rest = callback.payload.split(":")
+    page = int(rest[0]) if rest and rest[0].isdigit() else 0
+    deal = deals_store.get_deal(token)
+    if not deal:
+        await _safe_answer(callback.answer, *_queue_view(page, note="Эта заявка уже обработана или закрыта."))
+        return
+    builder = InlineKeyboardBuilder()
+    builder.callback(text="✖ Да, закрыть заявку", payload=f"queue_close:{token}:{page}")
+    builder.callback(text="Назад к очереди", payload=f"admin_queue_p:{page}")
+    builder.adjust(1)
+    await _safe_answer(callback.answer,
+                       "Закрыть заявку?\n\n" + _deal_short(deal)
+                       + f"\nСтатус: {_status_text(deal.get('approval_status'))}"
+                       + "\n\nКнопки на её карточке перестанут работать, оценщик получит уведомление.",
+                       builder)
+
+
+@router.message_callback(F.payload.startswith("queue_close:"))
+async def on_queue_close(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await _toast(callback, "Только для администраторов.")
+        return
+    _, token, *rest = callback.payload.split(":")
+    page = int(rest[0]) if rest and rest[0].isdigit() else 0
+    deal = deals_store.get_deal(token)
+    note = "Эта заявка уже обработана или закрыта."
+    if deal:
+        deals_store.delete_deal(token)
+        await _notify_appraiser(bot, token, deal,
+                                "⛔ Заявка закрыта администратором. При необходимости отправьте оценку заново.",
+                                outcome="closed")
+        note = f"✖ Заявка закрыта: {_deal_short(deal)}"
+    await _safe_answer(callback.answer, *_queue_view(page, note=note))
 
 
 @router.message_callback(F.payload == "bot_stop_ask")
@@ -1332,8 +1447,9 @@ def _salon_name_for_chat(vehicle_info: dict) -> str:
 
 
 def _deal_salon_label(deal: dict) -> str:
-    if deal.get("salon"):
-        return salon_label(deal["salon"])
+    salon = deal.get("salon") or find_salon(deal.get("dealer_name"))
+    if salon:
+        return salon_label(salon)
     return deal.get("dealer_name") or "—"
 
 
@@ -2492,6 +2608,7 @@ async def _set_commands_menu():
             {"name": "register_salon", "description": "[админ] Привязать этот чат к салону"},
             {"name": "register_pats", "description": "[админ] Назначить этот чат общим чатом ПАЦ"},
             {"name": "raw", "description": "[админ] Все поля оценки из MaxPoster"},
+            {"name": "queue", "description": "[админ] Оценки в очереди на согласование"},
             {"name": "report", "description": "[админ] Отчёт по салонам за 7 дней (/report 30 — за 30)"},
         ])
     except Exception as e:  # noqa: BLE001
