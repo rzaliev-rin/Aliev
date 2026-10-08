@@ -319,6 +319,23 @@ def new_appraisal_kb():
     return main_menu_kb()
 
 
+def _already_processed_text(deal: dict) -> str:
+    if deal.get("stage") == "adjusting":
+        return "Сделку сейчас корректирует другой согласующий — дождитесь его решения."
+    return "Эта сделка уже обработана — повторно нажимать не нужно."
+
+
+async def _toast(callback, text: str) -> None:
+    """Всплывающая подсказка ТОЛЬКО тому, кто нажал кнопку. Карточку и её кнопки
+    не трогаем: по умолчанию callback.answer() в pymaxgram отправляет пустой
+    список вложений, и MAX стирает кнопки у всех — например, когда кнопку
+    «Согласовано» нажал человек без прав, карточка оставалась без кнопок."""
+    try:
+        await callback.answer(notification=text, clear_attachments=False)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось показать подсказку на нажатие кнопки: %s", e)
+
+
 def _get_user_id(obj) -> Optional[int]:
     """Достаёт user_id из message/callback/event разных типов pymaxgram — с запасными вариантами,
     так как точная структура объекта не всегда одинакова."""
@@ -895,7 +912,7 @@ async def cmd_users(message, bot):
 @router.message_callback(F.payload.startswith("revoke_user:"))
 async def on_revoke_user(callback, bot):
     if not _is_admin(_get_user_id(callback)):
-        await callback.answer(notification="Только для администраторов.")
+        await _toast(callback, "Только для администраторов.")
         return
     uid = int(callback.payload.split(":", 1)[1])
     access_store.revoke(uid)
@@ -947,7 +964,7 @@ async def cmd_admin(message, bot):
 @router.message_callback(F.payload == "admin_pending")
 async def on_admin_pending(callback, bot):
     if not _is_admin(_get_user_id(callback)):
-        await callback.answer(notification="Только для администраторов.")
+        await _toast(callback, "Только для администраторов.")
         return
     pending = access_store.list_pending()
     if not pending:
@@ -966,7 +983,7 @@ async def on_admin_pending(callback, bot):
 @router.message_callback(F.payload == "admin_users")
 async def on_admin_users(callback, bot):
     if not _is_admin(_get_user_id(callback)):
-        await callback.answer(notification="Только для администраторов.")
+        await _toast(callback, "Только для администраторов.")
         return
     allowed = access_store.list_allowed()
     lines = ["Пользователи с доступом к боту:"]
@@ -988,7 +1005,7 @@ async def on_admin_users(callback, bot):
 @router.message_callback(F.payload == "admin_salons")
 async def on_admin_salons(callback, bot):
     if not _is_admin(_get_user_id(callback)):
-        await callback.answer(notification="Только для администраторов.")
+        await _toast(callback, "Только для администраторов.")
         return
     salons = dealer_chats.list_salons()
     pats_id = dealer_chats.get_pats_chat_id()
@@ -1025,7 +1042,7 @@ async def cmd_pending(message, bot):
 @router.message_callback(F.payload.startswith("approve:"))
 async def on_approve_callback(callback, bot):
     if not _is_admin(_get_user_id(callback)):
-        await callback.answer(notification="Только для администраторов.")
+        await _toast(callback, "Только для администраторов.")
         return
     uid = int(callback.payload.split(":", 1)[1])
     access_store.approve(uid)
@@ -1035,7 +1052,7 @@ async def on_approve_callback(callback, bot):
 @router.message_callback(F.payload.startswith("deny:"))
 async def on_deny_callback(callback, bot):
     if not _is_admin(_get_user_id(callback)):
-        await callback.answer(notification="Только для администраторов.")
+        await _toast(callback, "Только для администраторов.")
         return
     uid = int(callback.payload.split(":", 1)[1])
     access_store.deny(uid)
@@ -1333,7 +1350,7 @@ async def _request_adjustment(bot, callback, token: str, deal: dict, source: str
         appraisals_log.update_by_token(token, outcome="adjusting")
         await callback.answer(text=card + "\n\n🔄 Ожидается ввод новой цены — проверьте личные сообщения от бота.")
     else:
-        await callback.answer(notification="Не удалось написать вам лично. Напишите боту что-нибудь в личку и нажмите ещё раз.")
+        await _toast(callback, "Не удалось написать вам лично. Напишите боту что-нибудь в личку и нажмите ещё раз.")
 
 
 @router.message_callback(F.payload.startswith("deal_approve:"))
@@ -1342,11 +1359,11 @@ async def on_deal_approve(callback, bot):
     deal = deals_store.get_deal(token)
     if not deal:
         logger.info("[approve] token=%s не найден в deals_store (возможно, уже обработан)", token)
-        await callback.answer(notification="Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
         return
     if deal.get("stage") != "salon_pending":
         # Кто-то уже нажал кнопку раньше — не отправляем в ПАЦ повторно.
-        await callback.answer(notification="Эта сделка уже обработана — повторно нажимать не нужно.")
+        await _toast(callback, _already_processed_text(deal))
         return
 
     user_id = _get_user_id(callback)
@@ -1357,7 +1374,7 @@ async def on_deal_approve(callback, bot):
     if not _can_approve(user_id, approvers):
         role_hint = " (нужен ДДЦ)" if status in UK_STATUSES else ""
         logger.info("[approve] token=%s отклонён: user=%s нет в approvers", token, user_id)
-        await callback.answer(notification=f"У вас нет прав согласовывать сделку со статусом «{status}»{role_hint}.")
+        await _toast(callback, f"У вас нет прав согласовывать сделку со статусом «{status}»{role_hint}.")
         return
 
     role, sheet_name = approval_hierarchy.resolve_role_and_name(deal.get("dealer_name"), user_id)
@@ -1371,10 +1388,10 @@ async def on_deal_adjust(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await callback.answer(notification="Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
         return
     if deal.get("stage") != "salon_pending":
-        await callback.answer(notification="Эта сделка уже обработана — повторно нажимать не нужно.")
+        await _toast(callback, _already_processed_text(deal))
         return
 
     user_id = _get_user_id(callback)
@@ -1382,7 +1399,7 @@ async def on_deal_adjust(callback, bot):
     approvers = approval_hierarchy.get_first_stage_approvers(deal.get("dealer_name"), status)
     if not _can_approve(user_id, approvers):
         role_hint = " (нужен ДДЦ)" if status in UK_STATUSES else ""
-        await callback.answer(notification=f"У вас нет прав согласовывать сделку со статусом «{status}»{role_hint}.")
+        await _toast(callback, f"У вас нет прав согласовывать сделку со статусом «{status}»{role_hint}.")
         return
 
     await _request_adjustment(bot, callback, token, deal, source="salon")
@@ -1393,16 +1410,16 @@ async def on_deal_decline(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await callback.answer(notification="Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
         return
     if deal.get("stage") != "salon_pending":
-        await callback.answer(notification="Эта сделка уже обработана — повторно нажимать не нужно.")
+        await _toast(callback, _already_processed_text(deal))
         return
 
     user_id = _get_user_id(callback)
     approvers = approval_hierarchy.get_first_stage_approvers(deal.get("dealer_name"), deal.get("approval_status"))
     if not _can_approve(user_id, approvers):
-        await callback.answer(notification=f"У вас нет прав отклонять сделку со статусом «{deal.get('approval_status')}».")
+        await _toast(callback, f"У вас нет прав отклонять сделку со статусом «{deal.get('approval_status')}».")
         return
 
     card = _deal_card_text(deal)
@@ -1419,16 +1436,16 @@ async def on_uk_approve(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await callback.answer(notification="Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
         return
     if deal.get("stage") != "uk_pending":
-        await callback.answer(notification="Эта сделка уже обработана — повторно нажимать не нужно.")
+        await _toast(callback, _already_processed_text(deal))
         return
 
     user_id = _get_user_id(callback)
     uk_ids = approval_hierarchy.get_uk_approvers(deal.get("dealer_name"))
     if not _can_approve(user_id, uk_ids):
-        await callback.answer(notification="У вас нет прав согласовывать эту сделку (нужен УК).")
+        await _toast(callback, "У вас нет прав согласовывать эту сделку (нужен УК).")
         return
 
     text = await _advance_after_uk_approval(bot, token, deal, _get_user_name(callback))
@@ -1440,16 +1457,16 @@ async def on_uk_adjust(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await callback.answer(notification="Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
         return
     if deal.get("stage") != "uk_pending":
-        await callback.answer(notification="Эта сделка уже обработана — повторно нажимать не нужно.")
+        await _toast(callback, _already_processed_text(deal))
         return
 
     user_id = _get_user_id(callback)
     uk_ids = approval_hierarchy.get_uk_approvers(deal.get("dealer_name"))
     if not _can_approve(user_id, uk_ids):
-        await callback.answer(notification="У вас нет прав согласовывать эту сделку (нужен УК).")
+        await _toast(callback, "У вас нет прав согласовывать эту сделку (нужен УК).")
         return
 
     await _request_adjustment(bot, callback, token, deal, source="uk")
@@ -1460,16 +1477,16 @@ async def on_uk_decline(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await callback.answer(notification="Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
         return
     if deal.get("stage") != "uk_pending":
-        await callback.answer(notification="Эта сделка уже обработана — повторно нажимать не нужно.")
+        await _toast(callback, _already_processed_text(deal))
         return
 
     user_id = _get_user_id(callback)
     uk_ids = approval_hierarchy.get_uk_approvers(deal.get("dealer_name"))
     if not _can_approve(user_id, uk_ids):
-        await callback.answer(notification="У вас нет прав отклонять эту сделку (нужен УК).")
+        await _toast(callback, "У вас нет прав отклонять эту сделку (нужен УК).")
         return
 
     card = _deal_card_text(deal)
@@ -1498,13 +1515,13 @@ async def _send_pats_request(callback, bot, kind: str) -> None:
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await callback.answer(notification="Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
         return
 
     user_id = _get_user_id(callback)
     pats_approvers = approval_hierarchy.get_pats_approvers()
     if not _can_approve(user_id, pats_approvers):
-        await callback.answer(notification="У вас нет прав отправлять такие запросы.")
+        await _toast(callback, "У вас нет прав отправлять такие запросы.")
         return
 
     vehicle = deal.get("vehicle") or {}
@@ -1530,7 +1547,7 @@ async def _send_pats_request(callback, bot, kind: str) -> None:
     if pats_chat_id:
         await _send_to_chat(bot, pats_chat_id, pats_note)
 
-    await callback.answer(notification="Запрос отправлен.")
+    await _toast(callback, "Запрос отправлен.")
 
 
 @router.message_callback(F.payload.startswith("pats_done:"))
@@ -1538,13 +1555,13 @@ async def on_pats_done(callback, bot):
     token = callback.payload.split(":", 1)[1]
     deal = deals_store.get_deal(token)
     if not deal:
-        await callback.answer(notification="Сделка не найдена (возможно, уже обработана).")
+        await _toast(callback, "Сделка не найдена (возможно, уже обработана).")
         return
 
     user_id = _get_user_id(callback)
     pats_approvers = approval_hierarchy.get_pats_approvers()
     if not _can_approve(user_id, pats_approvers):
-        await callback.answer(notification="У вас нет прав подтверждать приёмку в ПАЦ.")
+        await _toast(callback, "У вас нет прав подтверждать приёмку в ПАЦ.")
         return
 
     pats_confirmer = _get_user_name(callback) or "ПАЦ"
@@ -1678,7 +1695,7 @@ def _build_report(records: list, days: int) -> str:
 @router.message_callback(F.payload == "admin_report")
 async def on_admin_report(callback, bot):
     if not _is_admin(_get_user_id(callback)):
-        await callback.answer(notification="Только для администраторов.")
+        await _toast(callback, "Только для администраторов.")
         return
     await callback.answer(text=_build_report(appraisals_log.since(7), 7)[:3900])
 
