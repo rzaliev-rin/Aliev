@@ -76,6 +76,7 @@ AVITO_MAX_AGE_DAYS = int(os.environ.get("AVITO_MAX_AGE_DAYS", "3") or 3)
 MAXPOSTER_RECEPTION_FIELD = (os.environ.get("MAXPOSTER_RECEPTION_FIELD", "").strip() or "acquisitionSource")
 MAXPOSTER_RECEPTION_MAP = {
     "trade_in_new": "Trade-In",  # «Трейд-ин новый» в интерфейсе MaxPoster
+    "trade_in_used": "Trade-Up",  # «Трейд-ин с пробегом» = Trade-Up (оценка 8737839)
 }
 MAXPOSTER_RECEPTION_MAP.update({
     k.strip().lower(): v.strip()
