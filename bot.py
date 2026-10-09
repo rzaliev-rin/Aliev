@@ -451,12 +451,51 @@ def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_nam
     return "\n".join(line for line in lines if line)
 
 
-async def _send_to_chat(bot, chat_id: int, text: str, keyboard=None) -> bool:
+def _track_card(token: Optional[str], sent, text: str) -> None:
+    """Запоминает карточку с кнопками по сделке (id сообщения, текст, этап), чтобы
+    после решения снять с неё кнопки и показать статус — см. _retire_cards."""
+    if not token:
+        return
+    mid = getattr(getattr(sent, "body", None), "mid", None)
+    deal = deals_store.get_deal(token)
+    if not mid or not deal:
+        return
+    cards = list(deal.get("card_msgs") or [])
+    cards.append({"mid": mid, "text": text, "stage": deal.get("stage")})
+    deals_store.update_deal(token, card_msgs=cards)
+
+
+async def _retire_cards(bot, token: str, deal: dict, event: str) -> None:
+    """Снимает кнопки со всех карточек и напоминаний по сделке, которые относятся
+    к уже пройденному этапу, и ставит сверху, чем всё закончилось. Карточки
+    текущего этапа (например, только что отправленные УК или в ПАЦ) не трогаем."""
+    current = deals_store.get_deal(token)
+    pending = current.get("stage") if current and current.get("stage") in (
+        "salon_pending", "uk_pending", "pats_pending") else None
+    cards, seen = [], set()
+    for card in list(deal.get("card_msgs") or []) + list((current or {}).get("card_msgs") or []):
+        if card.get("mid") and card["mid"] not in seen:
+            seen.add(card["mid"])
+            cards.append(card)
+    keep = [c for c in cards if pending and c.get("stage") == pending]
+    for card in cards:
+        if card in keep:
+            continue
+        text = f"📌 Уже решено: {event}\n\n{card.get('text') or ''}"
+        try:
+            await bot.edit_message(message_id=card["mid"], text=text[:3900], keyboard=None)
+        except Exception as e:  # noqa: BLE001 — сообщение могли удалить, это не критично
+            logger.warning("[retire_cards] token=%s mid=%s: %s", token, card["mid"], e)
+    if current:
+        deals_store.update_deal(token, card_msgs=keep)
+
+
+async def _send_to_chat(bot, chat_id: int, text: str, keyboard=None, track: Optional[str] = None) -> bool:
     """Отправка сообщения в чат по chat_id по инициативе бота (не в ответ).
-    Точный метод в библиотеке документирован не полностью — пробуем наиболее
-    вероятный вариант и логируем ошибку вместо падения бота, если не сработает."""
+    track — токен сделки: карточку с кнопками запоминаем, чтобы потом снять кнопки."""
     try:
-        await bot.send_message(chat_id=chat_id, text=text, keyboard=keyboard)
+        sent = await bot.send_message(chat_id=chat_id, text=text, keyboard=keyboard)
+        _track_card(track, sent, text)
         logger.info("[send_to_chat] Успешно отправлено в чат %s (%s символов)", chat_id, len(text))
         return True
     except Exception as e:  # noqa: BLE001
@@ -518,7 +557,7 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
             return (f"\n\n✅ Сделка отправлена на согласование УК ({where}).\n"
                     "О решении бот напишет вам сюда."), token, True
         return "\n\n⚠️ Не получилось отправить карточку УК — согласуйте по старому процессу.", token, False
-    sent = await _send_to_chat(bot, salon_chat_id, text, keyboard=deal_approval_kb(token))
+    sent = await _send_to_chat(bot, salon_chat_id, text, keyboard=deal_approval_kb(token), track=token)
     if sent:
         deals_store.update_deal(token, card_sent=True)  # только такие сделки попадают в напоминания
         return (f"\n\n✅ Карточка отправлена на согласование в чат салона «{_salon_name_for_chat(vehicle_info)}».\n"
@@ -1523,12 +1562,13 @@ def uk_approval_kb(token: str):
     return builder
 
 
-async def _send_to_user(bot, user_id: int, text: str, keyboard=None) -> bool:
+async def _send_to_user(bot, user_id: int, text: str, keyboard=None, track: Optional[str] = None) -> bool:
     """Личное сообщение конкретному пользователю по его user_id (не в ответ,
     а по инициативе бота). Как и _send_to_chat — метод не задокументирован
     официально, работает по аналогии с отправкой в чат."""
     try:
-        await bot.send_message(user_id=user_id, text=text, keyboard=keyboard)
+        sent = await bot.send_message(user_id=user_id, text=text, keyboard=keyboard)
+        _track_card(track, sent, text)
         return True
     except Exception as e:  # noqa: BLE001
         logger.error("Не удалось отправить личное сообщение пользователю %s: %s", user_id, e)
@@ -1603,7 +1643,7 @@ async def _send_to_pats(bot, token: str, deal: dict, approved_role_label: str = 
     if not pats_chat_id:
         logger.warning("[send_to_pats] token=%s — чат ПАЦ не зарегистрирован, карточка не отправлена", token)
         return "\n\n⚠️ Чат ПАЦ ещё не зарегистрирован."
-    sent = await _send_to_chat(bot, pats_chat_id, pats_text, keyboard=pats_done_kb(token))
+    sent = await _send_to_chat(bot, pats_chat_id, pats_text, keyboard=pats_done_kb(token), track=token)
     return "\n\nОтправлено в ПАЦ." if sent else "\n\n⚠️ Не удалось отправить в ПАЦ, сообщите администратору."
 
 
@@ -1626,6 +1666,7 @@ async def _notify_appraiser(bot, token: str, deal: dict, event: str, outcome: Op
     user_id = deal.get("manager_user_id")
     if user_id:
         await _send_to_user(bot, user_id, f"{event}\n{_deal_short(deal)}")
+    await _retire_cards(bot, token, deal, event)
 
 
 async def _send_to_uk(bot, token: str, dealer_name: Optional[str], text: str) -> tuple:
@@ -1633,10 +1674,10 @@ async def _send_to_uk(bot, token: str, dealer_name: Optional[str], text: str) ->
     Возвращает (ушло ли хоть одно личное сообщение, ушло ли в чат)."""
     sent_any = False
     for uk_id in approval_hierarchy.get_uk_approvers(dealer_name):
-        if await _send_to_user(bot, uk_id, text, keyboard=uk_approval_kb(token)):
+        if await _send_to_user(bot, uk_id, text, keyboard=uk_approval_kb(token), track=token):
             sent_any = True
     salon_chat_id = dealer_chats.get_salon_chat_id(dealer_name)
-    posted_in_chat = bool(salon_chat_id) and await _send_to_chat(bot, salon_chat_id, text, keyboard=uk_approval_kb(token))
+    posted_in_chat = bool(salon_chat_id) and await _send_to_chat(bot, salon_chat_id, text, keyboard=uk_approval_kb(token), track=token)
     return sent_any, posted_in_chat
 
 
@@ -1659,7 +1700,7 @@ async def _advance_after_salon_approval(bot, token: str, deal: dict, role: Optio
         )
         sent_any = False
         for uk_id in uk_ids:
-            if await _send_to_user(bot, uk_id, uk_text, keyboard=uk_approval_kb(token)):
+            if await _send_to_user(bot, uk_id, uk_text, keyboard=uk_approval_kb(token), track=token):
                 sent_any = True
 
         # Дублируем ту же карточку в чат салона — УК может согласовать и там,
@@ -1667,7 +1708,7 @@ async def _advance_after_salon_approval(bot, token: str, deal: dict, role: Optio
         salon_chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
         posted_in_chat = False
         if salon_chat_id:
-            posted_in_chat = await _send_to_chat(bot, salon_chat_id, uk_text, keyboard=uk_approval_kb(token))
+            posted_in_chat = await _send_to_chat(bot, salon_chat_id, uk_text, keyboard=uk_approval_kb(token), track=token)
 
         if sent_any and posted_in_chat:
             note = "\n\nОтправлено на согласование УК (лично и в этот чат)."
@@ -1747,7 +1788,7 @@ async def _handle_adjustment_input(message, token: str, deal: dict, bot):
                                  awaiting_input_from=None, awaiting_field=None, stage_before_adjust=None)
         kb = uk_approval_kb(token) if prev_stage == "uk_pending" else deal_approval_kb(token)
         salon_chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
-        reposted = bool(salon_chat_id) and await _send_to_chat(bot, salon_chat_id, _deal_card_text(deal), keyboard=kb)
+        reposted = bool(salon_chat_id) and await _send_to_chat(bot, salon_chat_id, _deal_card_text(deal), keyboard=kb, track=token)
         if not reposted:
             await message.answer(text=_deal_card_text(deal), keyboard=kb)
         appraisals_log.update_by_token(token, outcome="uk" if prev_stage == "uk_pending" else "salon")
@@ -2717,21 +2758,21 @@ async def _remind_deal(bot, token: str, deal: dict, waited: float) -> bool:
     if stage == "salon_pending":
         chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
         return bool(chat_id) and await _send_to_chat(bot, chat_id, prefix + _deal_card_text(deal),
-                                                     keyboard=deal_approval_kb(token))
+                                                     keyboard=deal_approval_kb(token), track=token)
     if stage == "uk_pending":
         text = prefix + _deal_card_text(deal)
         sent = False
         for uk_id in approval_hierarchy.get_uk_approvers(deal.get("dealer_name")):
-            sent = await _send_to_user(bot, uk_id, text, keyboard=uk_approval_kb(token)) or sent
+            sent = await _send_to_user(bot, uk_id, text, keyboard=uk_approval_kb(token), track=token) or sent
         if not sent:
             chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
-            sent = bool(chat_id) and await _send_to_chat(bot, chat_id, text, keyboard=uk_approval_kb(token))
+            sent = bool(chat_id) and await _send_to_chat(bot, chat_id, text, keyboard=uk_approval_kb(token), track=token)
         return sent
     if stage == "pats_pending":
         chat_id = dealer_chats.get_pats_chat_id()
         return bool(chat_id) and await _send_to_chat(
             bot, chat_id, prefix + _pats_card_text(deal, deal.get("final_approved_by_role")),
-            keyboard=pats_done_kb(token))
+            keyboard=pats_done_kb(token), track=token)
     return False
 
 
