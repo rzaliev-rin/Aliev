@@ -469,9 +469,12 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
                                 manager_user_id=None, warnings: Optional[list] = None,
                                 autohub_ptsp=None) -> tuple:
     """Создаёт карточку согласования и постит её в чат салона (Этап 1).
-    Возвращает (заметка для ответа оценщику, токен сделки, ушла ли карточка в чат)."""
+    Статусы УК (выше предела ДДЦ, выше потолка, «Не принимать») идут сразу к УК —
+    без промежуточного согласования ДДЦ: УК получает карточку лично и в чате салона.
+    Возвращает (заметка для ответа оценщику, токен сделки, ушла ли карточка)."""
     dealer_name = vehicle_info.get("dealer_name")
     salon_chat_id = dealer_chats.get_salon_chat_id(dealer_name)
+    to_uk = result.approval_status in UK_STATUSES
 
     token = deals_store.create_deal({
         "dealer_name": dealer_name,
@@ -491,7 +494,7 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
         "metrics": _metrics(result),
         "warnings": list(warnings or []),
         "autohub_ptsp": autohub_ptsp,
-        "stage": "salon_pending",
+        "stage": "uk_pending" if to_uk else "salon_pending",
     })
 
     if not salon_chat_id:
@@ -506,6 +509,15 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
                                 appraiser_sale_cost=appraiser_sale_cost,
                                 presale_preparation_cost=presale_preparation_cost,
                                 metrics=_metrics(result), warnings=warnings, autohub_ptsp=autohub_ptsp)
+    if to_uk:
+        sent_any, posted_in_chat = await _send_to_uk(bot, token, dealer_name, "⏳ Ожидается согласование УК.\n\n" + text)
+        if sent_any or posted_in_chat:
+            deals_store.update_deal(token, card_sent=True)
+            where = ("лично и в чат салона" if sent_any and posted_in_chat
+                     else "лично" if sent_any else "в чат салона")
+            return (f"\n\n✅ Сделка отправлена на согласование УК ({where}).\n"
+                    "О решении бот напишет вам сюда."), token, True
+        return "\n\n⚠️ Не получилось отправить карточку УК — согласуйте по старому процессу.", token, False
     sent = await _send_to_chat(bot, salon_chat_id, text, keyboard=deal_approval_kb(token))
     if sent:
         deals_store.update_deal(token, card_sent=True)  # только такие сделки попадают в напоминания
@@ -893,7 +905,8 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
     try:
         if not data.get("_record_id"):
             data["_record_id"] = appraisals_log.add(_journal_fields(data, result, appraisal_input))
-        appraisals_log.update(data["_record_id"], token=token, outcome="salon" if sent else "not_sent",
+        outcome = ("uk" if result.approval_status in UK_STATUSES else "salon") if sent else "not_sent"
+        appraisals_log.update(data["_record_id"], token=token, outcome=outcome,
                               status=result.approval_status, negotiated_price=appraisal_input.negotiated_price)
     except Exception as e:  # noqa: BLE001
         logger.error("Не удалось обновить журнал оценок: %s", e)
@@ -1615,6 +1628,18 @@ async def _notify_appraiser(bot, token: str, deal: dict, event: str, outcome: Op
         await _send_to_user(bot, user_id, f"{event}\n{_deal_short(deal)}")
 
 
+async def _send_to_uk(bot, token: str, dealer_name: Optional[str], text: str) -> tuple:
+    """Карточка с кнопками УК: лично каждому УК салона и в чат салона.
+    Возвращает (ушло ли хоть одно личное сообщение, ушло ли в чат)."""
+    sent_any = False
+    for uk_id in approval_hierarchy.get_uk_approvers(dealer_name):
+        if await _send_to_user(bot, uk_id, text, keyboard=uk_approval_kb(token)):
+            sent_any = True
+    salon_chat_id = dealer_chats.get_salon_chat_id(dealer_name)
+    posted_in_chat = bool(salon_chat_id) and await _send_to_chat(bot, salon_chat_id, text, keyboard=uk_approval_kb(token))
+    return sent_any, posted_in_chat
+
+
 async def _advance_after_salon_approval(bot, token: str, deal: dict, role: Optional[str], approver_name: Optional[str] = None) -> str:
     """Общая логика после согласования на этапе чата салона (только для
     настоящего «Согласовано» — «с корректировкой» обрабатывается отдельно,
@@ -1622,6 +1647,9 @@ async def _advance_after_salon_approval(bot, token: str, deal: dict, role: Optio
     status = deal.get("approval_status")
     card = _deal_card_text(deal)
 
+    if status in UK_STATUSES and role == "УК":
+        # сделка со статусом УК из прежней версии (ждала ДДЦ в чате) — УК согласовал сам, сразу в ПАЦ
+        return await _advance_after_uk_approval(bot, token, deal, approver_name)
     if status in UK_STATUSES:
         approved_role = role or "ДДЦ"
         deals_store.update_deal(token, stage="uk_pending", ddc_approved_role=approved_role)
