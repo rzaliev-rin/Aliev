@@ -198,7 +198,7 @@ MaxPoster, по каждой модели снимает Яндекс Вордс
 Запуск (на сервере бота — там есть доступ к MaxPoster и Яндексу):
 
 ```bash
-python -m marketing --sheet                  # API MaxPoster + Вордстат API -> Google Таблица
+bash marketing_run.sh                        # проверка + API MaxPoster + Вордстат -> Google Таблица
 python -m marketing --stock-file stock.xml   # склад из XML-фида/выгрузки, если метод API другой
 python -m marketing --wordstat-csv ws.csv    # фразы из ручной выгрузки wordstat.yandex.ru («фраза;частота»)
 python tests/test_marketing.py               # проверка логики на синтетических данных
