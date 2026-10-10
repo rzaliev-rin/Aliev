@@ -18,3 +18,6 @@ backups/
 
 # copies of files for the user to download (already in the repo root)
 dist/
+# маркетинг: кэш Вордстата и результаты запусков
+marketing_cache/
+marketing_out/
