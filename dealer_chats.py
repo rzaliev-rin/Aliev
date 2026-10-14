@@ -27,15 +27,26 @@ def normalize_salon_name(name) -> str:
     например, с номером и без него."""
     if not name:
         return ""
-    s = str(name).strip()
+    s = str(name).strip().lower().replace("ё", "е")
+    s = re.sub(r"[–—−]", "-", s)  # все виды тире — один дефис
     while True:
         new_s = re.sub(r"^!+\s*", "", s)
-        new_s = re.sub(r"^\d+\s*[:\-–]\s*", "", new_s)
+        new_s = re.sub(r"^\d+\s*[:\-]\s*", "", new_s)
+        new_s = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", new_s)  # «… (10120)» в конце
         new_s = new_s.strip()
         if new_s == s:
             break
         s = new_s
-    return s.lower()
+    return " ".join(s.split())
+
+
+def _table_salon(name) -> Optional[str]:
+    """Салон из таблицы «ПЦП автосалона», к которому относится название (или None)."""
+    try:
+        from pricing_engine import find_salon
+        return find_salon(name)
+    except Exception:  # noqa: BLE001 — таблица недоступна: сравниваем только названия
+        return None
 
 
 def _load() -> dict:
@@ -84,6 +95,12 @@ def get_salon_chat_id(dealer_name: Optional[str]) -> Optional[int]:
     for name, chat_id in salons.items():
         if normalize_salon_name(name) == target:
             return chat_id
+    # и наконец — оба названия указывают на один салон из таблицы «ПЦП автосалона»
+    table_salon = _table_salon(dealer_name)
+    if table_salon:
+        for name, chat_id in salons.items():
+            if _table_salon(name) == table_salon:
+                return chat_id
     return None
 
 

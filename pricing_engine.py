@@ -84,17 +84,9 @@ def salon_label(salon: Optional[str]) -> str:
 
 def _normalize_salon(name) -> str:
     """«10089: !АСП Тюмень Toyota действующий» -> «асп тюмень toyota действующий»:
-    без номера и «!» в начале, без регистра и лишних пробелов."""
-    if not name:
-        return ""
-    s = str(name).strip().lower().replace("ё", "е")
-    while True:
-        new_s = re.sub(r"^!+\s*", "", s)
-        new_s = re.sub(r"^\d+\s*[:\-–]\s*", "", new_s).strip()
-        if new_s == s:
-            break
-        s = new_s
-    return " ".join(s.split())
+    без номера и «!» в начале, без «(10120)» в конце, без регистра и лишних пробелов."""
+    from dealer_chats import normalize_salon_name
+    return normalize_salon_name(name)
 
 
 def find_salon(dealer_name: Optional[str]) -> Optional[str]:

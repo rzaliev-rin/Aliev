@@ -536,11 +536,19 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
         "stage": "uk_pending" if to_uk else "salon_pending",
     })
 
-    if not salon_chat_id:
+    if not salon_chat_id and not to_uk:
+        logger.warning("[submit] салон «%s» не привязан к чату (есть: %s)", dealer_name,
+                       list(dealer_chats.list_salons()))
+        await _alert_owner(
+            bot,
+            f"⚠️ Заявка не ушла: салон «{dealer_name or '—'}» (так он называется в MaxPoster) не привязан к чату.\n"
+            f"Напишите в рабочем чате салона:\n/register_salon {dealer_name or 'Название салона'}",
+            key=f"no_chat:{dealer_name}")
         return (
             "\n\n⚠️ Салон "
             + (f"«{_salon_name_for_chat(vehicle_info)}» " if dealer_name else "")
-            + "не привязан к чату согласования — пока согласуйте по старому процессу."
+            + "не привязан к чату согласования — пока согласуйте по старому процессу. "
+              "Администратор получил уведомление."
         ), token, False
 
     text = _approval_card_text(vehicle_info, appraisal_input, result, manager_name, vin,
@@ -600,18 +608,53 @@ def _can_approve(user_id: Optional[int], approvers) -> bool:
     return _is_admin(user_id)
 
 
-async def _deny_and_request_access(message, user_id: int) -> None:
+ACCESS_GRANTED_TEXT = ("✅ Доступ к боту открыт. Пришлите ссылку на оценку из MaxPoster, VIN "
+                       "или номер сделки — или выберите действие:")
+
+
+def _full_name(user) -> str:
+    """«Валеев Роман» — имя и фамилия из профиля MAX (что есть)."""
+    parts = [getattr(user, "last_name", None), getattr(user, "first_name", None)]
+    return " ".join(str(p).strip() for p in parts if p and str(p).strip()) or getattr(user, "name", None) or ""
+
+
+async def _register_access_request(bot, user_id: int, name: str) -> bool:
+    """Заявка на доступ + сообщение администраторам с кнопками «Одобрить/Отклонить».
+    Вызывается при ЛЮБОЙ попытке пользователя без доступа (сообщение, «Старт»,
+    кнопка меню), поэтому заявка не теряется. Возвращает True, если заявка новая."""
+    is_new = access_store.request_access(user_id, name)
+    if is_new and bot is not None:
+        builder = InlineKeyboardBuilder()
+        builder.callback(text="✅ Одобрить", payload=f"approve:{user_id}:0")
+        builder.callback(text="❌ Отклонить", payload=f"deny:{user_id}:0")
+        builder.adjust(2)
+        text = f"🙋 Новая заявка на доступ к боту: {name or 'без имени'}, ID {user_id}."
+        for admin_id in {OWNER_USER_ID, *ADMIN_USER_IDS} - {None}:
+            await _send_to_user(bot, admin_id, text, keyboard=builder)
+    return is_new
+
+
+async def _deny_callback(callback, bot) -> None:
+    """Нажатие кнопки меню без доступа: регистрируем заявку (раньше не регистрировалась)."""
+    user_id = _get_user_id(callback)
+    is_new = await _register_access_request(bot, user_id, _full_name(getattr(callback, "user", None)))
+    await callback.answer(
+        text=f"У вас нет доступа к этому боту. Ваш ID: {user_id}.\n"
+             + ("Заявка на доступ отправлена администратору." if is_new
+                else "Заявка уже зарегистрирована, ожидайте одобрения."))
+
+
+async def _deny_and_request_access(message, user_id: int, bot=None) -> None:
+    name = _full_name(getattr(message, "sender", None))
+    is_new = await _register_access_request(bot, user_id, name)
     if not access_store.is_bot_enabled():
         await message.answer(text="Бот временно отключён администратором. Попробуйте позже.")
         return
-    name = getattr(message.sender, "first_name", None) or ""
-    is_new = access_store.request_access(user_id, name)
     if is_new:
         await message.answer(
             text=(
                 f"У вас нет доступа к этому боту. Ваш ID: {user_id}.\n"
-                "Заявка на доступ отправлена — сообщите администратору, "
-                "что запросили доступ, и попросите одобрить."
+                "Заявка на доступ отправлена администратору — после одобрения бот напишет вам."
             )
         )
     else:
@@ -1024,12 +1067,13 @@ async def on_update_price(callback, state: FSMContext, bot):
 
 
 @router.bot_started()
-async def on_bot_started(event: BotStarted):
+async def on_bot_started(event: BotStarted, bot=None):
     user_id = getattr(event, "user_id", None) or getattr(getattr(event, "sender", None), "user_id", None)
     if user_id is not None and not _allowed(user_id):
-        access_store.request_access(user_id, getattr(getattr(event, "user", None), "first_name", None) or "")
+        await _register_access_request(bot, user_id, _full_name(getattr(event, "user", None)))
         await event.answer(
-            text=f"У вас нет доступа к этому боту. Ваш ID: {user_id}. Заявка отправлена, сообщите администратору."
+            text=f"У вас нет доступа к этому боту. Ваш ID: {user_id}. Заявка отправлена администратору — "
+                 "после одобрения бот напишет вам."
         )
         return
     await event.answer(
@@ -1197,7 +1241,10 @@ async def on_approve_callback(callback, bot):
         return
     uid = int(callback.payload.split(":")[1])
     name = (access_store.list_pending().get(str(uid)) or {}).get("name") or uid
+    already = access_store.is_allowed(uid)
     access_store.approve(uid)
+    if not already:
+        await _send_to_user(bot, uid, ACCESS_GRANTED_TEXT, keyboard=main_menu_kb())
     await _safe_answer(callback.answer, *_pending_view(_page_arg(callback.payload, 2),
                                                        note=f"✅ Доступ для «{name}» открыт."))
 
@@ -1229,6 +1276,7 @@ async def on_approve_all(callback, bot):
     pending = list(access_store.list_pending())
     for uid in pending:
         access_store.approve(int(uid))
+        await _send_to_user(bot, int(uid), ACCESS_GRANTED_TEXT, keyboard=main_menu_kb())
     await _safe_answer(callback.answer, *_pending_view(0, note=f"✅ Доступ открыт: {len(pending)} чел."))
 
 
@@ -1536,7 +1584,10 @@ async def cmd_approve(message, command: CommandObject, bot):
         await message.answer(text="Использование: /approve <ID> (или используйте кнопки в /pending)")
         return
     uid = int(command.args.strip())
+    already = access_store.is_allowed(uid)
     access_store.approve(uid)
+    if not already:
+        await _send_to_user(bot, uid, ACCESS_GRANTED_TEXT, keyboard=main_menu_kb())
     await message.answer(text=f"Готово, доступ для {uid} открыт.")
 
 
@@ -2343,11 +2394,11 @@ def _format_my_appraisals(records: list) -> str:
     return "\n".join(lines)
 
 
-async def _check_private_access(message) -> bool:
+async def _check_private_access(message, bot=None) -> bool:
     if not _is_private_chat(message):
         return False
     if not _allowed(message.sender.user_id):
-        await _deny_and_request_access(message, message.sender.user_id)
+        await _deny_and_request_access(message, message.sender.user_id, bot)
         return False
     return True
 
@@ -2361,26 +2412,26 @@ async def _start_quick_calc(state: FSMContext, answer_fn, user_id, user_name):
 
 @router.message(Command("menu"))
 async def cmd_menu(message, bot):
-    if await _check_private_access(message):
+    if await _check_private_access(message, bot):
         await message.answer(text="Выберите действие:", keyboard=main_menu_kb())
 
 
 @router.message(Command("help"))
 async def cmd_help(message, bot):
-    if await _check_private_access(message):
+    if await _check_private_access(message, bot):
         await message.answer(text=HELP_TEXT, keyboard=main_menu_kb())
 
 
 @router.message(Command("my"))
 async def cmd_my(message, bot):
-    if await _check_private_access(message):
+    if await _check_private_access(message, bot):
         records = appraisals_log.for_user(message.sender.user_id)
         await message.answer(text=_format_my_appraisals(records), keyboard=main_menu_kb())
 
 
 @router.message(Command("calc"))
 async def cmd_calc(message, state: FSMContext, bot):
-    if await _check_private_access(message):
+    if await _check_private_access(message, bot):
         await _start_quick_calc(state, message.answer, message.sender.user_id,
                                 getattr(message.sender, "first_name", None) or str(message.sender.user_id))
 
@@ -2394,7 +2445,7 @@ async def on_help(callback, bot):
 async def on_my_appraisals(callback, bot):
     user_id = _get_user_id(callback)
     if not _allowed(user_id):
-        await callback.answer(text=f"У вас нет доступа к этому боту. Ваш ID: {user_id}.")
+        await _deny_callback(callback, bot)
         return
     await callback.answer(text=_format_my_appraisals(appraisals_log.for_user(user_id)), keyboard=main_menu_kb())
 
@@ -2403,7 +2454,7 @@ async def on_my_appraisals(callback, bot):
 async def on_quick_calc(callback, state: FSMContext, bot):
     user_id = _get_user_id(callback)
     if not _allowed(user_id):
-        await callback.answer(text=f"У вас нет доступа к этому боту. Ваш ID: {user_id}.")
+        await _deny_callback(callback, bot)
         return
     await _start_quick_calc(state, callback.answer, user_id, _get_user_name(callback) or str(user_id))
 
@@ -2427,7 +2478,7 @@ async def cmd_new(message, state: FSMContext, bot):
     if not _is_private_chat(message):
         return
     if not _allowed(message.sender.user_id):
-        await _deny_and_request_access(message, message.sender.user_id)
+        await _deny_and_request_access(message, message.sender.user_id, bot)
         return
     await _start_new_appraisal(state, message.answer)
 
@@ -2436,7 +2487,7 @@ async def cmd_new(message, state: FSMContext, bot):
 async def on_new_appraisal_callback(callback, state: FSMContext, bot):
     user_id = _get_user_id(callback)
     if not _allowed(user_id):
-        await callback.answer(text=f"У вас нет доступа к этому боту. Ваш ID: {user_id}.")
+        await _deny_callback(callback, bot)
         return
     await _start_new_appraisal(state, callback.answer)
 
@@ -2456,7 +2507,7 @@ async def on_free_text(message, state: FSMContext, bot):
         return
 
     if not _allowed(message.sender.user_id):
-        await _deny_and_request_access(message, message.sender.user_id)
+        await _deny_and_request_access(message, message.sender.user_id, bot)
         return
     await state.set_state(AppraisalStates.waiting_link)
     await on_waiting_link(message, state, bot)
