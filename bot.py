@@ -3006,7 +3006,9 @@ async def on_waiting_link(message, state: FSMContext, bot):
     if data.mileage is not None:
         auto.append(f"пробег — {_fmt(data.mileage)} км")
     if colors_bucket:
-        auto.append(f"окрасы — «{colors_bucket}» (деталей: {data.repainted_parts_count})")
+        film = (f"; в плёнке, не считались окрашенными: {data.film_parts_count}"
+                if data.film_parts_count else "")
+        auto.append(f"окрасы — «{colors_bucket}» (деталей: {data.repainted_parts_count}{film})")
     if data.presale_preparation_cost:
         auto.append(f"переподготовка — {_fmt(data.presale_preparation_cost)} ₽")
     if data.appraisal_sale_cost is not None:

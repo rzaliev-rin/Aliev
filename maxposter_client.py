@@ -69,6 +69,7 @@ class AppraisalData:
     autohub_ptsp: Optional[float] = None                # ПЦП Автохаб (справочно)
     dealer_id: Optional[int] = None                     # номер салона в MaxPoster (dealer.id)
     lead_source: Optional[str] = None                   # источник поступления (leadSource.name)
+    film_parts_count: int = 0                           # деталей в плёнке (толщина не засчитана как окрас)
 
 
 # Где искать дату оценки, если MAXPOSTER_APPRAISAL_DATE_FIELD не задан
@@ -182,28 +183,58 @@ def extract_appraisal_id(text: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def count_repainted_parts(vehicle_part_states: list) -> int:
+# Признаки защитной плёнки: под плёнкой толщина «покрытия» больше, но деталь не окрашена
+FILM_RE = re.compile(r"пл[её]нк|пл[её]ночн|оклей|оклеен|винил|полиуретан|антигравий|бронеплен|\bppf\b|\bfilm\b",
+                     re.IGNORECASE)
+# Фразы в общем резюме осмотра, означающие, что в плёнке весь кузов
+WHOLE_BODY_FILM_RE = re.compile(
+    r"(полност\w*|весь|вся|целиком|полн\w*)\s+(кузов\s+)?(в\s+)?(оклей\w*|пл[её]нк\w*)|"
+    r"(кузов|автомобиль|авто|машина)\s+(полностью\s+)?(в\s+пл[её]нк\w*|оклеен\w*)|"
+    r"полная\s+оклейк\w*", re.IGNORECASE)
+
+
+def _part_texts(part_state: dict) -> list:
+    """Все текстовые пометки осмотрщика по детали: названия и комментарии дефектов, комментарий детали."""
+    texts = [part_state.get("comment")]
+    for d in part_state.get("defects") or []:
+        if isinstance(d, dict):
+            texts += [d.get("name"), d.get("comment"), (d.get("type") or {}).get("name")
+                      if isinstance(d.get("type"), dict) else d.get("type")]
+        else:
+            texts.append(d)
+    return [str(t) for t in texts if t]
+
+
+def analyze_paint(vehicle_part_states: list, resume: Optional[str] = None) -> tuple:
     """
-    Количество окрашенных/перекрашенных деталей кузова. Приоритет — прямой
-    тег дефекта "Покрашено", который проставляет сам осмотрщик (надёжнее
-    любых догадок по цифрам). Если тега нет — запасной вариант: эвристика
-    по толщине ЛКП, причём проверяем ВЕРХНЮЮ границу диапазона
-    (layerThicknessTo), а не только нижнюю (layerThicknessFrom) — толщина
-    часто указана диапазоном (например 100–1000 мкм на одной детали), и
-    именно верхняя граница выдаёт локальный окрас.
+    (окрашенных деталей, деталей в плёнке, где повышенная толщина ЛКП не засчитана как окрас).
+
+    Приоритет — тег дефекта «Покрашено», который ставит сам осмотрщик. Без тега —
+    эвристика по толщине ЛКП (верхняя граница диапазона > REPAINT_THRESHOLD_MICRONS).
+    Эвристику НЕ применяем к деталям, отмеченным как оклеенные плёнкой (в дефектах или
+    комментариях), и ко всем деталям, если в резюме осмотра сказано, что в плёнке весь кузов:
+    плёнка сама даёт прибавку к толщине, и деталь ошибочно считалась окрашенной.
     """
-    count = 0
+    whole_body_film = bool(resume and WHOLE_BODY_FILM_RE.search(str(resume)))
+    painted = film_skipped = 0
     for part_state in vehicle_part_states or []:
         defects = part_state.get("defects") or []
-        if any(str(d.get("name", "")).strip() == "Покрашено" for d in defects):
-            count += 1
+        if any(isinstance(d, dict) and str(d.get("name", "")).strip() == "Покрашено" for d in defects):
+            painted += 1
             continue
-        thickness_from = part_state.get("layerThicknessFrom")
-        thickness_to = part_state.get("layerThicknessTo")
-        candidates = [t for t in (thickness_from, thickness_to) if t is not None]
-        if candidates and max(candidates) > REPAINT_THRESHOLD_MICRONS:
-            count += 1
-    return count
+        thickness = [t for t in (part_state.get("layerThicknessFrom"), part_state.get("layerThicknessTo"))
+                     if t is not None]
+        if not thickness or max(thickness) <= REPAINT_THRESHOLD_MICRONS:
+            continue
+        if whole_body_film or any(FILM_RE.search(t) for t in _part_texts(part_state)):
+            film_skipped += 1
+            continue
+        painted += 1
+    return painted, film_skipped
+
+
+def count_repainted_parts(vehicle_part_states: list, resume: Optional[str] = None) -> int:
+    return analyze_paint(vehicle_part_states, resume)[0]
 
 
 def sum_repair_costs(repairs: list) -> tuple:
@@ -267,6 +298,7 @@ def fetch_appraisal(query: str) -> AppraisalData:
     inspection = data.get("inspection") or {}
     repairs = inspection.get("repairs") or []
     repair_min, repair_max = sum_repair_costs(repairs)
+    paint = analyze_paint(inspection.get("vehiclePartStates"), inspection.get("resume"))
     autoteka = data.get("autotekaReportLinks") or {}
     brand_obj = data.get("brand") or {}
     model_obj = data.get("model") or {}
@@ -282,7 +314,8 @@ def fetch_appraisal(query: str) -> AppraisalData:
         avito_price=float(data.get(AVITO_PRICE_FIELD, 0) or 0),
         mileage=data.get("mileage"),
         accidents_count=int(liquidity.get("accidentsCount", 0) or 0),
-        repainted_parts_count=count_repainted_parts(inspection.get("vehiclePartStates")),
+        repainted_parts_count=paint[0],
+        film_parts_count=paint[1],
         repair_cost_min=repair_min,
         repair_cost_max=repair_max,
         autoteka_url=autoteka.get("web"),
