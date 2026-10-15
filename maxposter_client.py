@@ -67,6 +67,8 @@ class AppraisalData:
     reception_raw: Optional[str] = None                 # тип приёма как в MaxPoster
     reception_type: Optional[str] = None                # тип приёма в терминах метрики
     autohub_ptsp: Optional[float] = None                # ПЦП Автохаб (справочно)
+    dealer_id: Optional[int] = None                     # номер салона в MaxPoster (dealer.id)
+    lead_source: Optional[str] = None                   # источник поступления (leadSource.name)
 
 
 # Где искать дату оценки, если MAXPOSTER_APPRAISAL_DATE_FIELD не задан
@@ -302,6 +304,8 @@ def fetch_appraisal(query: str) -> AppraisalData:
         appraiser_name=appraiser_name,
         dealer_name=dealer_obj.get("companyName"),
         raw=data,
+        dealer_id=dealer_obj.get("id"),
+        lead_source=(data.get("leadSource") or {}).get("name"),
         **_extra_fields(data),
     )
 

@@ -48,7 +48,8 @@ from maxgram.utils.keyboard import InlineKeyboardBuilder
 
 from config import (MAX_BOT_TOKEN, ALLOWED_USER_IDS, ADMIN_USER_IDS, OWNER_USER_ID,
                     REMINDER_AFTER_MINUTES, REMINDER_HOURS, DIGEST_TIME, REPORT_WEEKDAY, REPORT_TIME,
-                    REPORT_USER_IDS, BACKUP_TIME, BACKUP_KEEP_DAYS, DUPLICATE_DAYS, AVITO_MAX_AGE_DAYS)
+                    REPORT_USER_IDS, BACKUP_TIME, BACKUP_KEEP_DAYS, DUPLICATE_DAYS, AVITO_MAX_AGE_DAYS,
+                    CHAT_ROUTES)
 from pricing_engine import (
     AppraisalInput, calc_appraisal, colors_bucket_from_count,
     get_colors_options, get_condition_options, get_extra_options, get_salon_options, RECEPTION_TYPES,
@@ -397,7 +398,32 @@ def _vehicle_info(data: dict) -> dict:
         "dealer_name": data.get("dealer_name"),
         "appraisal_id": data.get("appraisal_id"),
         "salon": data.get("salon"),
+        "dealer_id": data.get("dealer_id"),
+        "lead_source": data.get("lead_source"),
     }
+
+
+def _chat_route(dealer_name: Optional[str], vehicle: Optional[dict]) -> Optional[dict]:
+    """Особый маршрут (CHAT_ROUTES): салон + источник поступления -> отдельный чат."""
+    vehicle = vehicle or {}
+    source = (vehicle.get("lead_source") or "").strip().lower()
+    if not source:
+        return None
+    dealer_id = vehicle.get("dealer_id") or _salon_dealer_id(vehicle.get("salon") or find_salon(dealer_name))
+    for route in CHAT_ROUTES:
+        if str(route["dealer"]) == str(dealer_id) and route["lead_source"].strip().lower() == source:
+            return route
+    return None
+
+
+def _salon_chat_for(dealer_name: Optional[str], vehicle: Optional[dict] = None) -> Optional[int]:
+    """Чат, куда идут карточки сделки: особый маршрут или чат салона."""
+    route = _chat_route(dealer_name, vehicle)
+    return route["chat_id"] if route else dealer_chats.get_salon_chat_id(dealer_name)
+
+
+def _deal_chat(deal: dict) -> Optional[int]:
+    return _salon_chat_for(deal.get("dealer_name"), deal.get("vehicle"))
 
 
 def deal_approval_kb(token: str):
@@ -521,7 +547,7 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
     без промежуточного согласования ДДЦ: УК получает карточку лично и в чате салона.
     Возвращает (заметка для ответа оценщику, токен сделки, ушла ли карточка)."""
     dealer_name = vehicle_info.get("dealer_name")
-    salon_chat_id = dealer_chats.get_salon_chat_id(dealer_name)
+    salon_chat_id = _salon_chat_for(dealer_name, vehicle_info)
     to_uk = result.approval_status in UK_STATUSES
 
     token = deals_store.create_deal({
@@ -577,7 +603,9 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
     sent = await _send_to_chat(bot, salon_chat_id, text, keyboard=deal_approval_kb(token), track=token)
     if sent:
         deals_store.update_deal(token, card_sent=True)  # только такие сделки попадают в напоминания
-        return (f"\n\n✅ Карточка отправлена на согласование в чат салона «{_salon_name_for_chat(vehicle_info)}».\n"
+        route = _chat_route(dealer_name, vehicle_info)
+        chat_title = (route.get("title") or "особый чат салона") if route else _salon_name_for_chat(vehicle_info)
+        return (f"\n\n✅ Карточка отправлена на согласование в чат «{chat_title}».\n"
                 "О решении бот напишет вам сюда."), token, True
     return "\n\n⚠️ Не получилось отправить карточку в чат салона — согласуйте по старому процессу.", token, False
 
@@ -1584,6 +1612,9 @@ async def on_admin_salons(callback, bot):
             lines.append(f"  «{name}» → chat_id {cid}")
     else:
         lines.append("  (пока нет)")
+    for route in CHAT_ROUTES:
+        lines.append(f"  особый маршрут: салон {route['dealer']}, источник «{route['lead_source']}» → "
+                     f"{route.get('title') or ''} chat_id {route['chat_id']}")
     lines.append(f"\nЧат ПАЦ: {pats_id if pats_id else '(не задан)'}")
     await callback.answer(text="\n".join(lines))
 
@@ -1740,7 +1771,8 @@ async def _send_to_uk(bot, token: str, dealer_name: Optional[str], text: str) ->
     for uk_id in approval_hierarchy.get_uk_approvers(dealer_name):
         if await _send_to_user(bot, uk_id, text, keyboard=uk_approval_kb(token), track=token):
             sent_any = True
-    salon_chat_id = dealer_chats.get_salon_chat_id(dealer_name)
+    deal = deals_store.get_deal(token) or {}
+    salon_chat_id = _salon_chat_for(dealer_name, deal.get("vehicle"))
     posted_in_chat = bool(salon_chat_id) and await _send_to_chat(bot, salon_chat_id, text, keyboard=uk_approval_kb(token), track=token)
     return sent_any, posted_in_chat
 
@@ -1769,7 +1801,7 @@ async def _advance_after_salon_approval(bot, token: str, deal: dict, role: Optio
 
         # Дублируем ту же карточку в чат салона — УК может согласовать и там,
         # если личное сообщение почему-либо не дошло, или ему так удобнее.
-        salon_chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
+        salon_chat_id = _deal_chat(deal)
         posted_in_chat = False
         if salon_chat_id:
             posted_in_chat = await _send_to_chat(bot, salon_chat_id, uk_text, keyboard=uk_approval_kb(token), track=token)
@@ -1808,7 +1840,7 @@ async def _return_for_correction(bot, token: str, deal: dict, role: Optional[str
     """Сделка НЕ идёт в ПАЦ — возвращается в чат салона с пометкой
     «оценка с корректировкой» и предложенными цифрами. Оценщику нужно
     поправить данные в MaxPoster и заново отправить оценку боту."""
-    salon_chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
+    salon_chat_id = _deal_chat(deal)
     role_label = f" ({role})" if role else ""
     vehicle_header = _vehicle_header(deal.get("vehicle") or {}, deal.get("reception_type"))
     text = (
@@ -1851,7 +1883,7 @@ async def _handle_adjustment_input(message, token: str, deal: dict, bot):
         deals_store.update_deal(token, stage=prev_stage,
                                  awaiting_input_from=None, awaiting_field=None, stage_before_adjust=None)
         kb = uk_approval_kb(token) if prev_stage == "uk_pending" else deal_approval_kb(token)
-        salon_chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
+        salon_chat_id = _deal_chat(deal)
         reposted = bool(salon_chat_id) and await _send_to_chat(bot, salon_chat_id, _deal_card_text(deal), keyboard=kb, track=token)
         if not reposted:
             await message.answer(text=_deal_card_text(deal), keyboard=kb)
@@ -2120,7 +2152,7 @@ async def on_pats_done(callback, bot):
     pats_card = _pats_card_text(deal, deal.get("final_approved_by_role"))
     confirm_line = f"\n\n✅ ПАЦ подтвердил приёмку: {pats_confirmer}\n\nНе забудьте нажать «Согласовать» в самом Автохаб."
 
-    salon_chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
+    salon_chat_id = _deal_chat(deal)
     if salon_chat_id:
         card = _deal_card_text(deal)
         await _send_to_chat(bot, salon_chat_id, card + confirm_line)
@@ -2712,6 +2744,9 @@ async def cmd_salons(message, bot):
             lines.append(f"  «{name}» → chat_id {cid}")
     else:
         lines.append("  (пока нет)")
+    for route in CHAT_ROUTES:
+        lines.append(f"  особый маршрут: салон {route['dealer']}, источник «{route['lead_source']}» → "
+                     f"{route.get('title') or ''} chat_id {route['chat_id']}")
     lines.append(f"\nЧат ПАЦ: {pats_id if pats_id else '(не задан)'}")
     await message.answer(text="\n".join(lines))
 
@@ -2960,6 +2995,8 @@ async def on_waiting_link(message, state: FSMContext, bot):
         autohub_ptsp=data.autohub_ptsp,
         reception_type=data.reception_type if data.reception_type in RECEPTION_TYPES else None,
         _reception_raw=data.reception_raw if data.reception_type in RECEPTION_TYPES else None,
+        dealer_id=data.dealer_id,
+        lead_source=data.lead_source,
     )
 
     vehicle_line = " ".join(str(x) for x in [data.brand, data.model, data.year] if x)
@@ -2984,6 +3021,9 @@ async def on_waiting_link(message, state: FSMContext, bot):
     warnings = _appraisal_warnings(await state.get_data())
     salon_line = (f"🏢 Автосалон: {salon_label(salon)}" if salon
                   else f"🏢 Автосалон: {data.dealer_name or '—'} (нет в таблице — выберите ниже)")
+    route = _chat_route(data.dealer_name, {"lead_source": data.lead_source, "dealer_id": data.dealer_id, "salon": salon})
+    if route:
+        salon_line += f"\n📍 Источник «{data.lead_source}» — согласование в чате «{route.get('title') or route['chat_id']}»"
     note = (
         f"Нашёл оценку.\n{salon_line}\n{vehicle_line + chr(10) if vehicle_line else ''}"
         f"ВИН: {data.vin or '—'}, Оценщик: {data.appraiser_name or '—'}\n"
@@ -3190,7 +3230,7 @@ async def _remind_deal(bot, token: str, deal: dict, waited: float) -> bool:
     stage = deal.get("stage")
     prefix = f"⏰ НАПОМИНАНИЕ: сделка ждёт решения {_waiting_text(waited)}\n\n"
     if stage == "salon_pending":
-        chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
+        chat_id = _deal_chat(deal)
         return bool(chat_id) and await _send_to_chat(bot, chat_id, prefix + _deal_card_text(deal),
                                                      keyboard=deal_approval_kb(token), track=token)
     if stage == "uk_pending":
@@ -3199,7 +3239,7 @@ async def _remind_deal(bot, token: str, deal: dict, waited: float) -> bool:
         for uk_id in approval_hierarchy.get_uk_approvers(deal.get("dealer_name")):
             sent = await _send_to_user(bot, uk_id, text, keyboard=uk_approval_kb(token), track=token) or sent
         if not sent:
-            chat_id = dealer_chats.get_salon_chat_id(deal.get("dealer_name"))
+            chat_id = _deal_chat(deal)
             sent = bool(chat_id) and await _send_to_chat(bot, chat_id, text, keyboard=uk_approval_kb(token), track=token)
         return sent
     if stage == "pats_pending":

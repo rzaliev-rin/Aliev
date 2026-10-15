@@ -92,6 +92,19 @@ MAXPOSTER_RECEPTION_MAP.update({
 MAXPOSTER_RECEPTION_BRAND_MAP = {
     "toyota": {"trade_in_new": "Trade-In на ПИ"},
 }
+# Особые чаты: оценки салона с определённым источником поступления (leadSource в MaxPoster)
+# уходят не в чат салона, а в отдельный чат. Иерархия согласования — та же, что у салона.
+# dealer — номер салона (dealer.id, число в начале названия), lead_source — как в MaxPoster.
+# Дополнительно можно задать в .env: CHAT_ROUTES=10088|Сайт дилера|-78433880053010|Название чата;...
+CHAT_ROUTES = [
+    {"dealer": 10088, "lead_source": "Сайт дилера", "chat_id": -78433880053010,
+     "title": "EXPOCAR Avatr/Deepal/Tenet+ Тюмень"},
+]
+for _route in os.environ.get("CHAT_ROUTES", "").split(";"):
+    _parts = [p.strip() for p in _route.split("|")]
+    if len(_parts) >= 3 and _parts[0].isdigit() and _parts[2].lstrip("-").isdigit():
+        CHAT_ROUTES.append({"dealer": int(_parts[0]), "lead_source": _parts[1], "chat_id": int(_parts[2]),
+                            "title": _parts[3] if len(_parts) > 3 else ""})
 # ПЦП Автохаб (справочно, для «цена выкупа к ПЦП Автохаб»): путь к полю.
 # maxposterSaleCost = 1 025 600 — в интерфейсе показан округлённо как 1 026 000.
 MAXPOSTER_AUTOHUB_PTSP_FIELD = (os.environ.get("MAXPOSTER_AUTOHUB_PTSP_FIELD", "").strip() or "maxposterSaleCost")
