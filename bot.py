@@ -78,6 +78,10 @@ ACCIDENTS_AUTO_THRESHOLD = 3  # выше этого — автоматическ
 ACCIDENTS_AUTO_OPTION = "Более 3х ДТП"  # должно совпадать с пунктом «Доп.данные» в таблице
 
 
+class HistoryStates(StatesGroup):
+    waiting_dates = State()  # ввод своего периода для «Истории оценок»
+
+
 class AppraisalStates(StatesGroup):
     waiting_link = State()
     manual_vin = State()
@@ -314,14 +318,19 @@ def skip_kb(payload: str):
     return builder
 
 
-def main_menu_kb():
-    """Главное меню: показывается при входе в бота и после каждой оценки."""
+def main_menu_kb(user_id: Optional[int] = None):
+    """Главное меню: показывается при входе в бота и после каждой оценки.
+    Администраторам и УК — ещё кнопка «История оценок»."""
     builder = InlineKeyboardBuilder()
     builder.callback(text="🆕 Новая оценка", payload="new_appraisal")
     builder.callback(text="🧮 Предварительный расчёт", payload="quick_calc")
     builder.callback(text="📋 Мои оценки", payload="my_appraisals")
     builder.callback(text="❓ Помощь", payload="help")
-    builder.adjust(1, 1, 2)
+    sizes = [1, 1, 2]
+    if user_id is not None and _history_scope(user_id)[0]:
+        builder.callback(text="🗂 История оценок", payload="hist")
+        sizes.append(1)
+    builder.adjust(*sizes)
     return builder
 
 
@@ -876,6 +885,9 @@ def _journal_fields(data: dict, result, appraisal_input) -> dict:
         "ptsp_rop": result.planned_sale_price_rop,          # ПЦП по метрике
         "forecast": result.manager_resale_forecast,         # ПЦП ДЦ (прогноз цены продажи)
         "reception_type": appraisal_input.reception_type,
+        "appraisal_id": data.get("appraisal_id"),     # для ссылки на MaxPoster в «Истории оценок»
+        "mileage": data.get("mileage"),
+        "appraiser_name": data.get("appraiser_name"),
     }
 
 
@@ -1081,7 +1093,7 @@ async def on_bot_started(event: BotStarted, bot=None):
             "Привет! Я считаю выкупную цену авто в трейд-ин по метрике АСП.\n\n"
             "Пришлите ссылку на оценку из MaxPoster, VIN или номер сделки — или выберите действие:"
         ),
-        keyboard=main_menu_kb(),
+        keyboard=main_menu_kb(user_id),
     )
 
 
@@ -1299,6 +1311,7 @@ def admin_menu_kb(user_id: Optional[int] = None):
     builder.callback(text="🏢 Салоны", payload="admin_salons")
     builder.callback(text="📊 Отчёт за 7 дней", payload="admin_report")
     builder.callback(text="⏳ Оценки в очереди", payload="admin_queue")
+    builder.callback(text="🗂 История оценок", payload="hist")
     if _is_owner(user_id):
         if access_store.is_bot_enabled():
             builder.callback(text="⏸ Остановить бота", payload="bot_stop_ask")
@@ -2267,6 +2280,278 @@ def _build_report(records: list, days: int) -> str:
     return "\n".join(out)
 
 
+# =====================================================================
+# ИСТОРИЯ ОЦЕНОК ЗА ПЕРИОД (администраторы и УК)
+# =====================================================================
+
+HIST_MAX_ROWS = 150  # больше в чат не выводим — сообщений было бы слишком много
+
+
+def _history_scope(user_id: Optional[int]) -> tuple:
+    """(может ли смотреть историю, салоны УК или None = все салоны).
+    Администратор видит все салоны, УК — салоны, где он указан в «Иерархии согласования»."""
+    if user_id is None:
+        return False, None
+    if _is_admin(user_id):
+        return True, None
+    if not access_store.is_bot_enabled():
+        return False, None
+    salons = approval_hierarchy.uk_salons(user_id)
+    return (True, salons) if salons else (False, None)
+
+
+def _record_in_scope(rec: dict, uk_scope: Optional[set]) -> bool:
+    if uk_scope is None:
+        return True
+    names = {dealer_chats.normalize_salon_name(rec.get("dealer_name")), dealer_chats.normalize_salon_name(rec.get("salon"))}
+    return bool(names & uk_scope)
+
+
+def _history_salon_options(uk_scope: Optional[set]) -> list:
+    """Салоны из таблицы «ПЦП автосалона», которые пользователь может смотреть: [(индекс, ключ)]."""
+    options = list(enumerate(get_salon_options()))
+    if uk_scope is None:
+        return options
+    return [(i, s) for i, s in options if dealer_chats.normalize_salon_name(s) in uk_scope]
+
+
+def _history_salon_by_arg(arg: str) -> Optional[str]:
+    """«all» -> None (все доступные салоны), номер -> ключ салона из таблицы."""
+    if arg == "all":
+        return None
+    options = get_salon_options()
+    return options[int(arg)] if arg.isdigit() and int(arg) < len(options) else None
+
+
+def _history_period(code: str, today: Optional[datetime.date] = None) -> tuple:
+    today = today or datetime.date.today()
+    if code == "today":
+        return today, today
+    if code == "yday":
+        d = today - datetime.timedelta(days=1)
+        return d, d
+    if code == "7d":
+        return today - datetime.timedelta(days=6), today
+    if code == "month":
+        return today.replace(day=1), today
+    if code == "pmonth":
+        last = today.replace(day=1) - datetime.timedelta(days=1)
+        return last.replace(day=1), last
+    raise ValueError(code)
+
+
+def _parse_period(text: str, today: Optional[datetime.date] = None) -> tuple:
+    """«01.10.2026-15.10.2026», «01.10-15.10», «1.10.26 - 15.10.26», «05.10» (один день)."""
+    today = today or datetime.date.today()
+    found = re.findall(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", text or "")
+    if not found or len(found) > 2:
+        raise ValueError(text)
+    dates = []
+    for d, m, y in found:
+        year = int(y) + (2000 if len(y) == 2 else 0) if y else today.year
+        dates.append(datetime.date(year, int(m), int(d)))
+    start, end = dates[0], dates[-1]
+    if end < start:
+        start, end = end, start
+    return start, end
+
+
+def _history_kb_salons(uk_scope: Optional[set]):
+    builder = InlineKeyboardBuilder()
+    options = _history_salon_options(uk_scope)
+    if len(options) != 1:
+        builder.callback(text="Все салоны", payload="hist_s:all")
+    for i, salon in options:
+        builder.callback(text=_short(salon_label(salon), 28), payload=f"hist_s:{i}")
+    builder.adjust(1, *([2] * ((len(options) + 1) // 2)))
+    return builder
+
+
+def _history_kb_period(arg: str):
+    builder = InlineKeyboardBuilder()
+    for code, text in [("today", "Сегодня"), ("yday", "Вчера"), ("7d", "7 дней"),
+                       ("month", "Этот месяц"), ("pmonth", "Прошлый месяц"), ("custom", "📅 Свои даты")]:
+        builder.callback(text=text, payload=f"hist_p:{arg}:{code}")
+    builder.callback(text="⬅️ Другой салон", payload="hist")
+    builder.adjust(3, 2, 1, 1)
+    return builder
+
+
+def _history_entry(n: int, rec: dict) -> str:
+    when = (rec.get("ts") or "")[:16]
+    try:
+        when = datetime.datetime.fromisoformat(when).strftime("%d.%m %H:%M")
+    except ValueError:
+        pass
+    car = rec.get("vehicle") or "авто —"
+    if rec.get("mileage") is not None:
+        car += f", {_fmt(rec['mileage'])} км"
+    vin = f" · VIN …{str(rec['vin'])[-6:]}" if rec.get("vin") else ""
+    facts = [f"Авито {_fmt(rec.get('avito_price'))}"]
+    if rec.get("negotiated_price"):
+        facts.append(f"цена {_fmt(rec['negotiated_price'])}")
+    if rec.get("category"):
+        facts.append(str(rec["category"]).replace("Категория ", "кат. "))
+    if rec.get("reception_type"):
+        facts.append(rec["reception_type"])
+    who = rec.get("appraiser_name") or rec.get("manager")
+    if who:
+        facts.append(f"оценщик {who}")
+    outcome = rec.get("outcome") or "not_sent"
+    if outcome == "not_sent":
+        state_line = "⚪ не отправлялась на согласование"
+    else:
+        state_line = (f"📨 отправлена · {_status_text(rec.get('status'))} → "
+                      f"{appraisals_log.OUTCOME_TEXT.get(outcome, outcome)}")
+    link = _maxposter_link(rec.get("appraisal_id"))
+    lines = [f"{n}. {when} · {car}{vin}", "   " + " · ".join(facts), "   " + state_line]
+    if link:
+        lines.append(f"   {link}")
+    return "\n".join(lines)
+
+
+def _history_messages(salon: Optional[str], uk_scope: Optional[set],
+                      start: datetime.date, end: datetime.date) -> list:
+    """Сводка + список оценок; возвращает список сообщений (каждое до ~3800 символов)."""
+    border_from, border_to = start.isoformat(), (end + datetime.timedelta(days=1)).isoformat()
+    records = [r for r in appraisals_log.since((datetime.date.today() - start).days + 1)
+               if border_from <= (r.get("ts") or "") < border_to and _record_in_scope(r, uk_scope)]
+    if salon:
+        records = [r for r in records if r.get("salon") == salon or find_salon(r.get("dealer_name")) == salon]
+    records.sort(key=lambda r: r.get("ts") or "")
+
+    period = start.strftime("%d.%m.%Y") if start == end else f"{start.strftime('%d.%m')}–{end.strftime('%d.%m.%Y')}"
+    title = salon_label(salon) if salon else ("все салоны" if uk_scope is None else "ваши салоны")
+    head = [f"🗂 ИСТОРИЯ ОЦЕНОК · {title} · {period}", ""]
+    total = len(records)
+    if not total:
+        return ["\n".join(head + ["Оценок за этот период нет."])]
+    sent = [r for r in records if (r.get("outcome") or "not_sent") != "not_sent"]
+    head.append(f"Оценок всего: {total} · отправлено на согласование: {len(sent)} ({_pct(len(sent), total)}) · "
+                f"не отправлено: {total - len(sent)}")
+    by_status = {}
+    for r in sent:
+        by_status[r.get("status")] = by_status.get(r.get("status"), 0) + 1
+    if by_status:
+        head.append("Статусы: " + " · ".join(f"{_status_text(st)} {n}" for st, n in by_status.items()))
+    outcomes = {}
+    for r in sent:
+        outcomes[r.get("outcome")] = outcomes.get(r.get("outcome"), 0) + 1
+    in_work = sum(n for o, n in outcomes.items() if o in ("salon", "uk", "adjusting", "pats"))
+    head.append(f"Итог: принято ПАЦ {outcomes.get('accepted', 0)} · в работе {in_work} · "
+                f"корректировка {outcomes.get('correction', 0)} · отказ {outcomes.get('declined', 0)} · "
+                f"закрыто {outcomes.get('closed', 0)}")
+    if not salon and uk_scope is None:
+        per_salon = {}
+        for r in records:
+            name = _deal_salon_label(r)
+            per_salon[name] = per_salon.get(name, 0) + 1
+        head.append("По салонам: " + " · ".join(f"{k} {v}" for k, v in sorted(per_salon.items(), key=lambda x: -x[1])))
+
+    messages, current = [], "\n".join(head)
+    for n, rec in enumerate(records[:HIST_MAX_ROWS], 1):
+        entry = _history_entry(n, rec)
+        if len(current) + len(entry) + 2 > 3800:
+            messages.append(current)
+            current = ""
+        current += ("\n\n" if current else "") + entry
+    if total > HIST_MAX_ROWS:
+        current += f"\n\n…показаны первые {HIST_MAX_ROWS} из {total}. Выберите период короче."
+    messages.append(current)
+    return messages
+
+
+async def _send_history(bot, user_id: int, answer_fn, salon_arg: str, start, end) -> None:
+    allowed, uk_scope = _history_scope(user_id)
+    if not allowed:
+        await answer_fn(text="История оценок доступна администраторам и УК.")
+        return
+    salon = _history_salon_by_arg(salon_arg)
+    if salon and uk_scope is not None and dealer_chats.normalize_salon_name(salon) not in uk_scope:
+        await answer_fn(text="Этот салон вам недоступен.")
+        return
+    messages = _history_messages(salon, uk_scope, start, end)
+    builder = InlineKeyboardBuilder()
+    builder.callback(text="📅 Другой период", payload=f"hist_s:{salon_arg}")
+    builder.callback(text="🏢 Другой салон", payload="hist")
+    builder.adjust(2)
+    if len(messages) == 1:
+        await _safe_answer(answer_fn, messages[0], builder)
+        return
+    await _safe_answer(answer_fn, messages[0])
+    for i, text in enumerate(messages[1:], 2):
+        await _send_to_user(bot, user_id, text, keyboard=builder if i == len(messages) else None)
+
+
+@router.message(Command("history"))
+async def cmd_history(message, state: FSMContext, bot):
+    user_id = message.sender.user_id
+    allowed, uk_scope = _history_scope(user_id)
+    if not allowed:
+        await message.answer(text="История оценок доступна администраторам и УК.")
+        return
+    await state.clear()
+    await message.answer(text="🗂 История оценок. Выберите салон:", keyboard=_history_kb_salons(uk_scope))
+
+
+@router.message_callback(F.payload == "hist")
+async def on_history(callback, state: FSMContext, bot):
+    allowed, uk_scope = _history_scope(_get_user_id(callback))
+    if not allowed:
+        await _toast(callback, "История оценок доступна администраторам и УК.")
+        return
+    await state.clear()
+    await callback.answer(text="🗂 История оценок. Выберите салон:", keyboard=_history_kb_salons(uk_scope))
+
+
+@router.message_callback(F.payload.startswith("hist_s:"))
+async def on_history_salon(callback, state: FSMContext, bot):
+    if not _history_scope(_get_user_id(callback))[0]:
+        await _toast(callback, "История оценок доступна администраторам и УК.")
+        return
+    await state.clear()
+    arg = callback.payload.split(":", 1)[1]
+    salon = _history_salon_by_arg(arg)
+    title = salon_label(salon) if salon else "все салоны"
+    await callback.answer(text=f"🗂 История оценок · {title}\nЗа какой период?", keyboard=_history_kb_period(arg))
+
+
+@router.message_callback(F.payload.startswith("hist_p:"))
+async def on_history_period(callback, state: FSMContext, bot):
+    user_id = _get_user_id(callback)
+    if not _history_scope(user_id)[0]:
+        await _toast(callback, "История оценок доступна администраторам и УК.")
+        return
+    _, arg, code = callback.payload.split(":", 2)
+    if code == "custom":
+        await state.set_state(HistoryStates.waiting_dates)
+        await state.update_data(hist_salon=arg)
+        await callback.answer(text="Напишите период датами, например:\n01.10.2026-15.10.2026\n"
+                                   "или 01.10-15.10 (текущий год), или одну дату: 05.10")
+        return
+    start, end = _history_period(code)
+    await _send_history(bot, user_id, callback.answer, arg, start, end)
+
+
+@router.message(StateFilter(HistoryStates.waiting_dates))
+async def on_history_dates(message, state: FSMContext, bot):
+    if _text(message).startswith("/"):
+        await state.clear()
+        await message.answer(text="Ввод периода отменён. Повторите команду.", keyboard=main_menu_kb(message.sender.user_id))
+        return
+    try:
+        start, end = _parse_period(_text(message))
+    except ValueError:
+        await message.answer(text="Не понял даты. Пример: 01.10.2026-15.10.2026 или 01.10-15.10")
+        return
+    if (end - start).days > 366:
+        await message.answer(text="Период больше года — выберите покороче.")
+        return
+    arg = (await state.get_data()).get("hist_salon", "all")
+    await state.clear()
+    await _send_history(bot, message.sender.user_id, message.answer, arg, start, end)
+
+
 @router.message_callback(F.payload == "admin_report")
 async def on_admin_report(callback, bot):
     if not _is_admin(_get_user_id(callback)):
@@ -2413,20 +2698,20 @@ async def _start_quick_calc(state: FSMContext, answer_fn, user_id, user_name):
 @router.message(Command("menu"))
 async def cmd_menu(message, bot):
     if await _check_private_access(message, bot):
-        await message.answer(text="Выберите действие:", keyboard=main_menu_kb())
+        await message.answer(text="Выберите действие:", keyboard=main_menu_kb(message.sender.user_id))
 
 
 @router.message(Command("help"))
 async def cmd_help(message, bot):
     if await _check_private_access(message, bot):
-        await message.answer(text=HELP_TEXT, keyboard=main_menu_kb())
+        await message.answer(text=HELP_TEXT, keyboard=main_menu_kb(message.sender.user_id))
 
 
 @router.message(Command("my"))
 async def cmd_my(message, bot):
     if await _check_private_access(message, bot):
         records = appraisals_log.for_user(message.sender.user_id)
-        await message.answer(text=_format_my_appraisals(records), keyboard=main_menu_kb())
+        await message.answer(text=_format_my_appraisals(records), keyboard=main_menu_kb(message.sender.user_id))
 
 
 @router.message(Command("calc"))
@@ -2438,7 +2723,7 @@ async def cmd_calc(message, state: FSMContext, bot):
 
 @router.message_callback(F.payload == "help")
 async def on_help(callback, bot):
-    await callback.answer(text=HELP_TEXT, keyboard=main_menu_kb())
+    await callback.answer(text=HELP_TEXT, keyboard=main_menu_kb(_get_user_id(callback)))
 
 
 @router.message_callback(F.payload == "my_appraisals")
@@ -2447,7 +2732,7 @@ async def on_my_appraisals(callback, bot):
     if not _allowed(user_id):
         await _deny_callback(callback, bot)
         return
-    await callback.answer(text=_format_my_appraisals(appraisals_log.for_user(user_id)), keyboard=main_menu_kb())
+    await callback.answer(text=_format_my_appraisals(appraisals_log.for_user(user_id)), keyboard=main_menu_kb(user_id))
 
 
 @router.message_callback(F.payload == "quick_calc")
