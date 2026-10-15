@@ -2092,6 +2092,45 @@ async def on_pats_req_cat(callback, bot):
     await _send_pats_request(callback, bot, "cat")
 
 
+PATS_FIX_BUTTONS = {"diag": "✅ Диагностику загрузил", "cat": "✅ Категорию исправил"}
+PATS_FIX_TEXT = {"diag": "диагностика загружена в Заказ-наряды", "cat": "категория в Автохаб исправлена"}
+
+
+@router.message_callback(F.payload.startswith("pats_fixed:"))
+async def on_pats_fixed(callback, bot):
+    """Оценщик отмечает, что выполнил запрос ПАЦ — ПАЦ получает уведомление с кнопками карточки."""
+    _, kind, token = callback.payload.split(":", 2)
+    deal = deals_store.get_deal(token)
+    if not deal or deal.get("stage") != "pats_pending":
+        await callback.answer(text="Заявка уже закрыта ПАЦ — отмечать ничего не нужно.")
+        return
+    user_id = _get_user_id(callback)
+    if user_id != deal.get("manager_user_id") and not _is_admin(user_id):
+        await _toast(callback, "Отметить исправление может только оценщик по этой сделке.")
+        return
+    requests_state = dict(deal.get("pats_requests") or {})
+    requests_state[kind] = "fixed"
+    deals_store.update_deal(token, pats_requests=requests_state)
+
+    vehicle = deal.get("vehicle") or {}
+    vehicle_line = " ".join(str(x) for x in [vehicle.get("brand"), vehicle.get("model"), vehicle.get("year")] if x)
+    who = _full_name(getattr(callback, "user", None)) or vehicle.get("appraiser_name") or deal.get("manager_name") or "оценщик"
+    link = _maxposter_link(vehicle.get("appraisal_id"))
+    text = (f"✅ {who}: {PATS_FIX_TEXT.get(kind, 'замечание исправлено')}.\n"
+            f"{_deal_salon_label(deal)} · {vehicle_line or '—'} · VIN {deal.get('vin') or '—'}"
+            + (f"\n{link}" if link else "")
+            + "\n\nПроверьте и нажмите «Готово», если всё в порядке.")
+    pats_chat_id = dealer_chats.get_pats_chat_id()
+    sent = bool(pats_chat_id) and await _send_to_chat(bot, pats_chat_id, text, keyboard=pats_done_kb(token), track=token)
+    try:
+        appraisals_log.update_by_token(token, last_event=f"Оценщик: {PATS_FIX_TEXT.get(kind)}")
+    except Exception as e:  # noqa: BLE001
+        logger.error("Не удалось обновить журнал по сделке %s: %s", token, e)
+    await callback.answer(text=f"✅ Отмечено: {PATS_FIX_TEXT.get(kind)}.\n"
+                               + ("ПАЦ получил уведомление." if sent
+                                  else "⚠️ Не удалось уведомить ПАЦ — напишите в чат ПАЦ вручную."))
+
+
 async def _send_pats_request(callback, bot, kind: str) -> None:
     """Общая логика для кнопок «Запросить диагностику» / «Запросить
     исправление категории» в карточке ПАЦ. Не трогает саму карточку и её
@@ -2124,7 +2163,15 @@ async def _send_pats_request(callback, bot, kind: str) -> None:
         )
 
     manager_user_id = deal.get("manager_user_id")
-    sent_dm = await _send_to_user(bot, manager_user_id, request_text) if manager_user_id else False
+    fixed_kb = InlineKeyboardBuilder()
+    fixed_kb.callback(text=PATS_FIX_BUTTONS[kind], payload=f"pats_fixed:{kind}:{token}")
+    sent_dm = (await _send_to_user(bot, manager_user_id,
+                                   request_text + "\n\nКогда исправите — нажмите кнопку ниже, ПАЦ получит уведомление.",
+                                   keyboard=fixed_kb)
+               if manager_user_id else False)
+    requests_state = dict(deal.get("pats_requests") or {})
+    requests_state[kind] = "open"
+    deals_store.update_deal(token, pats_requests=requests_state)
 
     pats_chat_id = dealer_chats.get_pats_chat_id()
     pats_note = request_text + ("\n\n(отправлено оценщику лично)" if sent_dm else "\n\n⚠️ Не удалось отправить оценщику лично — сообщите вручную.")
