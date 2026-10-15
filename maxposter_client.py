@@ -304,3 +304,105 @@ def fetch_appraisal(query: str) -> AppraisalData:
         raw=data,
         **_extra_fields(data),
     )
+
+
+# =====================================================================
+# СПИСОК ОЦЕНОК ЗА ПЕРИОД (для «Истории оценок» — включая сделанные не через бота)
+# =====================================================================
+
+LIST_PAGE_SIZE = 100
+LIST_MAX_PAGES = 30           # не больше 3000 оценок на запрос
+# Как фильтровать по салону, точный формат API не задокументирован: пробуем варианты
+# по очереди, рабочий запоминаем. Салон всё равно дополнительно проверяем у себя.
+DEALER_FILTER_FIELDS = ["dealer.id", "dealer", "dealerId"]
+_dealer_filter_field: Optional[str] = None
+
+
+def _post_appraisals(body: dict) -> list:
+    resp = requests.post(
+        f"{MAXPOSTER_API_BASE}/partners-api/appraisals",
+        headers={"Authorization": f"Basic {MAXPOSTER_API_KEY}", "Content-Type": "application/json"},
+        json=body, timeout=30,
+    )
+    if resp.status_code != 200:
+        raise MaxPosterError(f"MaxPoster API вернул {resp.status_code}: {resp.text[:200]}")
+    return (resp.json().get("data") or {}).get("appraisals") or []
+
+
+def _appraisal_date(item: dict) -> Optional[datetime.datetime]:
+    for path in ("createdAt", "createdDate", "inspection.finishedAt"):
+        dt = parse_date(get_path(item, path))
+        if dt:
+            return dt
+    return None
+
+
+def _brief(item: dict, created: datetime.datetime) -> dict:
+    """Короткая выжимка оценки для списка."""
+    appraiser = item.get("appraiser") or {}
+    dealer = item.get("dealer") or {}
+    reception_raw = get_path(item, MAXPOSTER_RECEPTION_FIELD) if MAXPOSTER_RECEPTION_FIELD else None
+    autohub = get_path(item, MAXPOSTER_AUTOHUB_PTSP_FIELD) if MAXPOSTER_AUTOHUB_PTSP_FIELD else None
+    return {
+        "appraisal_id": str(item.get("id")),
+        "created": created,
+        "vin": item.get("vin"),
+        "brand": (item.get("brand") or {}).get("name"),
+        "model": (item.get("model") or {}).get("name"),
+        "year": item.get("year"),
+        "mileage": item.get("mileage"),
+        "avito_price": item.get(AVITO_PRICE_FIELD),
+        "purchase_cost": item.get("appraisalPurchaseCost"),
+        "autohub_ptsp": autohub,
+        "dealer_id": dealer.get("id"),
+        "dealer_name": dealer.get("companyName"),
+        "appraiser_name": " ".join(p for p in [appraiser.get("lastName"), appraiser.get("firstName")] if p) or None,
+        "reception_raw": reception_raw if isinstance(reception_raw, str) else None,
+        "mp_status": (item.get("status") or {}).get("name"),
+    }
+
+
+def list_appraisals(dealer_id: Optional[int], start: datetime.date, end: datetime.date) -> list:
+    """Все оценки салона (dealer_id; None — всех салонов) с датой создания в [start, end].
+    Листаем от новых к старым и останавливаемся, когда пошли оценки раньше start."""
+    global _dealer_filter_field
+    if not MAXPOSTER_API_KEY:
+        raise MaxPosterError("Не задан MAXPOSTER_API_KEY — интеграция с MaxPoster не настроена.")
+
+    fields = [None]
+    if dealer_id is not None:
+        fields = ([_dealer_filter_field] if _dealer_filter_field else []) + \
+                 [f for f in DEALER_FILTER_FIELDS if f != _dealer_filter_field] + [None]
+
+    for field_name in fields:
+        filters = [{"fields": field_name, "type": "equal", "value": [str(dealer_id)]}] if field_name else []
+        result, offset = [], 0
+        try:
+            for _ in range(LIST_MAX_PAGES):
+                page = _post_appraisals({"limit": LIST_PAGE_SIZE, "offset": offset,
+                                         "filters": filters, "orders": ["-id"]})
+                reached_start = False
+                for item in page:
+                    if dealer_id is not None and str((item.get("dealer") or {}).get("id")) != str(dealer_id):
+                        continue
+                    created = _appraisal_date(item)
+                    if not created:
+                        continue
+                    if created.date() < start:
+                        reached_start = True
+                        continue
+                    if created.date() <= end:
+                        result.append(_brief(item, created))
+                if reached_start or len(page) < LIST_PAGE_SIZE:
+                    break
+                offset += LIST_PAGE_SIZE
+        except MaxPosterError:
+            if field_name is None:
+                raise
+            continue  # такой фильтр API не принимает — пробуем следующий
+        if field_name and not result:
+            continue  # пусто — возможно, фильтр понят не так; перепроверяем следующим способом
+        if field_name:
+            _dealer_filter_field = field_name
+        return result
+    return []

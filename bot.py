@@ -56,7 +56,7 @@ from pricing_engine import (
     STATUS_OK, STATUS_DDC, STATUS_UK, STATUS_UK_CEILING, STATUS_COMMISSION, COMMISSION,
     EXTRA_YOUNG_CAR, EXTRA_NOT_APPLICABLE, METRIC_VERSION,
 )
-from maxposter_client import fetch_appraisal, MaxPosterError, map_reception
+from maxposter_client import fetch_appraisal, MaxPosterError, map_reception, list_appraisals
 from sheets_logger import log_appraisal
 import access_store
 import appraisals_log
@@ -2377,80 +2377,177 @@ def _history_kb_period(arg: str):
     return builder
 
 
-def _history_entry(n: int, rec: dict) -> str:
-    when = (rec.get("ts") or "")[:16]
+def _history_entry(n: int, row: dict) -> str:
+    when = (row.get("ts") or "")[:16]
     try:
         when = datetime.datetime.fromisoformat(when).strftime("%d.%m %H:%M")
     except ValueError:
         pass
-    car = rec.get("vehicle") or "авто —"
-    if rec.get("mileage") is not None:
-        car += f", {_fmt(rec['mileage'])} км"
-    vin = f" · VIN …{str(rec['vin'])[-6:]}" if rec.get("vin") else ""
-    facts = [f"Авито {_fmt(rec.get('avito_price'))}"]
-    if rec.get("negotiated_price"):
-        facts.append(f"цена {_fmt(rec['negotiated_price'])}")
-    if rec.get("category"):
-        facts.append(str(rec["category"]).replace("Категория ", "кат. "))
-    if rec.get("reception_type"):
-        facts.append(rec["reception_type"])
-    who = rec.get("appraiser_name") or rec.get("manager")
-    if who:
-        facts.append(f"оценщик {who}")
-    outcome = rec.get("outcome") or "not_sent"
-    if outcome == "not_sent":
-        state_line = "⚪ не отправлялась на согласование"
+    car = row.get("vehicle") or "авто —"
+    if row.get("mileage") is not None:
+        car += f", {_fmt(row['mileage'])} км"
+    vin = f" · VIN …{str(row['vin'])[-6:]}" if row.get("vin") else ""
+    facts = []
+    if row.get("salon_label"):
+        facts.append(row["salon_label"])
+    if row.get("avito_price"):
+        facts.append(f"Авито {_fmt(row['avito_price'])}")
+    if row.get("negotiated_price"):
+        facts.append(f"цена {_fmt(row['negotiated_price'])}")
+    if row.get("category"):
+        facts.append(str(row["category"]).replace("Категория ", "кат. "))
+    if row.get("reception_type"):
+        facts.append(row["reception_type"])
+    if row.get("appraiser"):
+        facts.append(f"оценщик {row['appraiser']}")
+    outcome = row.get("outcome")
+    if outcome is None:
+        state_line = "⚪ через бота не оценивалась — на согласование не отправлялась"
+    elif outcome == "not_sent":
+        state_line = "⚪ посчитана в боте, на согласование не отправлялась"
     else:
-        state_line = (f"📨 отправлена · {_status_text(rec.get('status'))} → "
+        state_line = (f"📨 отправлена · {_status_text(row.get('status'))} → "
                       f"{appraisals_log.OUTCOME_TEXT.get(outcome, outcome)}")
-    link = _maxposter_link(rec.get("appraisal_id"))
-    lines = [f"{n}. {when} · {car}{vin}", "   " + " · ".join(facts), "   " + state_line]
+    lines = [f"{n}. {when} · {car}{vin}"]
+    if facts:
+        lines.append("   " + " · ".join(facts))
+    lines.append("   " + state_line)
+    if row.get("mp_status"):
+        lines.append(f"   MaxPoster: {row['mp_status']}")
+    link = _maxposter_link(row.get("appraisal_id"))
     if link:
         lines.append(f"   {link}")
     return "\n".join(lines)
 
 
-def _history_messages(salon: Optional[str], uk_scope: Optional[set],
-                      start: datetime.date, end: datetime.date) -> list:
-    """Сводка + список оценок; возвращает список сообщений (каждое до ~3800 символов)."""
+def _salon_dealer_id(salon: Optional[str]) -> Optional[int]:
+    """«10120: АСП Toyota - Екатеринбург» -> 10120 (номер салона = dealer.id в MaxPoster)."""
+    m = re.match(r"\s*(\d+)\s*:", salon or "")
+    return int(m.group(1)) if m else None
+
+
+def _row_from_journal(rec: dict) -> dict:
+    return {
+        "ts": rec.get("ts"), "vehicle": rec.get("vehicle"), "mileage": rec.get("mileage"), "vin": rec.get("vin"),
+        "avito_price": rec.get("avito_price"), "negotiated_price": rec.get("negotiated_price"),
+        "category": rec.get("category"), "reception_type": rec.get("reception_type"),
+        "appraiser": rec.get("appraiser_name") or rec.get("manager"),
+        "outcome": rec.get("outcome") or "not_sent", "status": rec.get("status"),
+        "appraisal_id": rec.get("appraisal_id"), "salon": rec.get("salon"), "dealer_name": rec.get("dealer_name"),
+    }
+
+
+def _row_from_maxposter(item: dict, rec: Optional[dict]) -> dict:
+    salon = find_salon(item.get("dealer_name"))
+    row = _row_from_journal(rec) if rec else {"outcome": None}
+    vehicle = " ".join(str(x) for x in [item.get("brand"), item.get("model"), item.get("year")] if x)
+    row.update({
+        "ts": item["created"].isoformat(timespec="seconds"),
+        "vehicle": vehicle or row.get("vehicle"),
+        "mileage": item.get("mileage") if item.get("mileage") is not None else row.get("mileage"),
+        "vin": item.get("vin") or row.get("vin"),
+        "avito_price": row.get("avito_price") or item.get("avito_price"),
+        "negotiated_price": row.get("negotiated_price") or item.get("purchase_cost"),
+        "reception_type": row.get("reception_type") or map_reception(
+            item.get("reception_raw"), salon_info(salon).get("brand") if salon else None),
+        "appraiser": item.get("appraiser_name") or row.get("appraiser"),
+        "appraisal_id": item.get("appraisal_id"),
+        "salon": salon or row.get("salon"), "dealer_name": item.get("dealer_name") or row.get("dealer_name"),
+        "mp_status": item.get("mp_status"),
+    })
+    return row
+
+
+async def _history_rows(salon: Optional[str], uk_scope: Optional[set],
+                        start: datetime.date, end: datetime.date) -> tuple:
+    """Оценки за период: все из MaxPoster + отметки бота (отправлялась ли, статус, итог).
+    Возвращает (строки, пометка о проблеме с MaxPoster или "")."""
     border_from, border_to = start.isoformat(), (end + datetime.timedelta(days=1)).isoformat()
-    records = [r for r in appraisals_log.since((datetime.date.today() - start).days + 1)
+    journal = [r for r in appraisals_log.since((datetime.date.today() - start).days + 1)
                if border_from <= (r.get("ts") or "") < border_to and _record_in_scope(r, uk_scope)]
     if salon:
-        records = [r for r in records if r.get("salon") == salon or find_salon(r.get("dealer_name")) == salon]
-    records.sort(key=lambda r: r.get("ts") or "")
+        journal = [r for r in journal if r.get("salon") == salon or find_salon(r.get("dealer_name")) == salon]
 
+    if salon:
+        targets = [salon]
+    elif uk_scope is not None:
+        targets = [s for _, s in _history_salon_options(uk_scope)]
+    else:
+        targets = [None]  # администратор, все салоны — одним запросом
+    items, note = [], ""
+    try:
+        for target in targets:
+            dealer_id = _salon_dealer_id(target)
+            got = await asyncio.to_thread(list_appraisals, dealer_id, start, end)
+            if target and dealer_id is None:
+                got = [i for i in got if find_salon(i.get("dealer_name")) == target]
+            items += got
+    except Exception as e:  # noqa: BLE001 — MaxPoster недоступен: показываем хотя бы журнал бота
+        logger.warning("[history] MaxPoster: %s", e)
+        items, note = [], "⚠️ MaxPoster сейчас недоступен — показаны только оценки, сделанные через бота."
+    if uk_scope is not None:
+        items = [i for i in items if dealer_chats.normalize_salon_name(i.get("dealer_name")) in uk_scope
+                 or dealer_chats.normalize_salon_name(find_salon(i.get("dealer_name"))) in uk_scope]
+
+    # последняя запись журнала по номеру оценки и по VIN
+    by_id, by_vin = {}, {}
+    for r in sorted(journal, key=lambda r: r.get("ts") or ""):
+        if r.get("appraisal_id"):
+            by_id[str(r["appraisal_id"])] = r
+        if r.get("vin"):
+            by_vin[str(r["vin"]).upper()] = r
+    used, rows = set(), []
+    for item in items:
+        rec = by_id.get(item["appraisal_id"])
+        if rec is None and item.get("vin"):
+            cand = by_vin.get(str(item["vin"]).upper())
+            if cand and not cand.get("appraisal_id"):  # старые записи без номера оценки
+                rec = cand
+        if rec is not None:
+            used.add(rec.get("id"))
+        rows.append(_row_from_maxposter(item, rec))
+    rows += [_row_from_journal(r) for r in journal if r.get("id") not in used]
+    rows.sort(key=lambda r: r.get("ts") or "")
+    return rows, note
+
+
+def _history_messages(rows: list, note: str, salon: Optional[str], uk_scope: Optional[set],
+                      start: datetime.date, end: datetime.date) -> list:
+    """Сводка + список оценок; список сообщений (каждое до ~3800 символов)."""
     period = start.strftime("%d.%m.%Y") if start == end else f"{start.strftime('%d.%m')}–{end.strftime('%d.%m.%Y')}"
     title = salon_label(salon) if salon else ("все салоны" if uk_scope is None else "ваши салоны")
-    head = [f"🗂 ИСТОРИЯ ОЦЕНОК · {title} · {period}", ""]
-    total = len(records)
+    head = [f"🗂 ИСТОРИЯ ОЦЕНОК · {title} · {period}", ""] + ([note, ""] if note else [])
+    total = len(rows)
     if not total:
         return ["\n".join(head + ["Оценок за этот период нет."])]
-    sent = [r for r in records if (r.get("outcome") or "not_sent") != "not_sent"]
+    sent = [r for r in rows if r.get("outcome") not in (None, "not_sent")]
+    bot_only = sum(1 for r in rows if r.get("outcome") == "not_sent")
     head.append(f"Оценок всего: {total} · отправлено на согласование: {len(sent)} ({_pct(len(sent), total)}) · "
                 f"не отправлено: {total - len(sent)}")
-    by_status = {}
+    head.append(f"   из них посчитаны в боте без отправки: {bot_only} · через бота не оценивались: "
+                f"{sum(1 for r in rows if r.get('outcome') is None)}")
+    by_status, outcomes = {}, {}
     for r in sent:
         by_status[r.get("status")] = by_status.get(r.get("status"), 0) + 1
+        outcomes[r.get("outcome")] = outcomes.get(r.get("outcome"), 0) + 1
     if by_status:
         head.append("Статусы: " + " · ".join(f"{_status_text(st)} {n}" for st, n in by_status.items()))
-    outcomes = {}
-    for r in sent:
-        outcomes[r.get("outcome")] = outcomes.get(r.get("outcome"), 0) + 1
-    in_work = sum(n for o, n in outcomes.items() if o in ("salon", "uk", "adjusting", "pats"))
-    head.append(f"Итог: принято ПАЦ {outcomes.get('accepted', 0)} · в работе {in_work} · "
-                f"корректировка {outcomes.get('correction', 0)} · отказ {outcomes.get('declined', 0)} · "
-                f"закрыто {outcomes.get('closed', 0)}")
-    if not salon and uk_scope is None:
+        in_work = sum(n for o, n in outcomes.items() if o in ("salon", "uk", "adjusting", "pats"))
+        head.append(f"Итог: принято ПАЦ {outcomes.get('accepted', 0)} · в работе {in_work} · "
+                    f"корректировка {outcomes.get('correction', 0)} · отказ {outcomes.get('declined', 0)} · "
+                    f"закрыто {outcomes.get('closed', 0)}")
+    multi_salon = not salon
+    if multi_salon:
         per_salon = {}
-        for r in records:
+        for r in rows:
             name = _deal_salon_label(r)
+            r["salon_label"] = name
             per_salon[name] = per_salon.get(name, 0) + 1
         head.append("По салонам: " + " · ".join(f"{k} {v}" for k, v in sorted(per_salon.items(), key=lambda x: -x[1])))
 
     messages, current = [], "\n".join(head)
-    for n, rec in enumerate(records[:HIST_MAX_ROWS], 1):
-        entry = _history_entry(n, rec)
+    for n, row in enumerate(rows[:HIST_MAX_ROWS], 1):
+        entry = _history_entry(n, row)
         if len(current) + len(entry) + 2 > 3800:
             messages.append(current)
             current = ""
@@ -2470,7 +2567,8 @@ async def _send_history(bot, user_id: int, answer_fn, salon_arg: str, start, end
     if salon and uk_scope is not None and dealer_chats.normalize_salon_name(salon) not in uk_scope:
         await answer_fn(text="Этот салон вам недоступен.")
         return
-    messages = _history_messages(salon, uk_scope, start, end)
+    rows, note = await _history_rows(salon, uk_scope, start, end)
+    messages = _history_messages(rows, note, salon, uk_scope, start, end)
     builder = InlineKeyboardBuilder()
     builder.callback(text="📅 Другой период", payload=f"hist_s:{salon_arg}")
     builder.callback(text="🏢 Другой салон", payload="hist")
