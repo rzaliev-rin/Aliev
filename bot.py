@@ -320,7 +320,7 @@ def skip_kb(payload: str):
 
 def main_menu_kb(user_id: Optional[int] = None):
     """Главное меню: показывается при входе в бота и после каждой оценки.
-    Администраторам и УК — ещё кнопка «История оценок»."""
+    Администраторам, УК, ДДЦ и РОП — ещё кнопка «История оценок»."""
     builder = InlineKeyboardBuilder()
     builder.callback(text="🆕 Новая оценка", payload="new_appraisal")
     builder.callback(text="🧮 Предварительный расчёт", payload="quick_calc")
@@ -2289,14 +2289,14 @@ HIST_MAX_ROWS = 150  # больше в чат не выводим — сообщ
 
 def _history_scope(user_id: Optional[int]) -> tuple:
     """(может ли смотреть историю, салоны УК или None = все салоны).
-    Администратор видит все салоны, УК — салоны, где он указан в «Иерархии согласования»."""
+    Администратор видит все салоны; РОП, ДДЦ и УК — салоны, где они указаны в «Иерархии согласования»."""
     if user_id is None:
         return False, None
     if _is_admin(user_id):
         return True, None
     if not access_store.is_bot_enabled():
         return False, None
-    salons = approval_hierarchy.uk_salons(user_id)
+    salons = approval_hierarchy.manager_salons(user_id)
     return (True, salons) if salons else (False, None)
 
 
@@ -2561,7 +2561,7 @@ def _history_messages(rows: list, note: str, salon: Optional[str], uk_scope: Opt
 async def _send_history(bot, user_id: int, answer_fn, salon_arg: str, start, end) -> None:
     allowed, uk_scope = _history_scope(user_id)
     if not allowed:
-        await answer_fn(text="История оценок доступна администраторам и УК.")
+        await answer_fn(text="История оценок доступна администраторам, УК, ДДЦ и РОП.")
         return
     salon = _history_salon_by_arg(salon_arg)
     if salon and uk_scope is not None and dealer_chats.normalize_salon_name(salon) not in uk_scope:
@@ -2586,7 +2586,7 @@ async def cmd_history(message, state: FSMContext, bot):
     user_id = message.sender.user_id
     allowed, uk_scope = _history_scope(user_id)
     if not allowed:
-        await message.answer(text="История оценок доступна администраторам и УК.")
+        await message.answer(text="История оценок доступна администраторам, УК, ДДЦ и РОП.")
         return
     await state.clear()
     await message.answer(text="🗂 История оценок. Выберите салон:", keyboard=_history_kb_salons(uk_scope))
@@ -2596,7 +2596,7 @@ async def cmd_history(message, state: FSMContext, bot):
 async def on_history(callback, state: FSMContext, bot):
     allowed, uk_scope = _history_scope(_get_user_id(callback))
     if not allowed:
-        await _toast(callback, "История оценок доступна администраторам и УК.")
+        await _toast(callback, "История оценок доступна администраторам, УК, ДДЦ и РОП.")
         return
     await state.clear()
     await callback.answer(text="🗂 История оценок. Выберите салон:", keyboard=_history_kb_salons(uk_scope))
@@ -2605,7 +2605,7 @@ async def on_history(callback, state: FSMContext, bot):
 @router.message_callback(F.payload.startswith("hist_s:"))
 async def on_history_salon(callback, state: FSMContext, bot):
     if not _history_scope(_get_user_id(callback))[0]:
-        await _toast(callback, "История оценок доступна администраторам и УК.")
+        await _toast(callback, "История оценок доступна администраторам, УК, ДДЦ и РОП.")
         return
     await state.clear()
     arg = callback.payload.split(":", 1)[1]
@@ -2618,7 +2618,7 @@ async def on_history_salon(callback, state: FSMContext, bot):
 async def on_history_period(callback, state: FSMContext, bot):
     user_id = _get_user_id(callback)
     if not _history_scope(user_id)[0]:
-        await _toast(callback, "История оценок доступна администраторам и УК.")
+        await _toast(callback, "История оценок доступна администраторам, УК, ДДЦ и РОП.")
         return
     _, arg, code = callback.payload.split(":", 2)
     if code == "custom":

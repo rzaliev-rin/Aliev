@@ -143,8 +143,8 @@ def get_uk_approvers(dealer_name: Optional[str]) -> set:
     return set()
 
 
-def uk_salons(user_id: Optional[int]) -> set:
-    """Нормализованные названия салонов, где пользователь указан как УК."""
+def manager_salons(user_id: Optional[int]) -> set:
+    """Нормализованные названия салонов, где пользователь указан как РОП, ДДЦ или УК."""
     if user_id is None:
         return set()
     try:
@@ -152,7 +152,8 @@ def uk_salons(user_id: Optional[int]) -> set:
     except Exception:  # noqa: BLE001
         return set()
     return {normalize_salon_name(row.get("Салон", "")) for row in rows
-            if user_id in _ids_from_cell(row.get("УК ID")) and row.get("Салон")}
+            if row.get("Салон") and any(user_id in _ids_from_cell(row.get(col))
+                                        for col in ("РОП ID", "ДДЦ ID", "УК ID"))}
 
 
 def get_role_ids(dealer_name: Optional[str], role: str) -> set:
