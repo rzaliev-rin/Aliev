@@ -1717,6 +1717,7 @@ def _pats_card_text(deal: dict, approved_role_label: str = "") -> str:
     return (
         "📋 НА ПОДТВЕРЖДЕНИЕ В АВТОХАБ (ПАЦ)\n"
         f"🏢 Автосалон: {_deal_salon_label(deal)}\n"
+        f"Тип контракта: {deal.get('reception_type') or '—'}\n"
         f"VIN: {deal.get('vin') or '—'}\n"
         + link_line +
         f"Оценщик: {(deal.get('vehicle') or {}).get('appraiser_name') or deal.get('manager_name') or '—'}\n"
