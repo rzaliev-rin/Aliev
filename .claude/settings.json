@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "felo-ai": {
+      "source": {
+        "source": "github",
+        "repo": "Felo-Inc/felo-skills"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "felo-slides@felo-ai": true
+  }
+}
