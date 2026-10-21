@@ -32,6 +32,7 @@ import json
 import re
 import datetime
 import logging
+import sys
 import time
 from typing import Optional
 from types import SimpleNamespace
@@ -331,6 +332,9 @@ def main_menu_kb(user_id: Optional[int] = None):
     sizes = [1, 1, 2]
     if user_id is not None and _history_scope(user_id)[0]:
         builder.callback(text="🗂 История оценок", payload="hist")
+        sizes.append(1)
+    if user_id is not None and _is_admin(user_id):
+        builder.callback(text="⚙️ Админ-панель", payload="admin_menu")
         sizes.append(1)
     builder.adjust(*sizes)
     return builder
@@ -1371,12 +1375,19 @@ def admin_menu_kb(user_id: Optional[int] = None):
     builder.callback(text="📊 Отчёт за 7 дней", payload="admin_report")
     builder.callback(text="⏳ Оценки в очереди", payload="admin_queue")
     builder.callback(text="🗂 История оценок", payload="hist")
+    builder.callback(text="📖 Все команды", payload="admin_cmds")
+    sizes = [2, 2, 2, 1]
     if _is_owner(user_id):
+        builder.callback(text="📥 Данные продаж (180 дн.)", payload="collect_sales")
+        builder.callback(text="💾 Резервная копия", payload="backup_now")
         if access_store.is_bot_enabled():
             builder.callback(text="⏸ Остановить бота", payload="bot_stop_ask")
         else:
             builder.callback(text="▶️ Запустить бота", payload="bot_start")
-    builder.adjust(1)
+        sizes += [1, 2]
+    builder.callback(text="🏠 Главное меню", payload="main_menu")
+    sizes.append(1)
+    builder.adjust(*sizes)
     return builder
 
 
@@ -3290,7 +3301,8 @@ async def on_waiting_negotiated_skip(callback, state: FSMContext, bot):
 async def fallback(message, bot):
     if not _is_private_chat(message):
         return
-    await message.answer(text="Воспользуйтесь кнопками выше или меню ниже.", keyboard=main_menu_kb())
+    await message.answer(text="Воспользуйтесь кнопками выше или меню ниже.",
+                         keyboard=main_menu_kb(message.sender.user_id))
 
 
 dp.include_router(router)
@@ -3564,6 +3576,23 @@ async def _alert_owner(bot, text: str, key: Optional[str] = None) -> None:
     await _send_to_user(bot, OWNER_USER_ID, f"🛠 {BOT_TITLE}: {text}"[:3900])
 
 
+async def _collect_sales(bot, user_id: int, days: int) -> None:
+    await _send_to_user(bot, user_id, f"⏳ Собираю оценки из MaxPoster за {days} дн. и проверяю данные о "
+                                      "продажах — это может занять несколько минут. Файлы пришлю сюда.")
+    import sales_export
+    try:
+        csv_path, json_path, summary = await asyncio.to_thread(sales_export.run_export, days)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("collect_sales")
+        await _send_to_user(bot, user_id, f"⚠️ Не удалось выгрузить данные: {e}")
+        return
+    await _send_to_user(bot, user_id, "✅ " + summary)
+    for path, caption in [(csv_path, "📊 Оценки и рынок (CSV, открывается в Excel)"),
+                          (json_path, "🔎 Проверка API склада/продаж")]:
+        if not await _send_file_to_user(bot, user_id, path, caption):
+            await _send_to_user(bot, user_id, f"⚠️ Не удалось отправить файл, он лежит на сервере: {path}")
+
+
 @router.message(Command("collect_sales"))
 async def cmd_collect_sales(message, command: CommandObject, bot):
     """[владелец] /collect_sales [дней=180] — выгрузка оценок и данных склада из MaxPoster
@@ -3573,20 +3602,63 @@ async def cmd_collect_sales(message, command: CommandObject, bot):
         return
     arg = (command.args or "").strip()
     days = int(arg) if arg.isdigit() and 1 <= int(arg) <= 730 else 180
-    await message.answer(text=f"⏳ Собираю оценки из MaxPoster за {days} дн. и проверяю данные о продажах — "
-                              "это может занять несколько минут. Файлы пришлю сюда.")
-    import sales_export
-    try:
-        csv_path, json_path, summary = await asyncio.to_thread(sales_export.run_export, days)
-    except Exception as e:  # noqa: BLE001
-        logger.exception("collect_sales")
-        await message.answer(text=f"⚠️ Не удалось выгрузить данные: {e}")
+    await _collect_sales(bot, message.sender.user_id, days)
+
+
+# ---------------------------------------------------------------------------
+# Кнопки админ-панели вместо команд + обновление бота с телефона
+# ---------------------------------------------------------------------------
+ADMIN_COMMANDS_TEXT = (
+    "📖 КОМАНДЫ (всё это есть и кнопками)\n\n"
+    "Для всех: /menu — меню · /new — новая оценка · /calc — предварительный расчёт · /my — мои оценки · "
+    "/help — помощь · /myid — мой ID\n"
+    "РОП, ДДЦ, УК: /history — история оценок\n\n"
+    "Администратор: /admin — админ-панель · /approve ID · /deny ID — доступ · /users · /pending · "
+    "/queue — очередь согласования · /report [дней] — отчёт · /raw ссылка — поля MaxPoster · "
+    "/salons — салоны\n"
+    "В чате салона: /register_salon Название — привязать чат · в чате ПАЦ: /register_pats\n"
+    "Владелец: /backup — резервная копия · /collect_sales [дней] — данные продаж · "
+    "/disable_all · /enable_all — остановка/запуск"
+)
+
+
+def _back_kb():
+    builder = InlineKeyboardBuilder()
+    builder.callback(text="⬅️ Админ-панель", payload="admin_menu")
+    return builder
+
+
+@router.message_callback(F.payload == "main_menu")
+async def on_main_menu(callback, state: FSMContext, bot):
+    await state.clear()
+    await callback.answer(text="Выберите действие:", keyboard=main_menu_kb(_get_user_id(callback)))
+
+
+@router.message_callback(F.payload == "admin_cmds")
+async def on_admin_cmds(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await _toast(callback, "Только для администраторов.")
         return
-    await message.answer(text="✅ " + summary)
-    for path, caption in [(csv_path, "📊 Оценки и рынок (CSV, открывается в Excel)"),
-                          (json_path, "🔎 Проверка API склада/продаж")]:
-        if not await _send_file_to_user(bot, message.sender.user_id, path, caption):
-            await message.answer(text=f"⚠️ Не удалось отправить файл, он лежит на сервере: {path}")
+    await callback.answer(text=ADMIN_COMMANDS_TEXT, keyboard=_back_kb())
+
+
+@router.message_callback(F.payload == "collect_sales")
+async def on_collect_sales_btn(callback, bot):
+    user_id = _get_user_id(callback)
+    if not _is_owner(user_id):
+        await _toast(callback, "Только для владельца бота.")
+        return
+    await callback.answer(text="📥 Выгрузка данных продаж запущена — файлы придут сюда отдельными сообщениями.",
+                          keyboard=_back_kb())
+    asyncio.create_task(_collect_sales(bot, user_id, 180))
+
+
+@router.message_callback(F.payload == "backup_now")
+async def on_backup_btn(callback, bot):
+    if not _is_owner(_get_user_id(callback)):
+        await _toast(callback, "Только для владельца бота.")
+        return
+    await callback.answer(text="💾 " + await _run_backup(bot), keyboard=_back_kb())
 
 
 @router.message(Command("backup"))
@@ -3613,27 +3685,20 @@ async def on_error(event, bot=None):
 
 
 async def _set_commands_menu():
-    """Заполняет нативное меню команд MAX (кнопка '/'), чтобы не нужно было
-    запоминать команды — они появятся со своими описаниями в списке."""
+    """Нативное меню команд MAX (кнопка «/» в чате с ботом). Здесь только основные
+    команды — всё остальное доступно кнопками в «⚙️ Админ-панели»."""
+    from maxgram.types import BotCommand
     try:
-        await bot.set_my_commands([
-            {"name": "menu", "description": "Главное меню"},
-            {"name": "new", "description": "Начать новую оценку"},
-            {"name": "calc", "description": "Предварительный расчёт (без отправки)"},
-            {"name": "my", "description": "Мои оценки и их статусы"},
-            {"name": "help", "description": "Как пользоваться ботом"},
-            {"name": "myid", "description": "Узнать свой ID в MAX"},
-            {"name": "admin", "description": "Меню администратора (заявки/пользователи/салоны)"},
-            {"name": "pending", "description": "[админ] Заявки на доступ"},
-            {"name": "users", "description": "[админ] Список пользователей с доступом"},
-            {"name": "salons", "description": "[админ] Список привязанных салонов"},
-            {"name": "register_salon", "description": "[админ] Привязать этот чат к салону"},
-            {"name": "register_pats", "description": "[админ] Назначить этот чат общим чатом ПАЦ"},
-            {"name": "raw", "description": "[админ] Все поля оценки из MaxPoster"},
-            {"name": "queue", "description": "[админ] Оценки в очереди на согласование"},
-            {"name": "backup", "description": "[владелец] Резервная копия данных прямо сейчас"},
-            {"name": "report", "description": "[админ] Отчёт по салонам за 7 дней (/report 30 — за 30)"},
-        ])
+        await bot.set_commands([BotCommand(name=n, description=d) for n, d in [
+            ("menu", "Главное меню"),
+            ("new", "Новая оценка"),
+            ("calc", "Предварительный расчёт"),
+            ("my", "Мои оценки"),
+            ("history", "История оценок (РОП, ДДЦ, УК)"),
+            ("help", "Как пользоваться ботом"),
+            ("myid", "Мой ID в MAX"),
+            ("admin", "Админ-панель (для администраторов)"),
+        ]])
     except Exception as e:  # noqa: BLE001
         logger.warning("Не удалось задать меню команд: %s", e)
 
