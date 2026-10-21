@@ -3502,25 +3502,37 @@ def _make_backup() -> Optional[str]:
 async def _send_file_to_user(bot, user_id: int, path: str, text: str) -> bool:
     """Отправка файла в личку. MAX обрабатывает загруженный файл не мгновенно —
     при ответе «attachment not ready» повторяем несколько раз."""
+    global _last_file_error
     from maxgram.types import FileAttachmentRequest
     try:
         with open(path, "rb") as f:
             token = await bot.upload_file("file", f.read(), filename=os.path.basename(path))
     except Exception as e:  # noqa: BLE001
+        _last_file_error = f"загрузка: {e}"
         logger.error("Не удалось загрузить файл %s в MAX: %s", path, e)
         return False
-    for attempt in range(5):
+    if not token:
+        _last_file_error = "MAX не вернул токен загруженного файла"
+        logger.error("Файл %s: %s", path, _last_file_error)
+        return False
+    # большой файл MAX обрабатывает дольше — ждём до ~2 минут
+    for attempt in range(10):
         try:
             await bot.send_message(user_id=user_id, text=text,
                                    attachments=[FileAttachmentRequest(payload={"token": token})])
             return True
         except Exception as e:  # noqa: BLE001
+            _last_file_error = str(e)[:200]
             if "not.ready" in str(e) or "not ready" in str(e):
-                await asyncio.sleep(2 + attempt * 2)
+                await asyncio.sleep(min(3 + attempt * 3, 20))
                 continue
             logger.error("Не удалось отправить файл %s: %s", path, e)
             return False
+    logger.error("Файл %s так и не обработан MAX: %s", path, _last_file_error)
     return False
+
+
+_last_file_error = ""
 
 
 async def _run_backup(bot) -> str:
@@ -3576,6 +3588,18 @@ async def _alert_owner(bot, text: str, key: Optional[str] = None) -> None:
     await _send_to_user(bot, OWNER_USER_ID, f"🛠 {BOT_TITLE}: {text}"[:3900])
 
 
+def _zip_file(path: str) -> str:
+    """CSV на тысячи строк сжимается в 5–10 раз — так MAX быстрее его принимает."""
+    import zipfile
+    zip_path = os.path.splitext(path)[0] + ".zip"
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(path, os.path.basename(path))
+        return zip_path
+    except OSError:
+        return path
+
+
 async def _collect_sales(bot, user_id: int, days: int) -> None:
     await _send_to_user(bot, user_id, f"⏳ Собираю оценки из MaxPoster за {days} дн. и проверяю данные о "
                                       "продажах — это может занять несколько минут. Файлы пришлю сюда.")
@@ -3587,10 +3611,11 @@ async def _collect_sales(bot, user_id: int, days: int) -> None:
         await _send_to_user(bot, user_id, f"⚠️ Не удалось выгрузить данные: {e}")
         return
     await _send_to_user(bot, user_id, "✅ " + summary)
-    for path, caption in [(csv_path, "📊 Оценки и рынок (CSV, открывается в Excel)"),
+    for path, caption in [(_zip_file(csv_path), "📊 Оценки и рынок (CSV в архиве, открывается в Excel)"),
                           (json_path, "🔎 Проверка API склада/продаж")]:
         if not await _send_file_to_user(bot, user_id, path, caption):
-            await _send_to_user(bot, user_id, f"⚠️ Не удалось отправить файл, он лежит на сервере: {path}")
+            await _send_to_user(bot, user_id, f"⚠️ Не удалось отправить файл ({_last_file_error}), "
+                                              f"он лежит на сервере: {path}")
 
 
 @router.message(Command("collect_sales"))

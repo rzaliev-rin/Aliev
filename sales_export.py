@@ -131,7 +131,54 @@ APPRAISAL_COLUMNS = [
     ("owners", "liquidity.ownersCount"), ("avg_market_mileage", "liquidity.averageMarketMileage"),
     ("total_rating", "liquidity.totalRating.rating"), ("final_category", "finalVehicleCategory.scoring"),
     ("completion_date", "completionDate"), ("vehicle_id", "vehicleId"), ("actual_vehicle_id", "actualVehicleId"),
+    ("updated", "updatedAt"), ("desired_buyout", "desiredBuyoutPrice"), ("rejection_reason", "rejectionReason"),
+    ("purchase_to_market", "purchaseCostToMarket"), ("purchase_to_autohub", "purchaseCostToAutohubPrice"),
 ]
+
+
+SHEET_TAB_DATA = "Выгрузка MaxPoster"
+SHEET_TAB_PROBE = "Проверка API MaxPoster"
+
+
+def write_to_sheet(header: list, rows: list, report: dict) -> str:
+    """Кладёт выгрузку во вкладки Google-таблицы бота (та же, что «История оценок»):
+    так файл не нужно пересылать — его видно в таблице. Возвращает ссылку."""
+    import gspread
+    from google.oauth2.service_account import Credentials
+    from config import GOOGLE_SERVICE_ACCOUNT_FILE, GOOGLE_SHEET_ID
+    creds = Credentials.from_service_account_file(
+        GOOGLE_SERVICE_ACCOUNT_FILE, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    sh = gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID)
+
+    def tab(title: str, n_rows: int, n_cols: int):
+        try:
+            ws = sh.worksheet(title)
+            ws.clear()
+            ws.resize(rows=max(n_rows, 2), cols=max(n_cols, 2))
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=title, rows=max(n_rows, 2), cols=max(n_cols, 2))
+        return ws
+
+    def cell(v):
+        return "" if v is None else (v if isinstance(v, (int, float)) else str(v))
+
+    values = [header] + [[cell(r.get(c)) for c in header] for r in rows]
+    ws = tab(SHEET_TAB_DATA, len(values) + 1, len(header))
+    for i in range(0, len(values), 2000):  # пачками — у Google лимит на размер одного запроса
+        ws.update(values=values[i:i + 2000], range_name=f"A{i + 1}", value_input_option="RAW")
+
+    probe_rows = [["Метод", "Адрес", "Код ответа", "Ключи ответа / ошибка", "Поля (пример)"]]
+    for e in report.get("vehicle_endpoints", []):
+        probe_rows.append([e.get("method", ""), e.get("path", ""), cell(e.get("status")),
+                           str(e.get("top_keys") or e.get("error") or e.get("body") or "")[:500],
+                           json.dumps(e.get("fields") or {}, ensure_ascii=False)[:5000]])
+    probe_rows += [[], ["Период", " — ".join(report.get("period", []))],
+                   ["Оценок", cell(report.get("appraisals"))],
+                   ["С привязкой к авто", cell(report.get("appraisals_with_vehicle"))],
+                   ["Данных по авто получено", cell(report.get("vehicles_fetched"))]]
+    ws2 = tab(SHEET_TAB_PROBE, len(probe_rows) + 1, 5)
+    ws2.update(values=probe_rows, range_name="A1", value_input_option="RAW")
+    return f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit#gid={ws.id}"
 
 
 def run_export(days: int = 180) -> tuple:
@@ -171,4 +218,9 @@ def run_export(days: int = 180) -> tuple:
     summary = (f"Оценок за {days} дн.: {len(items)}; с привязкой к авто на складе: {len(vehicle_ids)}; "
                f"данных по авто получено: {len(vehicles)}.\n"
                + (f"API склада ответил: {', '.join(ok)}" if ok else "API склада/продаж по проверенным адресам не ответил."))
+    try:
+        link = write_to_sheet([c for c, _ in APPRAISAL_COLUMNS] + extra_cols, rows, report)
+        summary += f"\n📄 Данные записаны в Google-таблицу, вкладки «{SHEET_TAB_DATA}» и «{SHEET_TAB_PROBE}»: {link}"
+    except Exception as e:  # noqa: BLE001
+        summary += f"\n⚠️ В Google-таблицу записать не удалось: {e}"
     return csv_path, json_path, summary
