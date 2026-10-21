@@ -340,8 +340,8 @@ def main_menu_kb(user_id: Optional[int] = None):
     return builder
 
 
-def new_appraisal_kb():
-    return main_menu_kb()
+def new_appraisal_kb(user_id: Optional[int] = None):
+    return main_menu_kb(user_id)
 
 
 def _already_processed_text(deal: dict) -> str:
@@ -779,7 +779,7 @@ async def _finish_scoring(state: FSMContext, answer_fn, bot, auto_note: str = ""
             text="🧮 ПРЕДВАРИТЕЛЬНЫЙ РАСЧЁТ\n\n" + header
             + "\n\nЭто прикидка — на согласование ничего не отправлено. Для сделки сделайте "
               "оценку в MaxPoster и нажмите «Новая оценка».",
-            keyboard=main_menu_kb(),
+            keyboard=main_menu_kb(data.get("_manager_user_id")),
         )
         return
 
@@ -992,7 +992,7 @@ async def _review_or_close(state: FSMContext, answer_fn, data: dict, note: str =
             text=prefix
             + "⚠️ Сделка НЕ отправлена на согласование — не указана согласованная цена с клиентом."
             + "\n\nГотово. Чтобы посчитать следующее авто — жмите кнопку ниже.",
-            keyboard=new_appraisal_kb(),
+            keyboard=new_appraisal_kb(data.get("_manager_user_id")),
         )
         await state.clear()
         await _log_appraisal_safe(manager_name, data.get("vin"), appraisal_input, result, vehicle_info)
@@ -1070,7 +1070,7 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
     await callback.answer(
         text="✅ Отправлено на согласование." + approval_note
         + "\n\nГотово. Чтобы посчитать следующее авто — жмите кнопку ниже.",
-        keyboard=new_appraisal_kb(),
+        keyboard=new_appraisal_kb(_get_user_id(callback)),
     )
     await _log_appraisal_safe(manager_name, data.get("vin"), appraisal_input, result, vehicle_info)
 
@@ -1319,7 +1319,7 @@ async def on_approve_callback(callback, bot):
     already = access_store.is_allowed(uid)
     access_store.approve(uid)
     if not already:
-        await _send_to_user(bot, uid, ACCESS_GRANTED_TEXT, keyboard=main_menu_kb())
+        await _send_to_user(bot, uid, ACCESS_GRANTED_TEXT, keyboard=main_menu_kb(uid))
     await _safe_answer(callback.answer, *_pending_view(_page_arg(callback.payload, 2),
                                                        note=f"✅ Доступ для «{name}» открыт."))
 
@@ -1351,7 +1351,7 @@ async def on_approve_all(callback, bot):
     pending = list(access_store.list_pending())
     for uid in pending:
         access_store.approve(int(uid))
-        await _send_to_user(bot, int(uid), ACCESS_GRANTED_TEXT, keyboard=main_menu_kb())
+        await _send_to_user(bot, int(uid), ACCESS_GRANTED_TEXT, keyboard=main_menu_kb(int(uid)))
     await _safe_answer(callback.answer, *_pending_view(0, note=f"✅ Доступ открыт: {len(pending)} чел."))
 
 
@@ -1673,7 +1673,7 @@ async def cmd_approve(message, command: CommandObject, bot):
     already = access_store.is_allowed(uid)
     access_store.approve(uid)
     if not already:
-        await _send_to_user(bot, uid, ACCESS_GRANTED_TEXT, keyboard=main_menu_kb())
+        await _send_to_user(bot, uid, ACCESS_GRANTED_TEXT, keyboard=main_menu_kb(uid))
     await message.answer(text=f"Готово, доступ для {uid} открыт.")
 
 

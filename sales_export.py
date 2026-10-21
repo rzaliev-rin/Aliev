@@ -24,7 +24,8 @@ import requests
 import maxposter_client as mc
 
 EXPORT_DIR = os.path.join(os.path.dirname(__file__), "exports")
-MAX_PAGES = 150  # до 15 000 оценок за выгрузку
+PAGE_SIZE = 50    # оценки идут с фото осмотра — небольшими страницами быстрее и надёжнее
+MAX_PAGES = 300   # до 15 000 оценок за выгрузку
 VEHICLE_ENDPOINTS = [("POST", "/partners-api/vehicles"), ("POST", "/partners-api/vehicles/search"),
                      ("GET", "/partners-api/vehicles"), ("POST", "/partners-api/stock"),
                      ("POST", "/partners-api/sales"), ("POST", "/partners-api/deals")]
@@ -187,7 +188,7 @@ def run_export(days: int = 180) -> tuple:
     end = datetime.date.today()
     start = end - datetime.timedelta(days=days)
     # сразу превращаем каждую оценку в строку — полные ответы (с фото осмотра) в памяти не держим
-    rows = mc.list_appraisals(None, start, end, max_pages=MAX_PAGES,
+    rows = mc.list_appraisals(None, start, end, max_pages=MAX_PAGES, page_size=PAGE_SIZE,
                               transform=lambda it: {col: mc.get_path(it, p) for col, p in APPRAISAL_COLUMNS})
     items = rows
     report = {"period": [start.isoformat(), end.isoformat()], "appraisals": len(rows),

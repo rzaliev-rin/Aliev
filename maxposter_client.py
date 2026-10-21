@@ -385,12 +385,27 @@ DEALER_FILTER_FIELDS = ["dealer.id", "dealer", "dealerId"]
 _dealer_filter_field: Optional[str] = None
 
 
-def _post_appraisals(body: dict) -> list:
-    resp = requests.post(
-        f"{MAXPOSTER_API_BASE}/partners-api/appraisals",
-        headers={"Authorization": f"Basic {MAXPOSTER_API_KEY}", "Content-Type": "application/json"},
-        json=body, timeout=30,
-    )
+def _post_appraisals(body: dict, attempts: int = 4) -> list:
+    """Страница оценок. MaxPoster отдаёт оценки вместе с фото осмотра, поэтому большая
+    страница может идти долго: ждём до 120 с и повторяем при обрыве/таймауте."""
+    import time
+    for attempt in range(attempts):
+        try:
+            resp = requests.post(
+                f"{MAXPOSTER_API_BASE}/partners-api/appraisals",
+                headers={"Authorization": f"Basic {MAXPOSTER_API_KEY}", "Content-Type": "application/json"},
+                json=body, timeout=(15, 120),
+            )
+        except (requests.Timeout, requests.ConnectionError) as e:
+            if attempt == attempts - 1:
+                raise MaxPosterError(f"MaxPoster не ответил за отведённое время ({e.__class__.__name__}), "
+                                     "попробуйте позже") from e
+            time.sleep(5 * (attempt + 1))
+            continue
+        if resp.status_code in (429, 502, 503, 504) and attempt < attempts - 1:
+            time.sleep(10 * (attempt + 1))
+            continue
+        break
     if resp.status_code != 200:
         raise MaxPosterError(f"MaxPoster API вернул {resp.status_code}: {resp.text[:200]}")
     return (resp.json().get("data") or {}).get("appraisals") or []
@@ -430,7 +445,7 @@ def _brief(item: dict, created: datetime.datetime) -> dict:
 
 
 def list_appraisals(dealer_id: Optional[int], start: datetime.date, end: datetime.date,
-                    transform=None, max_pages: int = LIST_MAX_PAGES) -> list:
+                    transform=None, max_pages: int = LIST_MAX_PAGES, page_size: int = LIST_PAGE_SIZE) -> list:
     """Все оценки салона (dealer_id; None — всех салонов) с датой создания в [start, end].
     Листаем от новых к старым и останавливаемся, когда пошли оценки раньше start."""
     global _dealer_filter_field
@@ -447,24 +462,24 @@ def list_appraisals(dealer_id: Optional[int], start: datetime.date, end: datetim
         result, offset = [], 0
         try:
             for _ in range(max_pages):
-                page = _post_appraisals({"limit": LIST_PAGE_SIZE, "offset": offset,
+                page = _post_appraisals({"limit": page_size, "offset": offset,
                                          "filters": filters, "orders": ["-id"]})
-                reached_start = False
+                # останавливаемся, только когда ВСЯ страница старше начала периода
+                # (порядок по id почти всегда совпадает с датой, но не гарантирован)
+                dated = [d for d in (_appraisal_date(it) for it in page) if d]
+                reached_start = bool(dated) and all(d.date() < start for d in dated)
                 for item in page:
                     if dealer_id is not None and str((item.get("dealer") or {}).get("id")) != str(dealer_id):
                         continue
                     created = _appraisal_date(item)
-                    if not created:
-                        continue
-                    if created.date() < start:
-                        reached_start = True
+                    if not created or created.date() < start:
                         continue
                     if created.date() <= end:
                         # transform — своя выжимка (выгрузка), иначе короткая карточка для истории
                         result.append(transform(item) if transform else _brief(item, created))
-                if reached_start or len(page) < LIST_PAGE_SIZE:
+                if reached_start or len(page) < page_size:
                     break
-                offset += LIST_PAGE_SIZE
+                offset += page_size
         except MaxPosterError:
             if field_name is None:
                 raise
