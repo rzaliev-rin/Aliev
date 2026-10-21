@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Рекомендация по цене (подсказка, на статус согласования НЕ влияет):
-  • за сколько выставить авто в продажу и план снижения цены;
+  • за сколько выставить авто в продажу (переоценка — по регламенту салона, здесь не даём);
   • ожидаемая цена и срок продажи (цель — продать за TARGET_DAYS дней);
   • до какой цены выкупать и с какой цены начинать торг.
 
@@ -19,7 +19,7 @@ TARGET_DAYS = 30                 # целевой срок продажи
 DEFAULT_SALE_DAYS = 35           # если MaxPoster не дал средний срок продажи
 CORRIDOR_DEFAULT = (0.93, 1.05)  # коридор к Авито-оценке, если нет minImv/maxImv
 BARGAIN = (0.05, 0.03)           # скидка при продаже (торг): низкая -> высокая ликвидность
-PRICE_DROPS = [(15, 0.02), (TARGET_DAYS, 0.03)]  # день и снижение цены, если авто не продано
+# План снижения цены НЕ даём: переоценка идёт по регламенту салона (каждые 5 дней без звонков).
 HOLDING_COST_PER_10_DAYS = 0.005  # стоимость стоянки/денег сверх TARGET_DAYS, доля цены продажи
 RISK_BUFFER = {"высокая": 0.01, "средняя": 0.02, "низкая": 0.03}
 TORG_START = 0.04                # начинать торг на столько ниже максимальной цены выкупа
@@ -28,7 +28,6 @@ TORG_START = 0.04                # начинать торг на столько
 @dataclass
 class Recommendation:
     list_price: float
-    drops: list                  # [(день, цена)]
     expected_sale: float
     expected_days: int
     buyout_max: float
@@ -98,11 +97,6 @@ def recommend(market: dict, avito_price: float, category: str, reception_type: s
 
     # цена выставления: позиция в рыночном коридоре по ликвидности, минус риски
     list_price = _round((lo + (hi - lo) * (0.35 + 0.45 * liq)) * (1 + risk), 10_000)
-    drops, price = [], list_price
-    for day, cut in PRICE_DROPS:
-        price = _round(price * (1 - cut), 10_000)
-        drops.append((day, price))
-
     bargain = BARGAIN[0] + (BARGAIN[1] - BARGAIN[0]) * liq
     expected_sale = _round(list_price * (1 - bargain), 5_000)
     market_days = m.get("avg_sale_days") or DEFAULT_SALE_DAYS
@@ -126,17 +120,16 @@ def recommend(market: dict, avito_price: float, category: str, reception_type: s
     if m.get("market_sales_90") is not None and m.get("market_total_90"):
         liq_text.append(f"продано {int(m['market_sales_90'])} из {int(m['market_total_90'])} за 90 дн.")
     reasons = liq_text + reasons
-    return Recommendation(list_price, drops, expected_sale, expected_days, buyout, torg, conf, reasons)
+    return Recommendation(list_price, expected_sale, expected_days, buyout, torg, conf, reasons)
 
 
 def format_recommendation(r: Optional[Recommendation], fmt, negotiated_price: Optional[float] = None,
                           limit_rop: Optional[float] = None) -> str:
     if r is None:
         return ""
-    drops = ", ".join(f"через {d} дн. — {fmt(p)}" for d, p in r.drops)
     lines = [
         "💡 РЕКОМЕНДАЦИЯ ПО ЦЕНЕ (подсказка, на согласование не влияет)",
-        f"Выставить: {fmt(r.list_price)} ₽ (если не продано: {drops})",
+        f"Выставить: {fmt(r.list_price)} ₽",
         f"Ожидаемая продажа: ~{fmt(r.expected_sale)} ₽ за ~{r.expected_days} дн."
         + (f" ⚠️ дольше цели {TARGET_DAYS} дн." if r.expected_days > TARGET_DAYS else ""),
         f"Выкуп: до {fmt(r.buyout_max)} ₽, торг начинать с {fmt(r.torg_start)} ₽",
