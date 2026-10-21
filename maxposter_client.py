@@ -70,6 +70,7 @@ class AppraisalData:
     dealer_id: Optional[int] = None                     # номер салона в MaxPoster (dealer.id)
     lead_source: Optional[str] = None                   # источник поступления (leadSource.name)
     film_parts_count: int = 0                           # деталей в плёнке (толщина не засчитана как окрас)
+    market: dict = field(default_factory=dict)          # рынок и ликвидность — для рекомендации цены (recommend.py)
 
 
 # Где искать дату оценки, если MAXPOSTER_APPRAISAL_DATE_FIELD не задан
@@ -127,6 +128,34 @@ def map_reception(raw_value: Any, brand: Optional[str] = None) -> Optional[str]:
     if "commiss" in key or "комис" in key:
         return "Комиссия"
     return None
+
+
+def extract_market(data: dict) -> dict:
+    """Рыночные поля оценки MaxPoster (сверены по /raw оценки 8737839)."""
+    liq = data.get("liquidity") or {}
+
+    def num(v):
+        try:
+            return float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+    return {
+        "imv": num(data.get("imv")), "min_imv": num(data.get("minImv")), "max_imv": num(data.get("maxImv")),
+        "avg_market_price": num(data.get("avgMarketPrice")),
+        "autohub_ptsp": num(data.get("maxposterSaleCost")),
+        "competitors": num(data.get("numberOfCompetitors")),
+        "rating_position": num(data.get("vRatingPosition")),
+        "avg_sale_days": num(liq.get("averageSalePeriod") or liq.get("averageDaysInSale")),
+        "liquidity_pct": num(liq.get("liquidityPercent90") or liq.get("liquidityPercent")),
+        "market_sales_90": num(liq.get("completedMarketSales90") or liq.get("completedMarketSales")),
+        "market_total_90": num(liq.get("totalMarketSales90") or liq.get("totalMarketSales")),
+        "holding_sales": num(liq.get("holdingSales")),
+        "accidents": num(liq.get("accidentsCount")),
+        "owners": num(liq.get("ownersCount") or data.get("ownerCount")),
+        "mileage": num(liq.get("mileage") or data.get("mileage")),
+        "avg_market_mileage": num(liq.get("averageMarketMileage")),
+        "total_rating": (liq.get("totalRating") or {}).get("rating"),
+    }
 
 
 def _extra_fields(data: dict) -> dict:
@@ -339,6 +368,7 @@ def fetch_appraisal(query: str) -> AppraisalData:
         raw=data,
         dealer_id=dealer_obj.get("id"),
         lead_source=(data.get("leadSource") or {}).get("name"),
+        market=extract_market(data),
         **_extra_fields(data),
     )
 
@@ -399,7 +429,8 @@ def _brief(item: dict, created: datetime.datetime) -> dict:
     }
 
 
-def list_appraisals(dealer_id: Optional[int], start: datetime.date, end: datetime.date) -> list:
+def list_appraisals(dealer_id: Optional[int], start: datetime.date, end: datetime.date,
+                    transform=None, max_pages: int = LIST_MAX_PAGES) -> list:
     """Все оценки салона (dealer_id; None — всех салонов) с датой создания в [start, end].
     Листаем от новых к старым и останавливаемся, когда пошли оценки раньше start."""
     global _dealer_filter_field
@@ -415,7 +446,7 @@ def list_appraisals(dealer_id: Optional[int], start: datetime.date, end: datetim
         filters = [{"fields": field_name, "type": "equal", "value": [str(dealer_id)]}] if field_name else []
         result, offset = [], 0
         try:
-            for _ in range(LIST_MAX_PAGES):
+            for _ in range(max_pages):
                 page = _post_appraisals({"limit": LIST_PAGE_SIZE, "offset": offset,
                                          "filters": filters, "orders": ["-id"]})
                 reached_start = False
@@ -429,7 +460,8 @@ def list_appraisals(dealer_id: Optional[int], start: datetime.date, end: datetim
                         reached_start = True
                         continue
                     if created.date() <= end:
-                        result.append(_brief(item, created))
+                        # transform — своя выжимка (выгрузка), иначе короткая карточка для истории
+                        result.append(transform(item) if transform else _brief(item, created))
                 if reached_start or len(page) < LIST_PAGE_SIZE:
                     break
                 offset += LIST_PAGE_SIZE

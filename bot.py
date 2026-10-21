@@ -64,6 +64,7 @@ import appraisals_log
 import dealer_chats
 import deals_store
 import approval_hierarchy
+import recommend
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -895,6 +896,23 @@ def _appraisal_warnings(data: dict) -> list:
     return lines
 
 
+def _recommendation(data: dict, result, appraisal_input):
+    """Рекомендация по цене (подсказка). None — нет данных рынка или это комиссия."""
+    if appraisal_input.reception_type == COMMISSION or not data.get("market"):
+        return None
+    try:
+        return recommend.recommend(data["market"], appraisal_input.avito_price, result.category,
+                                   appraisal_input.reception_type, result.refurbishment, result.ceiling_price)
+    except Exception as e:  # noqa: BLE001 — подсказка не должна ломать оценку
+        logger.warning("Не удалось посчитать рекомендацию: %s", e)
+        return None
+
+
+def _recommendation_text(data: dict, result, appraisal_input) -> str:
+    return recommend.format_recommendation(_recommendation(data, result, appraisal_input), _fmt,
+                                           appraisal_input.negotiated_price, result.purchase_price_rop)
+
+
 def _journal_fields(data: dict, result, appraisal_input) -> dict:
     """Что пишем в журнал «Мои оценки» / отчёт."""
     vehicle = " ".join(str(x) for x in [data.get("brand"), data.get("model"), data.get("year")] if x)
@@ -916,7 +934,16 @@ def _journal_fields(data: dict, result, appraisal_input) -> dict:
         "appraisal_id": data.get("appraisal_id"),     # для ссылки на MaxPoster в «Истории оценок»
         "mileage": data.get("mileage"),
         "appraiser_name": data.get("appraiser_name"),
+        **_recommendation_fields(_recommendation(data, result, appraisal_input)),
     }
+
+
+def _recommendation_fields(rec) -> dict:
+    """Прогноз в журнал — чтобы потом сравнить с фактической продажей (калибровка)."""
+    if rec is None:
+        return {}
+    return {"rec_list": rec.list_price, "rec_sale": rec.expected_sale, "rec_days": rec.expected_days,
+            "rec_buyout": rec.buyout_max, "rec_confidence": rec.confidence}
 
 
 async def _journal_save(state: FSMContext, data: dict, result, appraisal_input) -> None:
@@ -984,7 +1011,8 @@ async def _review_or_close(state: FSMContext, answer_fn, data: dict, note: str =
         f"Статус: {_status_text(result.approval_status)}",
     ]
     lines += [""] + _appraisal_warnings(data)
-    text = prefix + "\n".join(line for line in lines if line)
+    rec_text = _recommendation_text(data, result, appraisal_input)
+    text = prefix + "\n".join(line for line in lines if line) + (f"\n\n{rec_text}" if rec_text else "")
     await state.set_state(AppraisalStates.reviewing_result)
     await answer_fn(text=text, keyboard=review_kb())
 
@@ -1014,6 +1042,9 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
     await state.clear()
     appraisal_input = _appraisal_input(data)
     result = calc_appraisal(appraisal_input)
+    rec_text = _recommendation_text(data, result, appraisal_input)
+    if rec_text:  # подсказка по цене — согласующим в карточке (и в напоминаниях)
+        warnings = warnings + ["", rec_text]
     manager_name = data.get("_manager_name") or "неизвестно"
     vehicle_info = _vehicle_info(data)
     approval_note, token, sent = await _submit_for_approval(
@@ -3045,6 +3076,7 @@ async def on_waiting_link(message, state: FSMContext, bot):
         _reception_raw=data.reception_raw if data.reception_type in RECEPTION_TYPES else None,
         dealer_id=data.dealer_id,
         lead_source=data.lead_source,
+        market=data.market,
     )
 
     vehicle_line = " ".join(str(x) for x in [data.brand, data.model, data.year] if x)
@@ -3530,6 +3562,31 @@ async def _alert_owner(bot, text: str, key: Optional[str] = None) -> None:
         return
     _last_alerts[key] = now
     await _send_to_user(bot, OWNER_USER_ID, f"🛠 {BOT_TITLE}: {text}"[:3900])
+
+
+@router.message(Command("collect_sales"))
+async def cmd_collect_sales(message, command: CommandObject, bot):
+    """[владелец] /collect_sales [дней=180] — выгрузка оценок и данных склада из MaxPoster
+    для калибровки рекомендации по цене. Файлы приходят в личку."""
+    if not _is_owner(message.sender.user_id):
+        await message.answer(text="Эта команда доступна только владельцу бота.")
+        return
+    arg = (command.args or "").strip()
+    days = int(arg) if arg.isdigit() and 1 <= int(arg) <= 730 else 180
+    await message.answer(text=f"⏳ Собираю оценки из MaxPoster за {days} дн. и проверяю данные о продажах — "
+                              "это может занять несколько минут. Файлы пришлю сюда.")
+    import sales_export
+    try:
+        csv_path, json_path, summary = await asyncio.to_thread(sales_export.run_export, days)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("collect_sales")
+        await message.answer(text=f"⚠️ Не удалось выгрузить данные: {e}")
+        return
+    await message.answer(text="✅ " + summary)
+    for path, caption in [(csv_path, "📊 Оценки и рынок (CSV, открывается в Excel)"),
+                          (json_path, "🔎 Проверка API склада/продаж")]:
+        if not await _send_file_to_user(bot, message.sender.user_id, path, caption):
+            await message.answer(text=f"⚠️ Не удалось отправить файл, он лежит на сервере: {path}")
 
 
 @router.message(Command("backup"))
