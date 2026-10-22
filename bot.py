@@ -905,8 +905,10 @@ def _recommendation(data: dict, result, appraisal_input):
     if appraisal_input.reception_type == COMMISSION or not data.get("market"):
         return None
     try:
+        model = " ".join(str(x) for x in [data.get("brand"), data.get("model")] if x)
         return recommend.recommend(data["market"], appraisal_input.avito_price, result.category,
-                                   appraisal_input.reception_type, result.refurbishment, result.ceiling_price)
+                                   appraisal_input.reception_type, result.refurbishment, result.ceiling_price,
+                                   salon=data.get("salon") or data.get("dealer_name"), model=model)
     except Exception as e:  # noqa: BLE001 — подсказка не должна ломать оценку
         logger.warning("Не удалось посчитать рекомендацию: %s", e)
         return None

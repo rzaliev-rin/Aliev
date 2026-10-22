@@ -219,6 +219,15 @@ def run_export(days: int = 180) -> tuple:
     summary = (f"Оценок за {days} дн.: {len(items)}; с привязкой к авто на складе: {len(vehicle_ids)}; "
                f"данных по авто получено: {len(vehicles)}.\n"
                + (f"API склада ответил: {', '.join(ok)}" if ok else "API склада/продаж по проверенным адресам не ответил."))
+    try:  # пересчёт коэффициентов подсказки по цене (recommend.py) по свежим продажам
+        import recommend
+        cal = recommend.build_calibration(rows)
+        recommend.save_calibration(cal)
+        n_models = sum(1 for v in cal["models"].values() if v["n"] >= recommend.MIN_MODEL_SALES)
+        summary += (f"\n💡 Подсказка по цене обновлена: {sum(v['n'] for v in cal['salons'].values())} продаж, "
+                    f"{len(cal['salons'])} салонов, {n_models} моделей с 5+ продажами.")
+    except Exception as e:  # noqa: BLE001
+        summary += f"\n⚠️ Калибровка подсказки не обновлена: {e}"
     try:
         link = write_to_sheet([c for c, _ in APPRAISAL_COLUMNS] + extra_cols, rows, report)
         summary += f"\n📄 Данные записаны в Google-таблицу, вкладки «{SHEET_TAB_DATA}» и «{SHEET_TAB_PROBE}»: {link}"
