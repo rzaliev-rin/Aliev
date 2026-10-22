@@ -3503,7 +3503,6 @@ async def _send_file_to_user(bot, user_id: int, path: str, text: str) -> bool:
     """Отправка файла в личку. MAX обрабатывает загруженный файл не мгновенно —
     при ответе «attachment not ready» повторяем несколько раз."""
     global _last_file_error
-    from maxgram.types import FileAttachmentRequest
     try:
         with open(path, "rb") as f:
             token = await bot.upload_file("file", f.read(), filename=os.path.basename(path))
@@ -3519,7 +3518,7 @@ async def _send_file_to_user(bot, user_id: int, path: str, text: str) -> bool:
     for attempt in range(10):
         try:
             await bot.send_message(user_id=user_id, text=text,
-                                   attachments=[FileAttachmentRequest(payload={"token": token})])
+                                   attachments=[{"type": "file", "payload": {"token": token}}])
             return True
         except Exception as e:  # noqa: BLE001
             _last_file_error = str(e)[:200]
