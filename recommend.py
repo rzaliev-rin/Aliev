@@ -294,8 +294,16 @@ def format_recommendation(r: Optional[Recommendation], fmt, negotiated_price: Op
     ]
     if negotiated_price:
         diff = negotiated_price - r.buyout_max
-        lines.append(f"Запрошенная цена {fmt(negotiated_price)} ₽ — "
+        lines.append(f"Запрос бизнеса {fmt(negotiated_price)} ₽ — "
                      + (f"выше рекомендации на {fmt(diff)} ₽" if diff > 0 else "в пределах рекомендации"))
     elif limit_rop:
         lines.append(f"Лимит РОП по метрике: {fmt(limit_rop)} ₽")
     return "\n".join(lines)
+
+
+def format_recommendation_short(r: Optional[Recommendation], fmt) -> str:
+    """Две строки подсказки для карточки согласования."""
+    if r is None:
+        return ""
+    return (f"💡 Подсказка: выкуп до {fmt(r.buyout_max)}, торг с {fmt(r.torg_start)}\n"
+            f"   выставить {fmt(r.list_price)} → ~{fmt(r.expected_sale)} за ~{r.expected_days} дн.")

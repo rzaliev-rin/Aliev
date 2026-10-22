@@ -405,6 +405,13 @@ def _vehicle_info(data: dict) -> dict:
         "salon": data.get("salon"),
         "dealer_id": data.get("dealer_id"),
         "lead_source": data.get("lead_source"),
+        # для компактной карточки согласования
+        "accidents_count": data.get("accidents_count"),
+        "repainted_parts_count": data.get("repainted_parts_count"),
+        "colors": data.get("colors"),
+        "owners": (data.get("market") or {}).get("owners"),
+        "autoteka_url": data.get("autoteka_url"),
+        "forecast_by_appraiser": data.get("manager_resale_forecast") is not None,
     }
 
 
@@ -449,46 +456,117 @@ def pats_done_kb(token: str):
     return builder
 
 
+def _short_name(name) -> str:
+    """«Давыдов Павел» -> «Давыдов П.»."""
+    parts = str(name or "").split()
+    if len(parts) >= 2 and parts[1][:1].isalpha():
+        return f"{parts[0]} {parts[1][0]}."
+    return parts[0] if parts else ""
+
+
+def _card_status_line(status, price, metrics: dict) -> str:
+    """Первая строка карточки: кто решает и почему (на сколько выше какого лимита)."""
+    rop, ddc, ceiling = metrics.get("limit_rop"), metrics.get("limit_ddc"), metrics.get("ceiling")
+    over = lambda limit: f" на {_fmt(price - limit)} ₽" if price is not None and limit is not None else ""  # noqa: E731
+    if status == STATUS_DDC:
+        return "🟡 СОГЛАСОВАНИЕ ДДЦ — выше лимита выкупа РОП" + over(rop)
+    if status == STATUS_UK:
+        return "🟠 СОГЛАСОВАНИЕ УК — выше предела выкупа ДДЦ" + over(ddc)
+    if status == STATUS_UK_CEILING:
+        return "🔴 СОГЛАСОВАНИЕ УК — выше потолка выкупа" + over(ceiling)
+    if status == STATUS_REJECT:
+        return "⛔ СОГЛАСОВАНИЕ УК — по метрике «Не принимать»"
+    if status == STATUS_COMMISSION:
+        return "🔵 КОМИССИЯ — подтверждение РОП"
+    if status in (STATUS_OK, "Согласование РОП"):
+        return "🟢 СОГЛАСОВАНИЕ РОП — в пределах лимита выкупа"
+    return f"📋 СОГЛАСОВАНИЕ СДЕЛКИ · {_status_text(status)}"
+
+
 def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_name: str, vin,
                          reception_type: Optional[str] = None, appraiser_sale_cost=None,
                          presale_preparation_cost=None, metrics: Optional[dict] = None,
                          warnings: Optional[list] = None, autohub_ptsp=None) -> str:
+    """Компактная карточка согласования: статус -> кто/что -> авто -> деньги ->
+    прогноз -> рынок -> предупреждения и подсказка -> ссылки."""
     metrics = metrics or {}
-    header = _vehicle_header(vehicle_info, reception_type)
-    # шапка начинается с автосалона, оценщик — сразу под ней
-    header_lines = header.split("\n") if header else []
-    salon_lines = [ln for ln in header_lines if ln.startswith("🏢")]
-    rest = [ln for ln in header_lines if not ln.startswith("🏢")]
-    lines = ["📋 СОГЛАСОВАНИЕ СДЕЛКИ", *salon_lines,
-             f"Оценщик: {vehicle_info.get('appraiser_name') or manager_name or '—'}", *rest]
-    lines += [
-        f"VIN: {vin or '—'}",
-        f"Категория: {result.category}"
-        + (f" (баллы: {metrics['score']}, пробег в год: {_fmt(metrics.get('mileage_per_year'))} км)"
-           if metrics.get("score") is not None else ""),
-        f"Авито-оценка: {_fmt(appraisal_input.avito_price)} ₽",
-    ]
-    lines += _metrics_lines(metrics)
-    if appraisal_input.negotiated_price is not None:
-        price_label = "Цена комиссии (клиенту)" if appraisal_input.reception_type == COMMISSION \
-            else "Запрашиваемая цена выкупа"
-        lines.append(f"{price_label}: {_fmt(appraisal_input.negotiated_price)} ₽")
-    if appraiser_sale_cost is not None:
-        lines.append(f"Прогноз цены продажи (ДЦ): {_fmt(appraiser_sale_cost)} ₽")
-        prep_for_calc = presale_preparation_cost or 0
-        lines.append(
-            f"Подготовка: {_fmt(presale_preparation_cost)} ₽" if presale_preparation_cost
-            else "Подготовка: расходы не запланированы"
-        )
-        if appraisal_input.negotiated_price is not None:
-            vp = appraiser_sale_cost - appraisal_input.negotiated_price - prep_for_calc
-            lines.append(f"ВП (валовая прибыль): {_fmt(vp)} ₽")
-    lines.append(_autohub_line(autohub_ptsp, appraisal_input.negotiated_price).strip())
-    lines.append(f"Статус: {_status_text(result.approval_status)}")
-    if result.gm2_negotiated is not None:
+    v = vehicle_info or {}
+    price = appraisal_input.negotiated_price
+    status = result.approval_status
+    commission = (reception_type or appraisal_input.reception_type) == COMMISSION or status == STATUS_COMMISSION
+    lines = [_card_status_line(status, price, metrics)]
+
+    salon = salon_label(v["salon"]) if v.get("salon") else (v.get("city") or v.get("dealer_name"))
+    who = _short_name(v.get("appraiser_name") or manager_name)
+    lines.append(" · ".join(x for x in [salon, reception_type, who] if x))
+    lines.append("")
+
+    car = " ".join(str(x) for x in [v.get("brand"), v.get("model"), v.get("year")] if x)
+    category = str(result.category or "").replace("Категория ", "кат. ") or None
+    mileage = f"{_fmt(round(v['mileage'] / 1000))} тыс. км" if v.get("mileage") is not None else None
+    owners = f"{int(v['owners'])} влад." if v.get("owners") else None
+    lines.append("🚗 " + " · ".join(x for x in [car or "авто", mileage, category, owners] if x))
+    condition = []
+    if v.get("accidents_count") is not None:
+        condition.append(f"ДТП: {v['accidents_count']}")
+    if v.get("repainted_parts_count") is not None:
+        condition.append(f"окрасов: {v['repainted_parts_count']}")
+    elif v.get("colors"):
+        condition.append(f"окрасы: {v['colors']}")
+    condition.append(f"предпродажка: {_fmt(presale_preparation_cost)} ₽" if presale_preparation_cost
+                     else "предпродажка: не запланирована")
+    lines.append("   " + " · ".join(condition))
+    lines.append("")
+
+    if price is not None:
+        label = "Цена комиссии (клиенту)" if commission else "Запрос бизнеса"
+        lines.append(f"💰 {label} {_fmt(price)} ₽")
+    rop, ddc, ceiling = metrics.get("limit_rop"), metrics.get("limit_ddc"), metrics.get("ceiling")
+    if status in (STATUS_OK, "Согласование РОП") and rop is not None and price is not None:
+        lines.append(f"   в пределах лимита выкупа РОП {_fmt(rop)} ₽ (−{_fmt(rop - price)})")
+    elif rop is not None:
+        limits = [f"потолок {_fmt(ceiling)}", f"ДДЦ {_fmt(ddc)}", f"РОП {_fmt(rop)}"]
+        lines.append(("   Лимиты выкупа (справочно): " if commission else "   Лимиты выкупа: ")
+                     + " · ".join(limits))
+
+    sale = appraiser_sale_cost if appraiser_sale_cost is not None else metrics.get("ptsp_rop")
+    if sale:
+        by_metric = v.get("forecast_by_appraiser") is False or appraiser_sale_cost is None
+        forecast = [f"продажа {_fmt(sale)}"]
+        if price is not None and not commission:
+            forecast.append(f"ВП {_fmt(sale - price - (presale_preparation_cost or 0))}"
+                            + (f" (план метрики {_fmt(metrics['gross_margin'])})"
+                               if metrics.get("gross_margin") is not None else ""))
+        lines.append(("📈 Прогноз по метрике: " if by_metric else "📈 Прогноз бизнеса: ") + " · ".join(forecast))
+
+    market = [f"Авито {_fmt(appraisal_input.avito_price)}"] if appraisal_input.avito_price else []
+    if autohub_ptsp:
+        market.append(f"Автохаб {_fmt(autohub_ptsp)}")
+        if price and not commission:
+            market.append(f"выкуп {price / autohub_ptsp * 100:.0f}% Автохаба")
+    if market:
+        lines.append("📊 " + " · ".join(market))
+    if result.gm2_negotiated is not None and not metrics:  # старые сделки без метрики
         lines.append(f"GM2 по факту: {_fmt(result.gm2_negotiated)} ₽")
-    lines += list(warnings or [])
-    return "\n".join(line for line in lines if line)
+
+    extra = [w for w in (warnings or []) if w]
+    if extra:
+        lines.append("")
+        lines += extra
+
+    link = _maxposter_link(v.get("appraisal_id"))
+    footer = []
+    if link:
+        footer.append(f"MaxPoster: {link}")
+    if v.get("autoteka_url"):
+        footer.append(f"Автотека: {v['autoteka_url']}")
+    if vin:
+        footer.append(f"VIN …{str(vin)[-6:]}" if len(str(vin)) > 8 else f"VIN {vin}")
+    if footer:
+        lines.append("")
+        lines += footer
+    text = "\n".join(lines)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def _track_card(token: Optional[str], sent, text: str) -> None:
@@ -597,7 +675,7 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
                                 presale_preparation_cost=presale_preparation_cost,
                                 metrics=_metrics(result), warnings=warnings, autohub_ptsp=autohub_ptsp)
     if to_uk:
-        sent_any, posted_in_chat = await _send_to_uk(bot, token, dealer_name, "⏳ Ожидается согласование УК.\n\n" + text)
+        sent_any, posted_in_chat = await _send_to_uk(bot, token, dealer_name, text)
         if sent_any or posted_in_chat:
             deals_store.update_deal(token, card_sent=True)
             where = ("лично и в чат салона" if sent_any and posted_in_chat
@@ -900,6 +978,36 @@ def _appraisal_warnings(data: dict) -> list:
     return lines
 
 
+def _card_warnings(data: dict) -> list:
+    """Те же предупреждения, что у оценщика, но по строке на тему — для карточки согласования."""
+    lines = []
+    open_deals, recent = _vin_duplicates(data.get("vin"), data.get("_record_id"))
+    for _token, deal in open_deals[:2]:
+        lines.append(f"⚠️ По VIN уже идёт заявка: {_deal_salon_label(deal)}, {_fmt(deal.get('negotiated_price'))} ₽, "
+                     f"{STAGE_TEXT.get(deal.get('stage'), deal.get('stage'))}")
+    if recent:
+        recent = recent[-3:]
+        dates = [f"{(r.get('ts') or '')[8:10]}.{(r.get('ts') or '')[5:7]}" for r in recent]
+        prices = [r["negotiated_price"] for r in recent if r.get("negotiated_price")]
+        line = f"⚠️ VIN оценивали {', '.join(dates[:-1]) + ' и ' + dates[-1] if len(dates) > 1 else dates[0]}"
+        if prices:
+            line += f" по {_fmt(prices[-1])} ₽"
+            now = data.get("negotiated_price")
+            if now is not None and round(now) != round(prices[-1]):
+                diff = now - prices[-1]
+                line += f" — сейчас {'+' if diff > 0 else '−'}{_fmt(abs(diff))}"
+        lines.append(line)
+    if data.get("appraisal_date"):
+        try:
+            dt = datetime.datetime.fromisoformat(data["appraisal_date"])
+            age = (datetime.datetime.now() - dt).days
+            if age > AVITO_MAX_AGE_DAYS:
+                lines.append(f"⚠️ Авито-оценка от {dt:%d.%m} ({age} дн.) — нужна на день осмотра")
+        except ValueError:
+            pass
+    return lines
+
+
 def _recommendation(data: dict, result, appraisal_input):
     """Рекомендация по цене (подсказка). None — нет данных рынка или это комиссия."""
     if appraisal_input.reception_type == COMMISSION or not data.get("market"):
@@ -1008,7 +1116,7 @@ async def _review_or_close(state: FSMContext, answer_fn, data: dict, note: str =
         "Прогноз ДЦ:",
         f"  Цена продажи: {_fmt(result.manager_resale_forecast)} ₽ ({forecast_source})",
         ("  Цена комиссии (клиенту)" if appraisal_input.reception_type == COMMISSION
-         else "  Запрашиваемая цена выкупа") + f": {_fmt(appraisal_input.negotiated_price)} ₽",
+         else "  Запрос бизнеса (цена выкупа)") + f": {_fmt(appraisal_input.negotiated_price)} ₽",
         f"  Переподготовка: {_fmt(result.refurbishment)} ₽" if result.refurbishment
         else "  Переподготовка: расходы не запланированы",
         f"  ВП (валовая прибыль): {_fmt(result.margin_negotiated)} ₽",
@@ -1043,14 +1151,14 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
               "по первой или попросить администратора закрыть её («⏳ Оценки в очереди»).",
             keyboard=builder)
         return
-    warnings = _appraisal_warnings(data)
+    warnings = _card_warnings(data)
     # Сбрасываем сценарий сразу, чтобы повторное нажатие кнопки не создало вторую карточку.
     await state.clear()
     appraisal_input = _appraisal_input(data)
     result = calc_appraisal(appraisal_input)
-    rec_text = _recommendation_text(data, result, appraisal_input)
+    rec_text = recommend.format_recommendation_short(_recommendation(data, result, appraisal_input), _fmt)
     if rec_text:  # подсказка по цене — согласующим в карточке (и в напоминаниях)
-        warnings = warnings + ["", rec_text]
+        warnings = warnings + [rec_text]
     manager_name = data.get("_manager_name") or "неизвестно"
     vehicle_info = _vehicle_info(data)
     approval_note, token, sent = await _submit_for_approval(
@@ -3068,6 +3176,7 @@ async def on_waiting_link(message, state: FSMContext, bot):
         vin=data.vin,
         avito_price=data.avito_price,
         accidents_count=data.accidents_count,
+        repainted_parts_count=data.repainted_parts_count,
         repair_cost_min=data.repair_cost_min,
         repair_cost_max=data.repair_cost_max,
         autoteka_url=data.autoteka_url,
