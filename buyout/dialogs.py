@@ -71,7 +71,7 @@ def is_seen(listing: Listing) -> bool:
     return listing.key in _load()["seen"]
 
 
-def start(profile_id: str, listing: Listing, first_message: str, account: str) -> dict:
+def start(profile_id: str, listing: Listing, first_message: str, account: str, offer: str = "buyout") -> dict:
     data = _load()
     dialog = {
         "key": listing.key,
@@ -79,6 +79,7 @@ def start(profile_id: str, listing: Listing, first_message: str, account: str) -
         "account": account,
         "listing": listing.to_dict(),
         "status": ACTIVE,
+        "offer": offer,              # что предлагали: buyout / commission / both
         "messages": [{"from": "us", "text": first_message, "at": _now()}],
         "lead": {},
         "created": _now(),
@@ -120,11 +121,24 @@ def first_messages_today(account: str) -> int:
                if d.get("account") == account and d["created"].startswith(today))
 
 
+def deal_type(dialog: dict) -> str:
+    """buyout / commission / unknown — что выбрал клиент (или единственный предложенный вариант)."""
+    kind = (dialog.get("lead") or {}).get("deal_type")
+    if kind in ("buyout", "commission"):
+        return kind
+    return dialog.get("offer") if dialog.get("offer") in ("buyout", "commission") else "unknown"
+
+
 def stats(profile_id: Optional[str] = None) -> dict:
     out = {s: 0 for s in STATUS_TITLES}
+    out["ready_buyout"] = out["ready_commission"] = 0
     replied = 0
     for d in all_dialogs(profile_id):
         out[d["status"]] = out.get(d["status"], 0) + 1
+        if d["status"] == READY:
+            kind = deal_type(d)
+            if kind in ("buyout", "commission"):
+                out[f"ready_{kind}"] += 1
         if any(m["from"] == "client" for m in d["messages"]):
             replied += 1
     out["total"] = sum(out[s] for s in STATUS_TITLES)

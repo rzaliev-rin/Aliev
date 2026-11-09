@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Движок выкупа: раз в несколько минут для каждого включённого профиля
+Движок выкупа и комиссии: раз в несколько минут для каждого включённого профиля
   1) забирает новые ответы продавцов и отвечает им через ИИ-агента;
   2) ищет новые объявления по фильтрам и пишет первое сообщение (с дневным лимитом);
   3) раз в сутки мягко напоминает тем, кто не ответил (один раз);
-  4) готовых к выкупу клиентов отправляет карточкой в рабочий чат салона.
+  4) готовых к выкупу / комиссии клиентов отправляет карточкой в рабочий чат салона.
 
 С ботом MAX связан двумя функциями: notify(chat_id, text) и alert(text).
 """
@@ -37,11 +37,33 @@ def in_working_hours(hours: str, now: Optional[datetime.datetime] = None) -> boo
     return start <= h < end
 
 
-def lead_card(profile: dict, dialog: dict, title: str = "🔥 Клиент готов к выкупу") -> str:
+CARD_TITLES = {
+    "buyout": "🔥 Клиент готов к выкупу",
+    "commission": "🤝 Клиент готов продать на комиссии",
+    "unknown": "🔥 Клиент готов к разговору (выкуп или комиссия — уточнить)",
+}
+
+
+def choose_offer(profile: dict, listing: Listing) -> Optional[str]:
+    """Что предложить по объявлению: buyout / commission / both, или None — не подходит.
+    Машины дороже лимита выкупа (price_to), но до commission_price_to — только на комиссию."""
+    offer = profile.get("offer", "buyout")
+    filters = profile["filters"]
+    if rejection_reason(listing, filters) is None:
+        return offer
+    limit = filters.get("commission_price_to")
+    if (offer == "both" and limit and listing.price and filters.get("price_to")
+            and listing.price > filters["price_to"]
+            and rejection_reason(listing, {**filters, "price_to": limit}) is None):
+        return "commission"
+    return None
+
+
+def lead_card(profile: dict, dialog: dict, title: Optional[str] = None) -> str:
     listing = Listing.from_dict(dialog["listing"])
     lead = dialog.get("lead") or {}
     lines = [
-        title,
+        title or CARD_TITLES[dialogs.deal_type(dialog)],
         f"Салон: {profile['salon']}",
         "",
         f"🚗 {listing.summary()}",
@@ -141,7 +163,8 @@ class BuyoutEngine:
             dialog = dialogs.update(dialog["key"], status=dialogs.ACTIVE)  # передумал — продолжаем разговор
 
         result = await asyncio.to_thread(agent.next_turn, profile, dialog)
-        lead = {**(dialog.get("lead") or {}), **{k: v for k, v in (result.get("lead") or {}).items() if v}}
+        lead = {**(dialog.get("lead") or {}),
+                **{k: v for k, v in (result.get("lead") or {}).items() if v and v != "unknown"}}
         dialog = dialogs.update(dialog["key"], lead=lead, status=result["status"])
         if result["reply"]:
             await self._human_pause(profile["limits"].get("reply_delay_sec"))
@@ -168,21 +191,21 @@ class BuyoutEngine:
                 break
             if dialogs.is_seen(listing) or dialogs.already_contacted(listing):
                 continue
-            reason = rejection_reason(listing, profile["filters"])
-            if reason is None:
+            offer = choose_offer(profile, listing)
+            if offer is not None:
                 listing = await platform.details(listing)
-                reason = rejection_reason(listing, profile["filters"])  # описание/тип продавца — со страницы
-            if reason:
-                dialogs.mark_seen(listing, reason)
+                offer = choose_offer(profile, listing)  # описание/тип продавца — со страницы
+            if offer is None:
+                dialogs.mark_seen(listing, rejection_reason(listing, profile["filters"]) or "фильтр")
                 continue
-            text = await asyncio.to_thread(agent.opening_message, profile, listing)
+            text = await asyncio.to_thread(agent.opening_message, profile, listing, offer)
             if not text:
                 dialogs.mark_seen(listing, "агент не составил сообщение")
                 continue
             if sent:
                 await self._human_pause(profile["limits"].get("first_delay_sec"))
             await platform.send(account, listing, text)
-            dialogs.start(profile["id"], listing, text, account)
+            dialogs.start(profile["id"], listing, text, account, offer)
             sent += 1
         return sent
 

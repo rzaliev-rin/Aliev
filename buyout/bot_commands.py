@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Команды выкупа в боте MAX (только для администраторов).
+Команды выкупа и комиссии в боте MAX (только для администраторов).
 
   /buyout                         — профили, статистика, справка
   /buyout_new <id> <Салон>        — создать профиль
@@ -9,7 +9,7 @@
   /buyout_chat <id>               — выполнить в рабочем чате: лиды пойдут сюда
   /buyout_on <id> | /buyout_off <id>
   /buyout_del <id>
-  /buyout_try <id>                — песочница: агент пишет вам как продавцу
+  /buyout_try <id> [выкуп|комиссия] — песочница: агент пишет вам как продавцу
   /t <текст>                      — ответ агенту в песочнице от имени продавца
   /buyout_mute <ID диалога>       — агент больше не отвечает в этом диалоге (ведёт менеджер)
 """
@@ -32,6 +32,9 @@ _sandboxes = {}  # user_id → {"profile_id", "dialog"}
 
 HELP = (
     "Параметры для /buyout_set (через «;»):\n"
+    "offer — что предлагаем: выкуп, комиссия или оба\n"
+    "commission_terms — условия комиссии (размер, срок договора), commission_advantages — плюсы комиссии\n"
+    "commission_price_to — машины дороже price_to, но до этой суммы, — только на комиссию\n"
     "salon, manager_name, salon_title, address, advantages (через запятую), extra\n"
     "brands, models (через запятую), year_from, year_to, price_from, price_to,\n"
     "mileage_max, owners_max, transmission, only_private (да/нет), stop_words\n"
@@ -40,7 +43,8 @@ HELP = (
     "avito_account / autoru_account / drom_account — имя сохранённого входа\n"
     "per_day — новых продавцов в день, hours — часы работы, например 9-21\n\n"
     "Пример:\n/buyout_set tmn-toyota brands=Toyota,Lexus; year_from=2016; price_to=3 500 000; "
-    "mileage_max=150000; manager_name=Алексей"
+    "mileage_max=150000; manager_name=Алексей; offer=оба; commission_price_to=8 млн; "
+    "commission_terms=комиссия 5% от цены продажи, договор на 45 дней"
 )
 
 
@@ -86,14 +90,15 @@ def _profile_kb(p: dict):
 def _stats_text(profile_id: Optional[str] = None) -> str:
     s = dialogs.stats(profile_id)
     return (f"Написали продавцам: {s['total']}\nОтветили: {s['replied']}\n"
-            f"Готовы к выкупу (переданы в чат): {s[dialogs.READY]}\n"
+            f"Готовы и переданы в чат: {s[dialogs.READY]} "
+            f"(выкуп {s['ready_buyout']}, комиссия {s['ready_commission']})\n"
             f"Ждут менеджера: {s[dialogs.NEED_HUMAN]}\nВ диалоге: {s[dialogs.ACTIVE]}\n"
             f"Отказ: {s[dialogs.DECLINED]} · неактуально: {s[dialogs.NOT_RELEVANT]}")
 
 
 def _list_text() -> str:
     items = profiles.all_profiles()
-    head = "🚗 Выкуп авто — ИИ-агент\n\n"
+    head = "🚗 Выкуп и комиссия — ИИ-агент\n\n"
     if not items:
         return head + ("Профилей пока нет. Создайте первый:\n/buyout_new tmn-toyota Тойота Центр Тюмень\n\n" + HELP)
     return head + _stats_text() + "\n\nПрофили (нажмите, чтобы открыть):"
@@ -290,20 +295,28 @@ def _sample_listing(profile: dict) -> Listing:
 async def cmd_buyout_try(message, command: CommandObject, bot):
     if not await _guard(message):
         return
-    p = profiles.get((command.args or "").strip().lower())
+    args = (command.args or "").split()
+    p = profiles.get(args[0].lower()) if args else None
     if not p:
-        await message.answer(text="Использование: /buyout_try <id профиля>")
+        await message.answer(text="Использование: /buyout_try <id профиля> [выкуп|комиссия]")
         return
+    offer = p.get("offer", "buyout")
+    if len(args) > 1:
+        try:
+            offer = profiles.parse_value("offer", args[1])
+        except ValueError as e:
+            await message.answer(text=str(e))
+            return
     listing = _sample_listing(p)
     await message.answer(text=f"🧪 Песочница. Вы — продавец: {listing.summary()}.\n"
                               "Отвечайте агенту командой /t <текст>. Ничего никуда не отправляется.")
     try:
-        text = await asyncio.to_thread(agent.opening_message, p, listing)
+        text = await asyncio.to_thread(agent.opening_message, p, listing, offer)
     except Exception as e:  # noqa: BLE001
         await message.answer(text=f"Агент недоступен: {type(e).__name__}: {e}\nПроверьте ANTHROPIC_API_KEY в .env.")
         return
     _sandboxes[_uid(message)] = {"profile_id": p["id"], "dialog": {
-        "key": "sandbox", "listing": listing.to_dict(), "lead": {}, "status": dialogs.ACTIVE,
+        "key": "sandbox", "listing": listing.to_dict(), "lead": {}, "status": dialogs.ACTIVE, "offer": offer,
         "messages": [{"from": "us", "text": text}]}}
     await message.answer(text=f"🤖 {text}")
 
@@ -327,7 +340,7 @@ async def cmd_sandbox_reply(message, command: CommandObject, bot):
     except Exception as e:  # noqa: BLE001
         await message.answer(text=f"Агент недоступен: {type(e).__name__}: {e}")
         return
-    dialog["lead"] = {**dialog["lead"], **{k: v for k, v in result["lead"].items() if v}}
+    dialog["lead"] = {**dialog["lead"], **{k: v for k, v in result["lead"].items() if v and v != "unknown"}}
     dialog["status"] = result["status"]
     if result["reply"]:
         dialog["messages"].append({"from": "us", "text": result["reply"]})

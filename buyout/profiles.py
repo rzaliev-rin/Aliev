@@ -29,6 +29,8 @@ DEFAULT_PROFILE = {
     "id": "",
     "salon": "",
     "enabled": False,          # включается вручную, когда всё настроено
+    # Что предлагаем продавцу: buyout — выкуп, commission — продажа на комиссии, both — оба варианта
+    "offer": "both",
     "chat_id": None,           # рабочий чат MAX для лидов
     # Площадки: ссылка поиска (фильтры, настроенные прямо на сайте) и аккаунт,
     # с которого пишем. Аккаунт — имя сохранённой сессии браузера (см. README).
@@ -39,6 +41,9 @@ DEFAULT_PROFILE = {
         "models": [],
         "year_from": None, "year_to": None,
         "price_from": None, "price_to": None,
+        # Машины дороже price_to, но не дороже этой суммы, — предлагаем только комиссию
+        # (выкупать дорого, а продать на комиссии — выгодно). Пусто — не используем.
+        "commission_price_to": None,
         "mileage_max": None,
         "owners_max": None,
         "transmission": [],      # "автомат", "механика", "робот", "вариатор"
@@ -52,6 +57,11 @@ DEFAULT_PROFILE = {
         "address": "",
         "advantages": ["выкуп за один день", "деньги сразу на карту или наличными",
                        "все документы оформляем сами", "можем выкупить авто в кредите"],
+        "commission_terms": "",  # условия комиссии: размер, срок договора, где стоит машина
+        "commission_advantages": ["продаём по рыночной цене — обычно дороже, чем выкуп",
+                                  "машина стоит у нас на площадке, звонки и показы берём на себя",
+                                  "проверка покупателя и юридическое сопровождение сделки",
+                                  "покупателю доступны кредит и трейд-ин — покупателей больше"],
         "extra": "",             # любые доп. инструкции агенту
     },
     "limits": {
@@ -64,7 +74,10 @@ DEFAULT_PROFILE = {
 
 # Короткие имена для /buyout_set → путь в профиле
 _KEYS = {
-    "salon": ("salon",),
+    "salon": ("salon",), "offer": ("offer",),
+    "commission_price_to": ("filters", "commission_price_to"),
+    "commission_terms": ("pitch", "commission_terms"),
+    "commission_advantages": ("pitch", "commission_advantages"),
     "brands": ("filters", "brands"), "models": ("filters", "models"),
     "year_from": ("filters", "year_from"), "year_to": ("filters", "year_to"),
     "price_from": ("filters", "price_from"), "price_to": ("filters", "price_to"),
@@ -81,8 +94,12 @@ for _p in PLATFORMS:
     _KEYS[f"{_p}_on"] = ("platforms", _p, "enabled")
 
 SETTABLE_KEYS = tuple(_KEYS)
-_LIST_KEYS = {"brands", "models", "transmission", "stop_words", "advantages"}
-_INT_KEYS = {"year_from", "year_to", "price_from", "price_to", "mileage_max", "owners_max", "per_day"}
+_LIST_KEYS = {"brands", "models", "transmission", "stop_words", "advantages", "commission_advantages"}
+_INT_KEYS = {"year_from", "year_to", "price_from", "price_to", "mileage_max", "owners_max", "per_day",
+             "commission_price_to"}
+OFFERS = {"buyout": "выкуп", "commission": "комиссия", "both": "выкуп и комиссия"}
+_OFFER_ALIASES = {"выкуп": "buyout", "buyout": "buyout", "комиссия": "commission", "commission": "commission",
+                  "оба": "both", "both": "both", "все": "both", "выкуп и комиссия": "both"}
 _BOOL_KEYS = {"only_private"} | {f"{p}_on" for p in PLATFORMS}
 
 
@@ -139,6 +156,11 @@ def delete(profile_id: str) -> bool:
 
 def parse_value(key: str, raw: str):
     raw = raw.strip()
+    if key == "offer":
+        value = _OFFER_ALIASES.get(raw.lower())
+        if not value:
+            raise ValueError("offer: выкуп, комиссия или оба")
+        return value
     if key in _LIST_KEYS:
         return [x.strip() for x in raw.split(",") if x.strip()]
     if key in _INT_KEYS:
@@ -224,14 +246,18 @@ def problems(profile: dict) -> list:
 def describe(profile: dict) -> str:
     f, pitch, lim = profile["filters"], profile["pitch"], profile["limits"]
 
+    def num(n):
+        return f"{n:,}".replace(",", " ") if isinstance(n, int) else (n or "…")
+
     def rng(a, b, unit=""):
         if a is None and b is None:
             return "любой"
-        return f"{a if a is not None else '…'}–{b if b is not None else '…'}{unit}"
+        return f"{num(a)}–{num(b)}{unit}"
 
     lines = [
         f"🚗 Профиль {profile['id']} — {profile['salon']}",
         f"Статус: {'🟢 работает' if profile['enabled'] else '⏸ выключен'}",
+        f"Предлагаем: {OFFERS.get(profile.get('offer'), profile.get('offer'))}",
         f"Рабочий чат: {profile['chat_id'] or 'не привязан'}",
         "",
         "Площадки:",
@@ -249,6 +275,12 @@ def describe(profile: dict) -> str:
         f"Пробег до: {f['mileage_max'] or 'любой'}; владельцев до: {f['owners_max'] or 'любое число'}",
         f"КПП: {', '.join(f['transmission']) or 'любая'}; только частники: {'да' if f['only_private'] else 'нет'}",
         f"Стоп-слова: {', '.join(f['stop_words']) or '—'}",
+    ]
+    if profile.get("offer") == "both" and f.get("commission_price_to"):
+        lines.append(f"Дороже {num(f['price_to'])} и до {num(f['commission_price_to'])} ₽ — только комиссия")
+    if profile.get("offer") != "buyout":
+        lines.append(f"Условия комиссии: {pitch.get('commission_terms') or 'не заданы (commission_terms=...)'}")
+    lines += [
         "",
         f"Агент представляется: {pitch['manager_name'] or '—'}, {pitch['salon_title'] or profile['salon']}",
         f"Лимит: {lim['first_messages_per_day']} новых продавцов в день на аккаунт, часы {lim['hours']}",

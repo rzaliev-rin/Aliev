@@ -63,14 +63,16 @@ class FakePlatform(Platform):
 
 def _fake_agent(script):
     """script: список ответов модели для next_turn по порядку."""
-    agent.opening_message = lambda profile, listing: f"Добрый день! Я Алексей, {profile['salon']}. Машина ещё продаётся?"
+    agent.opening_message = lambda profile, listing, offer=None: (
+        f"Добрый день! Я Алексей, {profile['salon']} ({offer}). Машина ещё продаётся?")
     agent.followup_message = lambda profile, dialog: "Подскажите, вопрос по выкупу ещё актуален?"
     it = iter(script)
     agent.next_turn = lambda profile, dialog: next(it)
 
 
 def _turn(reply, status="active", **lead):
-    full = {k: "" for k in ("client_name", "phone", "best_time", "price_expectation", "condition", "summary")}
+    full = {"deal_type": "unknown"}
+    full.update({k: "" for k in ("client_name", "phone", "best_time", "price_expectation", "condition", "summary")})
     full.update(lead)
     return {"reply": reply, "status": status, "lead": full}
 
@@ -132,7 +134,7 @@ def test_engine_full_dialog():
         _turn("Понял. Подскажите, по состоянию — были ДТП или окрасы?"),
         _turn("Отлично. Оставьте номер — менеджер наберёт и договоритесь об осмотре.",
               condition="без ДТП"),
-        _turn("Спасибо, Сергей! Менеджер позвонит сегодня после 18.", status="ready",
+        _turn("Спасибо, Сергей! Менеджер позвонит сегодня после 18.", status="ready", deal_type="buyout",
               client_name="Сергей", phone="79991234567", best_time="после 18", summary="Готов к осмотру"),
     ])
     asyncio.run(eng.run_profile(profile, now=NOON))
@@ -151,6 +153,7 @@ def test_engine_full_dialog():
     assert d["lead"]["phone"] == "79991234567" and d["lead"]["condition"] == "без ДТП"
     cards = [t for c, t in notes if c == -100]
     assert len(cards) == 1 and "+7 999 123-45-67" in cards[0] and "Сергей" in cards[0]
+    assert cards[0].startswith("🔥 Клиент готов к выкупу")
 
     # После передачи менеджеру агент молчит, сообщения клиента пересылаются в чат
     sent_before = len(fake.sent)
@@ -183,6 +186,38 @@ def test_limits_hours_and_followup():
     asyncio.run(eng.followups(profile))
     followups = [t for _, t in fake.sent if "актуален" in t]
     assert len(followups) == 2  # по одному на каждый из двух диалогов
+
+
+def test_commission():
+    """Дорогие машины (выше лимита выкупа) — только на комиссию; ещё дороже — пропускаем."""
+    _reset()
+    _profile()
+    profiles.set_values("tmn", "offer=оба; commission_price_to=8 млн; commission_terms=5%, договор 45 дней")
+    profile = profiles.get("tmn")
+    fake = FakePlatform(found=[_listing(1), _listing(2, price=5_500_000), _listing(3, price=9_000_000)])
+    register(fake)
+    notes = []
+    _fake_agent([_turn("Отлично, тогда менеджер позвонит завтра в 11 и всё расскажет по договору.",
+                       status="ready", deal_type="commission", phone="79990001122", best_time="завтра в 11")])
+    eng = _engine(notes)
+    asyncio.run(eng.run_profile(profile, now=NOON))
+    assert [k for k, _ in fake.sent] == ["avito:1", "avito:2"]
+    assert "(both)" in fake.sent[0][1] and "(commission)" in fake.sent[1][1]
+    assert dialogs.get("avito:2")["offer"] == "commission"
+    fake.inbox = [IncomingMessage("avito:2", ["Давайте на комиссию, 79990001122, завтра в 11"])]
+    asyncio.run(eng.run_profile(profile, now=NOON))
+    card = [t for c, t in notes if c == -100][0]
+    assert card.startswith("🤝 Клиент готов продать на комиссии")
+    s = dialogs.stats("tmn")
+    assert s["ready_commission"] == 1 and s["ready_buyout"] == 0
+
+    # Только выкуп: дорогую машину не трогаем
+    _reset()
+    _profile()
+    profiles.set_values("tmn", "offer=выкуп; commission_price_to=8 млн")
+    fake.sent.clear()
+    asyncio.run(eng.run_profile(profiles.get("tmn"), now=NOON))
+    assert [k for k, _ in fake.sent] == ["avito:1"]
 
 
 def test_decline_stops():
@@ -231,6 +266,9 @@ def test_agent_request_shape():
     assert captured["output_config"]["format"]["type"] == "json_schema"
     assert "Алексей" in captured["system"][1]["text"]
     assert "Toyota Camry" in captured["messages"][0]["content"]
+    assert "Что предлагаем: выкуп или комиссию" in captured["messages"][0]["content"]
+    assert "Плюсы комиссии" in captured["system"][1]["text"]
+    assert "commission" in captured["output_config"]["format"]["schema"]["properties"]["lead"]["properties"]["deal_type"]["enum"]
     agent._client = None
 
 
