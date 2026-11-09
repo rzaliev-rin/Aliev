@@ -21,3 +21,9 @@ dist/
 
 # выгрузки /collect_sales
 exports/
+
+# выкуп авто: профили, переписки с продавцами и сохранённые входы в аккаунты площадок
+buyout_profiles.json
+buyout_dialogs.json
+buyout_selectors.json
+buyout_sessions/

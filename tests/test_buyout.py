@@ -1,0 +1,241 @@
+# -*- coding: utf-8 -*-
+"""Выкуп: фильтры, профили, движок (с ненастоящими площадкой и ИИ). Запуск: python tests/test_buyout.py"""
+import asyncio
+import datetime
+import json
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+_tmp = tempfile.mkdtemp()
+os.environ["BUYOUT_PROFILES_PATH"] = os.path.join(_tmp, "profiles.json")
+os.environ["BUYOUT_DIALOGS_PATH"] = os.path.join(_tmp, "dialogs.json")
+
+from buyout import agent, dialogs, engine, profiles  # noqa: E402
+from buyout.listings import Listing, rejection_reason  # noqa: E402
+from buyout.platforms import IncomingMessage, Platform, register  # noqa: E402
+from buyout.platforms.browser import parse_params, parse_title  # noqa: E402
+
+NOON = datetime.datetime.now().replace(hour=12)
+
+
+def _reset():
+    for p in (profiles.STORE_PATH, dialogs.STORE_PATH):
+        if os.path.exists(p):
+            os.remove(p)
+
+
+def _profile():
+    profiles.create("tmn", "Тойота Центр Тюмень")
+    profiles.set_values("tmn", "brands=Toyota; year_from=2016; price_to=3 млн; mileage_max=150000; "
+                               "manager_name=Алексей; avito_on=да; avito_url=https://avito.ru/s; avito_account=acc1")
+    profiles.set_chat("tmn", -100)
+    return profiles.set_enabled("tmn", True)
+
+
+def _listing(i, **kw):
+    base = dict(platform="avito", listing_id=str(i), url=f"https://avito.ru/{i}", title="Toyota Camry, 2019",
+                brand="Toyota", model="Camry", year=2019, price=2_400_000, mileage=80_000 + i * 1000,
+                is_private=True, seller_id=f"s{i}")
+    base.update(kw)
+    return Listing(**base)
+
+
+class FakePlatform(Platform):
+    name = "avito"
+
+    def __init__(self, found=None):
+        self.found = found or []
+        self.sent = []
+        self.inbox = []
+
+    async def search(self, search_url, limit=50):
+        return list(self.found)
+
+    async def send(self, account, listing, text):
+        self.sent.append((listing.key, text))
+
+    async def incoming(self, account):
+        out, self.inbox = self.inbox, []
+        return out
+
+
+def _fake_agent(script):
+    """script: список ответов модели для next_turn по порядку."""
+    agent.opening_message = lambda profile, listing: f"Добрый день! Я Алексей, {profile['salon']}. Машина ещё продаётся?"
+    agent.followup_message = lambda profile, dialog: "Подскажите, вопрос по выкупу ещё актуален?"
+    it = iter(script)
+    agent.next_turn = lambda profile, dialog: next(it)
+
+
+def _turn(reply, status="active", **lead):
+    full = {k: "" for k in ("client_name", "phone", "best_time", "price_expectation", "condition", "summary")}
+    full.update(lead)
+    return {"reply": reply, "status": status, "lead": full}
+
+
+async def _no_sleep(_):
+    return None
+
+
+def _engine(notes):
+    async def notify(chat_id, text):
+        notes.append((chat_id, text))
+
+    async def alert(text):
+        notes.append(("alert", text))
+    return engine.BuyoutEngine(notify, alert, sleep=_no_sleep)
+
+
+def test_filters():
+    f = profiles.DEFAULT_PROFILE["filters"] | {"brands": ["Toyota"], "year_from": 2016, "price_to": 3_000_000,
+                                                "mileage_max": 150_000}
+    assert rejection_reason(_listing(1), f) is None
+    assert rejection_reason(_listing(1, brand="Kia", title="Kia Rio"), f) == "марка"
+    assert rejection_reason(_listing(1, year=2012), f) == "год"
+    assert rejection_reason(_listing(1, price=3_500_000), f) == "цена"
+    assert rejection_reason(_listing(1, mileage=200_000), f) == "пробег"
+    assert rejection_reason(_listing(1, is_private=False), f) == "не частник"
+    assert rejection_reason(_listing(1, description="Битый перед"), f).startswith("стоп-слово")
+
+
+def test_parsing():
+    assert parse_title("Toyota Camry 2.5 AT, 2019") == {"year": 2019, "brand": "Toyota", "model": "Camry"}
+    p = parse_params("2.5 AT (181 л.с.), седан, 87\xa0000 км, 2 владельца")
+    assert p["mileage"] == 87000 and p["transmission"] == "автомат" and p["owners"] == 2
+
+
+def test_profiles():
+    _reset()
+    p = profiles.create("tmn", "Тойота Центр Тюмень")
+    assert profiles.problems(p)  # пока не настроен
+    _reset()
+    p = _profile()
+    assert p["filters"]["price_to"] == 3_000_000 and p["filters"]["brands"] == ["Toyota"]
+    assert profiles.problems(p) == []
+    try:
+        profiles.set_values("tmn", "nonsense=1")
+        raise AssertionError("ожидалась ошибка")
+    except ValueError:
+        pass
+
+
+def test_engine_full_dialog():
+    _reset()
+    profile = _profile()
+    fake = FakePlatform(found=[_listing(1), _listing(2, year=2010), _listing(3)])
+    register(fake)
+    notes = []
+    eng = _engine(notes)
+    _fake_agent([
+        _turn("Понял. Подскажите, по состоянию — были ДТП или окрасы?"),
+        _turn("Отлично. Оставьте номер — менеджер наберёт и договоритесь об осмотре.",
+              condition="без ДТП"),
+        _turn("Спасибо, Сергей! Менеджер позвонит сегодня после 18.", status="ready",
+              client_name="Сергей", phone="79991234567", best_time="после 18", summary="Готов к осмотру"),
+    ])
+    asyncio.run(eng.run_profile(profile, now=NOON))
+    assert [k for k, _ in fake.sent] == ["avito:1", "avito:3"]  # 2010 год отсеян
+    assert dialogs.is_seen(_listing(2))
+
+    # Второй круг: тех же продавцов не трогаем
+    asyncio.run(eng.run_profile(profile, now=NOON))
+    assert len(fake.sent) == 2
+
+    for text in ("Да, продаю", "Нет, не битая", "Сергей, 8 999 123-45-67, после 18"):
+        fake.inbox = [IncomingMessage("avito:1", [text])]
+        asyncio.run(eng.run_profile(profile, now=NOON))
+    d = dialogs.get("avito:1")
+    assert d["status"] == dialogs.READY and d["handed_off"]
+    assert d["lead"]["phone"] == "79991234567" and d["lead"]["condition"] == "без ДТП"
+    cards = [t for c, t in notes if c == -100]
+    assert len(cards) == 1 and "+7 999 123-45-67" in cards[0] and "Сергей" in cards[0]
+
+    # После передачи менеджеру агент молчит, сообщения клиента пересылаются в чат
+    sent_before = len(fake.sent)
+    fake.inbox = [IncomingMessage("avito:1", ["А во сколько точно?"])]
+    asyncio.run(eng.run_profile(profile, now=NOON))
+    assert len(fake.sent) == sent_before
+    assert "А во сколько точно?" in notes[-1][1]
+
+
+def test_limits_hours_and_followup():
+    _reset()
+    profile = _profile()
+    profiles.set_values("tmn", "per_day=2")
+    profile = profiles.get("tmn")
+    fake = FakePlatform(found=[_listing(i) for i in range(1, 6)])
+    register(fake)
+    _fake_agent([])
+    eng = _engine([])
+    asyncio.run(eng.run_profile(profile, now=NOON.replace(hour=23)))
+    assert fake.sent == []  # ночью не пишем
+    asyncio.run(eng.run_profile(profile, now=NOON))
+    assert len(fake.sent) == 2  # дневной лимит
+
+    # Через сутки без ответа — одно напоминание, не больше
+    data = json.load(open(dialogs.STORE_PATH, encoding="utf-8"))
+    for d in data["dialogs"].values():
+        d["created"] = (datetime.datetime.now() - datetime.timedelta(days=2)).isoformat(timespec="seconds")
+    json.dump(data, open(dialogs.STORE_PATH, "w", encoding="utf-8"))
+    asyncio.run(eng.followups(profile))
+    asyncio.run(eng.followups(profile))
+    followups = [t for _, t in fake.sent if "актуален" in t]
+    assert len(followups) == 2  # по одному на каждый из двух диалогов
+
+
+def test_decline_stops():
+    _reset()
+    profile = _profile()
+    fake = FakePlatform(found=[_listing(1)])
+    register(fake)
+    _fake_agent([_turn("Понял, извините за беспокойство. Удачной продажи!", status="declined")])
+    eng = _engine([])
+    asyncio.run(eng.run_profile(profile, now=NOON))
+    fake.inbox = [IncomingMessage("avito:1", ["Не интересно, не пишите"])]
+    asyncio.run(eng.run_profile(profile, now=NOON))
+    assert dialogs.get("avito:1")["status"] == dialogs.DECLINED
+    data = json.load(open(dialogs.STORE_PATH, encoding="utf-8"))
+    for d in data["dialogs"].values():
+        d["created"] = "2020-01-01T00:00:00"
+    json.dump(data, open(dialogs.STORE_PATH, "w", encoding="utf-8"))
+    n = len(fake.sent)
+    asyncio.run(eng.followups(profile))
+    assert len(fake.sent) == n  # отказавшимся не напоминаем
+
+
+def test_agent_request_shape():
+    """Запрос к Claude собирается правильно (без сети)."""
+    import importlib
+    import anthropic
+    import httpx2 as httpx
+    importlib.reload(agent)
+    captured = {}
+
+    def handler(request):
+        captured.update(json.loads(request.content))
+        body = {"id": "msg_1", "type": "message", "role": "assistant", "model": agent.MODEL,
+                "content": [{"type": "text", "text": json.dumps(_turn("Добрый день! Машина ещё в продаже?"),
+                                                                ensure_ascii=False)}],
+                "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 10}}
+        return httpx.Response(200, json=body)
+
+    agent._client = anthropic.Anthropic(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    _reset()
+    profile = _profile()
+    text = agent.opening_message(profile, _listing(1))
+    assert text == "Добрый день! Машина ещё в продаже?"
+    assert captured["fallbacks"] == "default"
+    assert captured["output_config"]["format"]["type"] == "json_schema"
+    assert "Алексей" in captured["system"][1]["text"]
+    assert "Toyota Camry" in captured["messages"][0]["content"]
+    agent._client = None
+
+
+if __name__ == "__main__":
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+            print("OK", name)
