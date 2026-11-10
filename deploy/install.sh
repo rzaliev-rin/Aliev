@@ -41,7 +41,26 @@ if [ -f "$APP/.env" ]; then
 else
   ask "Вставьте ТОКЕН БОТА MAX и нажмите Ввод:" BOT_TOKEN
   while [ -z "$BOT_TOKEN" ]; do ask "Токен обязателен. Вставьте токен бота MAX:" BOT_TOKEN; done
-  ask "Вставьте КЛЮЧ MaxPoster API (или просто Ввод — добавить позже):" MP_KEY
+  ask "Вставьте готовый КЛЮЧ MaxPoster API, если он у вас есть (нет — просто Ввод):" MP_KEY
+  if [ -z "$MP_KEY" ]; then
+    # ключ = base64("email:пароль") служебного аккаунта MaxPoster — соберём его сами
+    ask "Email (логин) служебного аккаунта MaxPoster для бота (или Ввод — добавить позже):" MP_LOGIN
+    if [ -n "$MP_LOGIN" ]; then
+      printf "\nПароль этого аккаунта (при вводе не отображается), затем Ввод:\n> " > /dev/tty
+      IFS= read -rs MP_PASS < /dev/tty; echo > /dev/tty
+      MP_KEY=$(printf "%s:%s" "$MP_LOGIN" "$MP_PASS" | base64 -w0)
+      unset MP_PASS
+      CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 -X POST \
+           https://api.maxposter.ru/partners-api/appraisals \
+           -H "Authorization: Basic $MP_KEY" -H "Content-Type: application/json" \
+           -d '{"limit":1,"offset":0,"orders":["-id"]}' || true)
+      case "$CODE" in
+        200) echo "MaxPoster: доступ проверен ✓" ;;
+        401|403) echo "⚠️ MaxPoster не пустил этот аккаунт (код $CODE) — бот запустится без данных MaxPoster. Напишите Claude." ;;
+        *) echo "MaxPoster: проверить не удалось (код $CODE), ключ сохранён — проверим по первой оценке." ;;
+      esac
+    fi
+  fi
   ask "Вставьте ID Google Таблицы (или просто Ввод — добавить позже):" SHEET_ID
   cat > "$APP/.env" <<ENV
 MAX_BOT_TOKEN=$BOT_TOKEN
