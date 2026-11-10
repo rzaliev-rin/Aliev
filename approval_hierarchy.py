@@ -7,11 +7,14 @@
 Google Таблице, что и история оценок. Формат вкладки (первая строка —
 заголовки, должны совпадать буквально):
 
-Салон | РОП ID | РОП Имя | ДДЦ ID | ДДЦ Имя | УК ID | УК Имя
+Салон | РОП ID | РОП Имя | ДДЦ ID | ДДЦ Имя | УК ID | УК Имя | РОП почта | ДДЦ почта | УК почта
 
 "Салон" — название точно как dealer.companyName в MaxPoster (то же самое,
 что вы указывали в /register_salon). ID — числовые ID пользователей MAX
 (команда /myid). Имя — просто для наглядности, ботом не используется.
+«… почта» — корпоративные адреса (через запятую): сотрудник получает роль,
+как только войдёт в бота по этой почте (код на e-mail). Можно заполнять
+ID, почту или и то и другое — роли складываются.
 
 Правило допуска на первом этапе (в чате салона), статусы метрики v2.0:
   - "Согласовано"                     -> РОП, ДДЦ, УК могут одобрить
@@ -40,11 +43,12 @@ from google.oauth2.service_account import Credentials
 from dealer_chats import normalize_salon_name
 from pricing_engine import STATUS_DDC, UK_STATUSES
 
+import access_store
 from config import GOOGLE_SERVICE_ACCOUNT_FILE, GOOGLE_SHEET_ID
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TAB_NAME = "Иерархия согласования"
-HEADER = ["Салон", "РОП ID", "РОП Имя", "ДДЦ ID", "ДДЦ Имя", "УК ID", "УК Имя"]
+HEADER = ["Салон", "РОП ID", "РОП Имя", "ДДЦ ID", "ДДЦ Имя", "УК ID", "УК Имя", "РОП почта", "ДДЦ почта", "УК почта"]
 
 ROWS_CACHE_TTL_SECONDS = 60
 
@@ -97,6 +101,29 @@ def _ids_from_cell(v) -> set:
     return ids
 
 
+def _email_to_id() -> dict:
+    """{почта: ID в MAX} — кто вошёл в бота по корпоративной почте."""
+    result = {}
+    for uid, info in access_store.list_allowed().items():
+        email = str(info.get("email") or "").strip().lower()
+        if email and uid.isdigit():
+            result[email] = int(uid)
+    return result
+
+
+def _role_ids(row: dict, role: str, emails: Optional[dict] = None) -> set:
+    """ID сотрудников роли в строке: колонка «<роль> ID» + «<роль> почта»."""
+    ids = _ids_from_cell(row.get(f"{role} ID"))
+    cell = str(row.get(f"{role} почта") or "")
+    if cell.strip():
+        emails = _email_to_id() if emails is None else emails
+        for part in cell.replace(";", ",").replace(" ", ",").split(","):
+            uid = emails.get(part.strip().lower())
+            if uid:
+                ids.add(uid)
+    return ids
+
+
 def get_first_stage_approvers(dealer_name: Optional[str], status: Optional[str]) -> set:
     """Кто может нажать «Одобрить»/«Отклонить» в чате салона (первый этап).
 
@@ -113,9 +140,9 @@ def get_first_stage_approvers(dealer_name: Optional[str], status: Optional[str])
         if normalize_salon_name(row.get("Салон", "")) != normalize_salon_name(dealer_name):
             continue
 
-        rop_ids = _ids_from_cell(row.get("РОП ID"))
-        ddc_ids = _ids_from_cell(row.get("ДДЦ ID"))
-        uk_ids = _ids_from_cell(row.get("УК ID"))
+        rop_ids = _role_ids(row, "РОП")
+        ddc_ids = _role_ids(row, "ДДЦ")
+        uk_ids = _role_ids(row, "УК")
 
         if status == STATUS_DDC:
             return ddc_ids | uk_ids
@@ -138,7 +165,7 @@ def get_uk_approvers(dealer_name: Optional[str]) -> set:
     for row in rows:
         if normalize_salon_name(row.get("Салон", "")) != normalize_salon_name(dealer_name):
             continue
-        return _ids_from_cell(row.get("УК ID"))
+        return _role_ids(row, "УК")
 
     return set()
 
@@ -152,13 +179,12 @@ def manager_salons(user_id: Optional[int]) -> set:
     except Exception:  # noqa: BLE001
         return set()
     return {normalize_salon_name(row.get("Салон", "")) for row in rows
-            if row.get("Салон") and any(user_id in _ids_from_cell(row.get(col))
-                                        for col in ("РОП ID", "ДДЦ ID", "УК ID"))}
+            if row.get("Салон") and any(user_id in _role_ids(row, role)
+                                        for role in ("РОП", "ДДЦ", "УК"))}
 
 
 def get_role_ids(dealer_name: Optional[str], role: str) -> set:
     """ID сотрудников роли «РОП» / «ДДЦ» / «УК» в салоне (для утренней сводки)."""
-    column = {"РОП": "РОП ID", "ДДЦ": "ДДЦ ID", "УК": "УК ID"}[role]
     try:
         rows = _get_rows()
     except Exception as e:  # noqa: BLE001
@@ -166,7 +192,7 @@ def get_role_ids(dealer_name: Optional[str], role: str) -> set:
         return set()
     for row in rows:
         if normalize_salon_name(row.get("Салон", "")) == normalize_salon_name(dealer_name):
-            return _ids_from_cell(row.get(column))
+            return _role_ids(row, role)
     return set()
 
 
@@ -174,7 +200,7 @@ def get_pats_approvers() -> set:
     """ID сотрудников, которым разрешено подтверждать приёмку в общем чате
     ПАЦ. Настраивается отдельной строкой на той же вкладке «Иерархия
     согласования»: в колонке «Салон» пишете буквально «ПАЦ», а разрешённые
-    ID перечисляете в колонке «РОП ID» через запятую (остальные колонки в
+    ID перечисляете в колонке «РОП ID» (почты — в «РОП почта») через запятую (остальные колонки в
     этой строке можно оставить пустыми). Пустое множество = ограничение не
     применяется (подтвердить сможет любой участник чата ПАЦ)."""
     try:
@@ -185,7 +211,7 @@ def get_pats_approvers() -> set:
 
     for row in rows:
         if normalize_salon_name(row.get("Салон", "")) == normalize_salon_name("ПАЦ"):
-            return _ids_from_cell(row.get("РОП ID"))
+            return _role_ids(row, "РОП")
 
     return set()
 
@@ -214,11 +240,11 @@ def resolve_role_and_name(dealer_name: Optional[str], user_id: Optional[int]) ->
     for row in rows:
         if normalize_salon_name(row.get("Салон", "")) != normalize_salon_name(dealer_name):
             continue
-        if user_id in _ids_from_cell(row.get("УК ID")):
+        if user_id in _role_ids(row, "УК"):
             return "УК", str(row.get("УК Имя") or "").strip() or None
-        if user_id in _ids_from_cell(row.get("ДДЦ ID")):
+        if user_id in _role_ids(row, "ДДЦ"):
             return "ДДЦ", str(row.get("ДДЦ Имя") or "").strip() or None
-        if user_id in _ids_from_cell(row.get("РОП ID")):
+        if user_id in _role_ids(row, "РОП"):
             return "РОП", str(row.get("РОП Имя") or "").strip() or None
         return None, None
 
