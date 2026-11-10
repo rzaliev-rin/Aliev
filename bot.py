@@ -3028,10 +3028,20 @@ async def _start_quick_calc(state: FSMContext, answer_fn, user_id, user_name):
     await answer_fn(text="🧮 ПРЕДВАРИТЕЛЬНЫЙ РАСЧЁТ\n\nВведите Авито-оценку автомобиля (₽), например 1200000:")
 
 
-@router.message(Command("menu"))
-async def cmd_menu(message, bot):
+@router.message(Command("menu", "start", ignore_case=True))
+async def cmd_menu(message, state: FSMContext, bot):
+    if _is_private_chat(message):
+        await state.clear()  # /start и /menu всегда возвращают в главное меню, а не продолжают оценку
     if await _check_private_access(message, bot):
         await message.answer(text="Выберите действие:", keyboard=main_menu_kb(message.sender.user_id))
+
+
+MENU_WORDS = {"start", "старт", "меню", "menu", "начать"}
+
+
+@router.message(F.body.text.lower().strip().in_(MENU_WORDS))
+async def on_menu_word(message, state: FSMContext, bot):
+    await cmd_menu(message, state, bot)
 
 
 @router.message(Command("help"))
