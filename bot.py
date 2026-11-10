@@ -50,7 +50,7 @@ from maxgram.utils.keyboard import InlineKeyboardBuilder
 from config import (MAX_BOT_TOKEN, ALLOWED_USER_IDS, ADMIN_USER_IDS, OWNER_USER_ID,
                     REMINDER_AFTER_MINUTES, REMINDER_HOURS, DIGEST_TIME, REPORT_WEEKDAY, REPORT_TIME,
                     REPORT_USER_IDS, BACKUP_TIME, BACKUP_KEEP_DAYS, DUPLICATE_DAYS, AVITO_MAX_AGE_DAYS,
-                    CHAT_ROUTES)
+                    CHAT_ROUTES, GOOGLE_SERVICE_ACCOUNT_FILE)
 from pricing_engine import (
     AppraisalInput, calc_appraisal, colors_bucket_from_count,
     get_colors_options, get_condition_options, get_extra_options, get_salon_options, RECEPTION_TYPES,
@@ -3118,6 +3118,20 @@ async def on_free_text(message, state: FSMContext, bot):
     произвольный текст полностью — там бот реагирует только на команды."""
     if not _is_private_chat(message):
         return
+    key_url = _backup_attachment_url(message, key_file=True)
+    if key_url and _is_owner(message.sender.user_id):
+        text = await asyncio.to_thread(_save_google_key, key_url)
+        await message.answer(text=text)
+        if text.startswith("✅"):  # перезапуск, чтобы подхватить ключ (systemd поднимет бота сам)
+            await asyncio.sleep(2)
+            os._exit(0)
+        return
+    backup_url = _backup_attachment_url(message)
+    if backup_url and _is_owner(message.sender.user_id):
+        await message.answer(text="♻️ Восстанавливаю данные из резервной копии…")
+        await message.answer(text=await asyncio.to_thread(_restore_backup, backup_url),
+                             keyboard=main_menu_kb(message.sender.user_id))
+        return
 
     token, deal = deals_store.find_awaiting(message.sender.user_id)
     if token:
@@ -3647,6 +3661,77 @@ async def _send_file_to_user(bot, user_id: int, path: str, text: str) -> bool:
 
 
 _last_file_error = ""
+
+
+def _backup_attachment_url(message, key_file: bool = False) -> Optional[str]:
+    """Ссылка на присланный боту архив «maxbot_backup_….zip» (или, при key_file,
+    на JSON-ключ сервисного аккаунта Google)."""
+    forwarded = getattr(getattr(message, "link", None), "message", None)  # файл можно и переслать
+    attachments = list(getattr(getattr(message, "body", None), "attachments", None) or []) \
+        + list(getattr(forwarded, "attachments", None) or [])
+    for att in attachments:
+        name = (getattr(att, "filename", None) or "").lower()
+        url = getattr(getattr(att, "payload", None), "url", None)
+        if getattr(att, "type", None) != "file" or not url:
+            continue
+        if key_file and name.endswith(".json"):
+            return url
+        if not key_file and name.startswith("maxbot_backup") and name.endswith(".zip"):
+            return url
+    return None
+
+
+def _save_google_key(url: str) -> str:
+    """Владелец прислал JSON-ключ Google (после переезда сервера) — кладём его
+    в GOOGLE_SERVICE_ACCOUNT_FILE."""
+    import requests
+    try:
+        resp = requests.get(url, timeout=(15, 60))
+        resp.raise_for_status()
+        key = json.loads(resp.content.decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return f"⚠️ Не получилось прочитать файл: {e}"
+    if key.get("type") != "service_account" or not key.get("private_key"):
+        return "⚠️ Это не ключ сервисного аккаунта Google (нужен JSON-ключ из Google Cloud)."
+    path = GOOGLE_SERVICE_ACCOUNT_FILE if os.path.isabs(GOOGLE_SERVICE_ACCOUNT_FILE) \
+        else os.path.join(BASE_DIR, GOOGLE_SERVICE_ACCOUNT_FILE)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(key, f)
+    os.chmod(path, 0o600)
+    return (f"✅ Ключ Google сохранён ({key.get('client_email')}). Бот перезапускается — через минуту "
+            "он снова на связи.\nСообщение с ключом лучше удалить из чата.")
+
+
+def _restore_backup(url: str) -> str:
+    """Восстановление после переезда сервера: владелец присылает боту архив из
+    «💾 Резервная копия», бот кладёт из него доступы, заявки, привязки чатов и
+    журнал. Текущие данные перед этим сохраняются отдельной копией."""
+    import io
+    import zipfile
+    import requests
+    try:
+        resp = requests.get(url, timeout=(15, 120))
+        resp.raise_for_status()
+        zf = zipfile.ZipFile(io.BytesIO(resp.content))
+        files = {}
+        for name in BACKUP_FILES:
+            if name in zf.namelist():
+                raw = zf.read(name)
+                json.loads(raw.decode("utf-8"))  # битый файл не кладём
+                files[name] = raw
+    except Exception as e:  # noqa: BLE001
+        logger.error("[restore] %s", e)
+        return f"⚠️ Не получилось прочитать архив: {e}"
+    if not files:
+        return "⚠️ В архиве нет данных бота — это точно файл «💾 Резервная копия»?"
+    _make_backup()  # что было до восстановления — на всякий случай
+    for name, raw in files.items():
+        with open(os.path.join(BASE_DIR, name), "wb") as f:
+            f.write(raw)
+    labels = {"access_store.json": "доступы сотрудников", "deals_store.json": "заявки на согласовании",
+              "dealer_chats.json": "привязки чатов салонов", "appraisals_log.json": "журнал оценок"}
+    return ("✅ Данные восстановлены: " + ", ".join(labels[n] for n in files)
+            + ".\nПроверьте: /salons и /users. Перезапуск не нужен.")
 
 
 async def _run_backup(bot) -> str:

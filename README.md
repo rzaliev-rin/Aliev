@@ -43,6 +43,15 @@
 3. ID таблицы (из адресной строки) укажите в `.env` как `GOOGLE_SHEET_ID`.
 
 ### 4. Хостинг
+**Быстрая установка на новый сервер Ubuntu (в т.ч. переезд):**
+```bash
+curl -sL https://raw.githubusercontent.com/rzaliev-rin/Aliev/claude/bot-metrika-refactor-4t2oii/deploy/install.sh | bash
+```
+Скрипт ставит Python, код, библиотеки, спрашивает токен MAX / ключ MaxPoster / ID таблицы
+и запускает службу `maxbot`. Затем владелец присылает боту в MAX: JSON-ключ Google
+(бот сохранит его и перезапустится) и архив «maxbot_backup_….zip» из «💾 Резервная копия»
+(бот восстановит доступы, заявки, привязки чатов и журнал).
+
 Бот работает через long polling — не нужен ни домен, ни HTTPS, ни белый IP.
 Подойдёт любой недорогой VPS с Python 3.10+:
 
