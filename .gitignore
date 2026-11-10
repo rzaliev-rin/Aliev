@@ -21,3 +21,4 @@ dist/
 
 # выгрузки /collect_sales
 exports/
+email_codes.json

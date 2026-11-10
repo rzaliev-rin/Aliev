@@ -68,7 +68,7 @@ def list_pending() -> dict:
     return _load()["pending"]
 
 
-def approve(user_id: int, name: Optional[str] = None) -> bool:
+def approve(user_id: int, name: Optional[str] = None, email: Optional[str] = None) -> bool:
     """Одобряет заявку. Имя берётся из аргумента, либо из самой заявки (если была)."""
     data = _load()
     key = str(user_id)
@@ -78,6 +78,8 @@ def approve(user_id: int, name: Optional[str] = None) -> bool:
         "name": resolved_name,
         "approved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if email:
+        data["allowed"][key]["email"] = email
     _save(data)
     return True
 

@@ -29,6 +29,20 @@ ADMIN_USER_IDS = {
     int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
 }
 
+# Вход по корпоративной почте: код из 6 цифр приходит на адрес из этих доменов.
+# SMTP-ящик для отправки кодов заводит IT. Пока SMTP_HOST пуст — доступ по
+# заявке администратору (кнопки «Одобрить/Отклонить»), как раньше.
+ACCESS_EMAIL_DOMAINS = [d.strip().lower().lstrip("@") for d in
+                        os.environ.get("ACCESS_EMAIL_DOMAINS", "expocar.ru").split(",") if d.strip()]
+SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+SMTP_SECURITY = (os.environ.get("SMTP_SECURITY", "") or "").strip().lower()  # ssl | starttls | none
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "") or (465 if SMTP_SECURITY in ("", "ssl") else 587))
+if not SMTP_SECURITY:
+    SMTP_SECURITY = "ssl" if SMTP_PORT == 465 else "starttls"
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", "").strip()
+
 # Устаревший способ ограничения доступа (список ID в .env, требует
 # перезапуска при изменении). Теперь основной способ — access_store.py
 # с заявками на доступ через /pending и /approve, но эта переменная

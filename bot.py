@@ -66,6 +66,7 @@ import dealer_chats
 import deals_store
 import approval_hierarchy
 import recommend
+import email_auth
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -754,9 +755,66 @@ async def _register_access_request(bot, user_id: int, name: str) -> bool:
     return is_new
 
 
+EMAIL_LOGIN_TEXT = ("👋 Это бот «Метрика_оценка АСП»: оценка и согласование выкупа авто.\n\n"
+                    "Чтобы войти, напишите вашу корпоративную почту ({domains}) — на неё придёт "
+                    "код из 6 цифр. Введите его сюда, и доступ откроется сразу.")
+
+
+def _email_login_kb():
+    builder = InlineKeyboardBuilder()
+    builder.callback(text="🔄 Начать заново", payload="email_restart")
+    builder.callback(text="Нет корпоративной почты — запросить у администратора", payload="access_admin_req")
+    builder.adjust(1)
+    return builder
+
+
+async def _email_login(answer_fn, user_id: int, name: str, text: str, bot) -> None:
+    """Вход по корпоративной почте: адрес -> код на почту -> код в чат -> доступ."""
+    text = (text or "").strip()
+    if email_auth.looks_like_email(text):
+        _ok, reply = await asyncio.to_thread(email_auth.send_code, user_id, text)
+        await answer_fn(text=reply, keyboard=_email_login_kb())
+        return
+    if email_auth.looks_like_code(text) and email_auth.pending_email(user_id):
+        email, reply = email_auth.check_code(user_id, text)
+        if not email:
+            await answer_fn(text=reply, keyboard=_email_login_kb())
+            return
+        access_store.approve(user_id, name, email=email)
+        logger.info("[access] вход по почте: %s %s %s", user_id, name, email)
+        await answer_fn(text=f"Здравствуйте{', ' + name if name else ''}!\n\n" + ACCESS_GRANTED_TEXT,
+                        keyboard=main_menu_kb(user_id))
+        for admin_id in {OWNER_USER_ID, *ADMIN_USER_IDS} - {None}:
+            await _send_to_user(bot, admin_id, f"🔑 Вошёл по корпоративной почте: {name or 'без имени'}, "
+                                               f"{email}, ID {user_id}. Закрыть доступ — /admin → Пользователи.")
+        return
+    await answer_fn(text=EMAIL_LOGIN_TEXT.format(domains=email_auth.domains_text()), keyboard=_email_login_kb())
+
+
+@router.message_callback(F.payload == "email_restart")
+async def on_email_restart(callback, bot):
+    await callback.answer(text=EMAIL_LOGIN_TEXT.format(domains=email_auth.domains_text()),
+                          keyboard=_email_login_kb())
+
+
+@router.message_callback(F.payload == "access_admin_req")
+async def on_access_admin_req(callback, bot):
+    user_id = _get_user_id(callback)
+    if _allowed(user_id):
+        await callback.answer(text="У вас уже есть доступ.", keyboard=main_menu_kb(user_id))
+        return
+    is_new = await _register_access_request(bot, user_id, _full_name(getattr(callback, "user", None)))
+    await callback.answer(text=f"Ваш ID: {user_id}.\n" + ("Заявка отправлена администратору — после одобрения бот напишет вам."
+                                                          if is_new else "Заявка уже зарегистрирована, ожидайте одобрения."))
+
+
 async def _deny_callback(callback, bot) -> None:
     """Нажатие кнопки меню без доступа: регистрируем заявку (раньше не регистрировалась)."""
     user_id = _get_user_id(callback)
+    if email_auth.enabled() and access_store.is_bot_enabled():
+        await callback.answer(text=EMAIL_LOGIN_TEXT.format(domains=email_auth.domains_text()),
+                              keyboard=_email_login_kb())
+        return
     is_new = await _register_access_request(bot, user_id, _full_name(getattr(callback, "user", None)))
     await callback.answer(
         text=f"У вас нет доступа к этому боту. Ваш ID: {user_id}.\n"
@@ -766,6 +824,9 @@ async def _deny_callback(callback, bot) -> None:
 
 async def _deny_and_request_access(message, user_id: int, bot=None) -> None:
     name = _full_name(getattr(message, "sender", None))
+    if email_auth.enabled() and access_store.is_bot_enabled():
+        await _email_login(message.answer, user_id, name, _text(message), bot)
+        return
     is_new = await _register_access_request(bot, user_id, name)
     if not access_store.is_bot_enabled():
         await message.answer(text="Бот временно отключён администратором. Попробуйте позже.")
@@ -1254,6 +1315,10 @@ async def on_update_price(callback, state: FSMContext, bot):
 @router.bot_started()
 async def on_bot_started(event: BotStarted, bot=None):
     user_id = getattr(event, "user_id", None) or getattr(getattr(event, "sender", None), "user_id", None)
+    if user_id is not None and not _allowed(user_id) and email_auth.enabled() and access_store.is_bot_enabled():
+        await event.answer(text=EMAIL_LOGIN_TEXT.format(domains=email_auth.domains_text()),
+                           keyboard=_email_login_kb())
+        return
     if user_id is not None and not _allowed(user_id):
         await _register_access_request(bot, user_id, _full_name(getattr(event, "user", None)))
         await event.answer(
