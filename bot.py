@@ -2913,12 +2913,34 @@ async def cmd_register_salon(message, command: CommandObject, bot):
         await message.answer(text="Эта команда только для администраторов.")
         return
     if not command.args:
-        await message.answer(text="Использование: /register_salon Название салона (точно как в MaxPoster, поле dealer.companyName)")
+        # без названия — кнопки с салонами из таблицы «ПЦП автосалона»
+        builder = InlineKeyboardBuilder()
+        for i, name in enumerate(get_salon_options()):
+            builder.callback(text=salon_label(name), payload=f"regsalon:{i}")
+        builder.adjust(2)
+        await message.answer(text="Какой салон привязать к этому чату? Нажмите кнопку.\n"
+                                  "(Или: /register_salon Название как в MaxPoster)", keyboard=builder)
         return
     chat_id = message.recipient.chat_id
     name = command.args.strip()
     dealer_chats.set_salon_chat_id(name, chat_id)
     await message.answer(text=f"Готово. Этот чат (ID {chat_id}) привязан к салону «{name}».")
+
+
+@router.message_callback(F.payload.startswith("regsalon:"))
+async def on_register_salon_btn(callback, bot):
+    if not _is_admin(_get_user_id(callback)):
+        await _toast(callback, "Привязать чат может только администратор.")
+        return
+    options = get_salon_options()
+    idx = int(callback.payload.split(":", 1)[1])
+    chat_id = getattr(getattr(getattr(callback, "message", None), "recipient", None), "chat_id", None)
+    if idx >= len(options) or not chat_id:
+        await _toast(callback, "Не получилось — напишите /register_salon ещё раз.")
+        return
+    dealer_chats.set_salon_chat_id(options[idx], chat_id)
+    await callback.answer(text=f"✅ Этот чат привязан к салону «{salon_label(options[idx])}». "
+                               "Карточки согласования по нему будут приходить сюда.")
 
 
 @router.message(Command("register_pats"))
