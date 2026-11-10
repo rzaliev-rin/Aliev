@@ -29,6 +29,11 @@ ADMIN_USER_IDS = {
     int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
 }
 
+# Мини-приложение MAX (кнопка «Открыть»): веб-сервер внутри бота на 127.0.0.1:WEBAPP_PORT,
+# снаружи — https://WEBAPP_URL через Caddy (deploy/set_domain.sh).
+WEBAPP_PORT = int(os.environ.get("WEBAPP_PORT", "8080") or 8080)
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "").strip()
+
 # Вход по корпоративной почте: код из 6 цифр приходит на адрес из этих доменов.
 # SMTP-ящик для отправки кодов заводит IT. Пока SMTP_HOST пуст — доступ по
 # заявке администратору (кнопки «Одобрить/Отклонить»), как раньше.

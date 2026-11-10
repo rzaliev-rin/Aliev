@@ -50,7 +50,7 @@ from maxgram.utils.keyboard import InlineKeyboardBuilder
 from config import (MAX_BOT_TOKEN, ALLOWED_USER_IDS, ADMIN_USER_IDS, OWNER_USER_ID,
                     REMINDER_AFTER_MINUTES, REMINDER_HOURS, DIGEST_TIME, REPORT_WEEKDAY, REPORT_TIME,
                     REPORT_USER_IDS, BACKUP_TIME, BACKUP_KEEP_DAYS, DUPLICATE_DAYS, AVITO_MAX_AGE_DAYS,
-                    CHAT_ROUTES, GOOGLE_SERVICE_ACCOUNT_FILE)
+                    CHAT_ROUTES, GOOGLE_SERVICE_ACCOUNT_FILE, WEBAPP_PORT, WEBAPP_URL)
 from pricing_engine import (
     AppraisalInput, calc_appraisal, colors_bucket_from_count,
     get_colors_options, get_condition_options, get_extra_options, get_salon_options, RECEPTION_TYPES,
@@ -67,6 +67,7 @@ import deals_store
 import approval_hierarchy
 import recommend
 import email_auth
+import webapp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -322,15 +323,22 @@ def skip_kb(payload: str):
     return builder
 
 
+BOT_USER_ID: Optional[int] = None  # ID самого бота в MAX — для кнопки мини-приложения (см. _main)
+
+
 def main_menu_kb(user_id: Optional[int] = None):
     """Главное меню: показывается при входе в бота и после каждой оценки.
     Администраторам, УК, ДДЦ и РОП — ещё кнопка «История оценок»."""
     builder = InlineKeyboardBuilder()
+    sizes = []
+    if WEBAPP_URL and BOT_USER_ID:
+        builder.open_app(text="📱 Открыть приложение", contact_id=BOT_USER_ID)
+        sizes.append(1)
     builder.callback(text="🆕 Новая оценка", payload="new_appraisal")
     builder.callback(text="🧮 Предварительный расчёт", payload="quick_calc")
     builder.callback(text="📋 Мои оценки", payload="my_appraisals")
     builder.callback(text="❓ Помощь", payload="help")
-    sizes = [1, 1, 2]
+    sizes += [1, 1, 2]
     if user_id is not None and _history_scope(user_id)[0]:
         builder.callback(text="🗂 История оценок", payload="hist")
         sizes.append(1)
@@ -1212,9 +1220,20 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
               "по первой или попросить администратора закрыть её («⏳ Оценки в очереди»).",
             keyboard=builder)
         return
-    warnings = _card_warnings(data)
     # Сбрасываем сценарий сразу, чтобы повторное нажатие кнопки не создало вторую карточку.
     await state.clear()
+    approval_note = await _submit_appraisal(bot, data)
+    await callback.answer(
+        text="✅ Отправлено на согласование." + approval_note
+        + "\n\nГотово. Чтобы посчитать следующее авто — жмите кнопку ниже.",
+        keyboard=new_appraisal_kb(_get_user_id(callback)),
+    )
+
+
+async def _submit_appraisal(bot, data: dict) -> str:
+    """Карточка на согласование + журнал + Google Таблица (чат и мини-приложение).
+    Возвращает пояснение для оценщика (куда ушла карточка)."""
+    warnings = _card_warnings(data)
     appraisal_input = _appraisal_input(data)
     result = calc_appraisal(appraisal_input)
     rec_text = recommend.format_recommendation_short(_recommendation(data, result, appraisal_input), _fmt)
@@ -1238,12 +1257,9 @@ async def on_confirm_submit(callback, state: FSMContext, bot):
                               status=result.approval_status, negotiated_price=appraisal_input.negotiated_price)
     except Exception as e:  # noqa: BLE001
         logger.error("Не удалось обновить журнал оценок: %s", e)
-    await callback.answer(
-        text="✅ Отправлено на согласование." + approval_note
-        + "\n\nГотово. Чтобы посчитать следующее авто — жмите кнопку ниже.",
-        keyboard=new_appraisal_kb(_get_user_id(callback)),
-    )
-    await _log_appraisal_safe(manager_name, data.get("vin"), appraisal_input, result, vehicle_info)
+    # Google Таблица — в фоне: её задержка не должна тормозить ответ оценщику
+    asyncio.create_task(_log_appraisal_safe(manager_name, data.get("vin"), appraisal_input, result, vehicle_info))
+    return approval_note
 
 
 @router.message_callback(F.payload == "confirm_submit_dup", StateFilter(AppraisalStates.reviewing_result))
@@ -3242,6 +3258,50 @@ async def on_free_text(message, state: FSMContext, bot):
     await on_waiting_link(message, state, bot)
 
 
+def _maxposter_state(data, manager_name: str, user_id) -> dict:
+    """Данные новой оценки из ответа MaxPoster (то, что бот кладёт в сценарий
+    оценки) — общий код для чата и мини-приложения."""
+    colors_bucket = None
+    if data.repainted_parts_count is not None:
+        colors_bucket = colors_bucket_from_count(data.repainted_parts_count)
+
+    salon = _resolve_salon(data.dealer_name)
+    # тип приёма с учётом бренда салона (Toyota: «Трейд-ин новый» = Trade-In на ПИ)
+    if data.reception_raw:
+        data.reception_type = map_reception(data.reception_raw, salon_info(salon).get("brand") if salon else None)
+
+    return dict(
+        _manager_name=manager_name,
+        _manager_user_id=user_id,
+        vin=data.vin,
+        avito_price=data.avito_price,
+        accidents_count=data.accidents_count,
+        repainted_parts_count=data.repainted_parts_count,
+        repair_cost_min=data.repair_cost_min,
+        repair_cost_max=data.repair_cost_max,
+        autoteka_url=data.autoteka_url,
+        colors=colors_bucket,  # None, если не удалось определить
+        appraisal_purchase_cost=data.appraisal_purchase_cost,
+        appraisal_sale_cost=data.appraisal_sale_cost,
+        presale_preparation_cost=data.presale_preparation_cost,
+        brand=data.brand,
+        model=data.model,
+        year=data.year,
+        mileage=data.mileage,
+        appraiser_name=data.appraiser_name,
+        dealer_name=data.dealer_name,
+        appraisal_id=data.appraisal_id,
+        salon=salon,
+        appraisal_date=data.appraisal_date.isoformat() if data.appraisal_date else None,
+        autohub_ptsp=data.autohub_ptsp,
+        reception_type=data.reception_type if data.reception_type in RECEPTION_TYPES else None,
+        _reception_raw=data.reception_raw if data.reception_type in RECEPTION_TYPES else None,
+        dealer_id=data.dealer_id,
+        lead_source=data.lead_source,
+        market=data.market,
+    )
+
+
 @router.message(StateFilter(AppraisalStates.waiting_link))
 async def on_waiting_link(message, state: FSMContext, bot):
     text = _text(message)
@@ -3271,46 +3331,10 @@ async def on_waiting_link(message, state: FSMContext, bot):
         )
         return
 
-    colors_bucket = None
-    if data.repainted_parts_count is not None:
-        colors_bucket = colors_bucket_from_count(data.repainted_parts_count)
-
-    salon = _resolve_salon(data.dealer_name)
-    # тип приёма с учётом бренда салона (Toyota: «Трейд-ин новый» = Trade-In на ПИ)
-    if data.reception_raw:
-        data.reception_type = map_reception(data.reception_raw, salon_info(salon).get("brand") if salon else None)
-
     await state.clear()  # новая оценка — не тащим ответы из прошлой
-    await state.update_data(
-        _manager_name=manager_name,
-        _manager_user_id=message.sender.user_id,
-        vin=data.vin,
-        avito_price=data.avito_price,
-        accidents_count=data.accidents_count,
-        repainted_parts_count=data.repainted_parts_count,
-        repair_cost_min=data.repair_cost_min,
-        repair_cost_max=data.repair_cost_max,
-        autoteka_url=data.autoteka_url,
-        colors=colors_bucket,  # None, если не удалось определить
-        appraisal_purchase_cost=data.appraisal_purchase_cost,
-        appraisal_sale_cost=data.appraisal_sale_cost,
-        presale_preparation_cost=data.presale_preparation_cost,
-        brand=data.brand,
-        model=data.model,
-        year=data.year,
-        mileage=data.mileage,
-        appraiser_name=data.appraiser_name,
-        dealer_name=data.dealer_name,
-        appraisal_id=data.appraisal_id,
-        salon=salon,
-        appraisal_date=data.appraisal_date.isoformat() if data.appraisal_date else None,
-        autohub_ptsp=data.autohub_ptsp,
-        reception_type=data.reception_type if data.reception_type in RECEPTION_TYPES else None,
-        _reception_raw=data.reception_raw if data.reception_type in RECEPTION_TYPES else None,
-        dealer_id=data.dealer_id,
-        lead_source=data.lead_source,
-        market=data.market,
-    )
+    fields = _maxposter_state(data, manager_name, message.sender.user_id)
+    await state.update_data(**fields)
+    colors_bucket, salon = fields["colors"], fields["salon"]
 
     vehicle_line = " ".join(str(x) for x in [data.brand, data.model, data.year] if x)
     auto = []  # что подставили сами — оценщику не нужно вводить
@@ -4025,6 +4049,15 @@ async def _main():
     with open(RUN_FLAG_PATH, "w") as f:
         f.write(str(time.time()))
     await _set_commands_menu()
+    global BOT_USER_ID
+    try:
+        BOT_USER_ID = (await bot.get_me()).user_id
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось узнать ID бота: %s", e)
+    try:  # мини-приложение; если порт занят — бот работает и без него
+        await webapp.start(sys.modules[__name__], bot, port=WEBAPP_PORT)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Мини-приложение не запустилось: %s", e)
     if crashed_before:
         await _alert_owner(bot, "⚠️ бот был перезапущен после сбоя (прошлая работа завершилась аварийно). "
                                 "Сейчас всё работает.", key="startup")

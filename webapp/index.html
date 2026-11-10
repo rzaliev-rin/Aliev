@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Метрика АСП</title>
+<script src="https://st.max.ru/js/max-web-app.js"></script>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --fg: #15181e; --muted: #687080; --line: #e3e6eb;
+    --accent: #d7141a; --accent-fg: #ffffff; --soft: #fdeced;
+    --ok: #18864b; --warn: #b7791f; --bad: #c53030; --code: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #101217; --card: #1a1d24; --fg: #eef0f4; --muted: #9aa2b1; --line: #2a2f39;
+      --accent: #ff3b42; --accent-fg: #ffffff; --soft: #3a1c1e;
+      --ok: #3ccf7f; --warn: #f0b45a; --bad: #ff6b6b; --code: #12151b;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { padding: 14px 14px 96px; max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 4px 0 12px; }
+  h2 { font-size: 16px; margin: 18px 0 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; margin: 10px 0; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row > * { flex: 1; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+  input, select, textarea { width: 100%; font: inherit; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  button { font: inherit; border: 0; border-radius: 12px; padding: 12px 14px; cursor: pointer;
+    background: var(--accent); color: var(--accent-fg); font-weight: 600; width: 100%; margin-top: 10px; }
+  button.secondary { background: var(--code); color: var(--fg); border: 1px solid var(--line); font-weight: 500; }
+  button.small { width: auto; padding: 8px 12px; margin: 6px 6px 0 0; font-size: 14px; }
+  button:disabled { opacity: .5; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 7px 12px;
+    font-size: 14px; cursor: pointer; }
+  .chip.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  pre { white-space: pre-wrap; word-break: break-word; background: var(--code); border-radius: 10px;
+    padding: 10px 12px; font-size: 14px; line-height: 1.45; font-family: inherit; margin: 8px 0 0; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 14px; }
+  .kv b { font-weight: 600; text-align: right; }
+  .status { font-weight: 700; font-size: 16px; }
+  .error { background: var(--soft); color: var(--bad); border-radius: 10px; padding: 10px 12px; margin: 10px 0; }
+  .note { background: var(--code); border-radius: 10px; padding: 10px 12px; margin: 10px 0; white-space: pre-wrap; }
+  a { color: var(--accent); }
+  nav { position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: var(--card);
+    border-top: 1px solid var(--line); padding: 6px 4px calc(6px + env(safe-area-inset-bottom)); }
+  nav a { flex: 1; text-align: center; text-decoration: none; color: var(--muted); font-size: 11px; padding: 4px 0; position: relative; }
+  nav a .ico { display: block; font-size: 20px; line-height: 1.2; }
+  nav a.on { color: var(--accent); font-weight: 600; }
+  nav a .badge { position: absolute; top: 0; left: 55%; background: var(--accent); color: #fff;
+    border-radius: 999px; font-size: 10px; padding: 1px 6px; }
+  .list-item { border-bottom: 1px solid var(--line); padding: 10px 0; }
+  .list-item:last-child { border-bottom: 0; }
+  .spinner { text-align: center; color: var(--muted); padding: 30px 0; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 14px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main id="app"><div class="spinner">Загрузка…</div></main>
+<nav id="nav" hidden></nav>
+<script src="/static/app.js"></script>
+</body>
+</html>

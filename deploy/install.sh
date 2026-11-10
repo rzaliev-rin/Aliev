@@ -28,6 +28,7 @@ SRC=$(ls -d "$TMP"/src/Aliev-*)
 mkdir -p "$APP/tests"
 cp "$SRC"/*.py "$SRC"/requirements.txt "$SRC"/params_table_v2.csv "$APP"/
 cp "$SRC"/tests/*.py "$APP"/tests/
+mkdir -p "$APP/webapp" && cp "$SRC"/webapp/* "$APP"/webapp/
 rm -rf "$TMP"
 
 echo "=== 3/5 Ставлю библиотеки бота…"
