@@ -3,5 +3,3 @@ python-dotenv>=1.0
 requests>=2.31
 gspread>=6.0
 google-auth>=2.29
-anthropic>=2.6
-playwright>=1.48

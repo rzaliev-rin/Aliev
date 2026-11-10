@@ -36,5 +36,8 @@ class Platform:
         """Новые (непрочитанные) сообщения продавцов на этом аккаунте."""
         raise NotImplementedError
 
+    async def reset_account(self, account: str) -> None:
+        """Забыть открытую сессию аккаунта (после того как прислали новый файл входа)."""
+
     async def close(self) -> None:
         pass

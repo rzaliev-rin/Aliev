@@ -5,10 +5,13 @@
 Запускать на компьютере с экраном (откроется окно браузера):
     python -m buyout.login avito tmn-avito-1
 Войдите в аккаунт (логин, SMS), затем вернитесь в терминал и нажмите Enter.
-Файл buyout_sessions/avito/tmn-avito-1.json скопируйте на сервер в ту же папку.
+Рядом появится файл buyout_session_avito_tmn-avito-1.json — пришлите его боту
+«Выкуп и комиссия» в MAX (владелец или администратор), бот сохранит вход сам.
 """
 import asyncio
 import os
+import re
+import shutil
 import sys
 
 from buyout.platforms.browser import SELECTORS, session_path
@@ -33,11 +36,15 @@ async def main(platform: str, account: str) -> None:
             None, input, "Войдите в аккаунт в открывшемся окне и нажмите Enter здесь… ")
         await ctx.storage_state(path=path)
         await browser.close()
-    print(f"Сессия сохранена: {path}")
+    copy = os.path.abspath(f"buyout_session_{platform}_{account}.json")
+    shutil.copyfile(path, copy)
+    print(f"Вход сохранён: {path}")
+    print(f"Пришлите боту «Выкуп и комиссия» в MAX этот файл: {copy}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3 or sys.argv[1] not in SELECTORS:
-        print("Использование: python -m buyout.login <avito|autoru|drom> <имя_аккаунта>")
+    if len(sys.argv) != 3 or sys.argv[1] not in SELECTORS or not re.fullmatch(r"[a-z0-9_\-]{1,40}", sys.argv[2]):
+        print("Использование: python -m buyout.login <avito|autoru|drom> <имя_аккаунта>\n"
+              "Имя аккаунта — латиница/цифры/«-», например tmn-drom-1")
         sys.exit(1)
     asyncio.run(main(sys.argv[1], sys.argv[2]))

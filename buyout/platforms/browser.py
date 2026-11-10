@@ -348,6 +348,14 @@ class BrowserPlatform(Platform):
         finally:
             await page.close()
 
+    async def reset_account(self, account: str) -> None:
+        ctx = self._contexts.pop(account, None)
+        if ctx is not None:
+            try:
+                await ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     async def close(self) -> None:
         for ctx in self._contexts.values():
             try:

@@ -254,30 +254,39 @@ https://auto.drom.ru/…
 дневным лимитом новых продавцов на аккаунт. Одному продавцу и одной машине
 (даже если она висит на трёх площадках) пишет только один раз.
 
-### Запуск
+### Запуск — отдельный бот
 
-1. `pip install -r requirements.txt` и `playwright install chromium`
-2. В `.env`: `ANTHROPIC_API_KEY=…` (ключ с console.anthropic.com). Без ключа
-   агент выкупа просто не запускается, остальной бот работает как раньше.
-3. Войти в аккаунт площадки (один раз на каждый аккаунт; на компьютере с
-   экраном откроется браузер, войдите и нажмите Enter в терминале):
+Это **отдельный бот MAX** со своим токеном, папкой (`/root/buyoutbot`) и службой
+(`buyoutbot`). Бота метрики не трогает, можно ставить на тот же сервер.
+
+1. В MAX у `@MasterBot` создайте новый бота (`/newbot`), сохраните токен.
+2. На сервере (Ubuntu, под root):
    ```bash
+   curl -sL https://raw.githubusercontent.com/rzaliev-rin/Aliev/claude/peaceful-dijkstra-2793bo/deploy/install_buyout.sh | bash
+   ```
+   Скрипт ставит Python, Chromium, код и спросит токен нового бота, ваш ID в MAX
+   и ключ Anthropic API (console.anthropic.com; можно добавить позже в
+   `/root/buyoutbot/.env`, затем `systemctl restart buyoutbot`).
+3. Вход в аккаунт площадки — на своём компьютере (откроется браузер):
+   ```bash
+   pip install playwright && playwright install chromium
    python -m buyout.login drom tmn-drom-1
    ```
-   Файл `buyout_sessions/drom/tmn-drom-1.json` скопируйте на сервер в ту же папку.
-4. В боте (команды для администраторов):
+   Появится файл `buyout_session_drom_tmn-drom-1.json` — пришлите его новому боту
+   в MAX, он сохранит вход сам.
+4. В новом боте:
    ```
    /buyout_new tmn-toyota Тойота Центр Тюмень
    /buyout_set tmn-toyota manager_name=Алексей; address=Тюмень, ул. …; brands=Toyota,Lexus; year_from=2016; price_to=3,5 млн; mileage_max=150000
    /buyout_set tmn-toyota offer=оба; commission_price_to=8 млн; commission_terms=5% от цены продажи, договор на 45 дней
    /buyout_set tmn-toyota drom_on=да; drom_url=https://auto.drom.ru/tyumen/toyota/…; drom_account=tmn-drom-1
-   /buyout_chat tmn-toyota        ← написать в рабочем чате, куда слать клиентов
+   /buyout_chat tmn-toyota        ← в рабочем чате салона (сначала добавьте туда нового бота)
    /buyout_try tmn-toyota         ← песочница: агент пишет вам как продавцу, отвечайте /t текст
    /buyout_on tmn-toyota          ← запуск
    ```
-   `/buyout` — список профилей, статистика и кнопки «включить/выключить».
-   `/buyout_help` — все параметры. `/buyout_mute <ID диалога>` — агент
-   замолкает в этом диалоге, сообщения клиента пересылаются в чат.
+   `/menu` — справка, `/buyout` — профили и статистика. Доступ: владелец и
+   администраторы (`/admin_add <ID>`, ID сотрудника — команда `/myid`).
+   Журнал: `journalctl -u buyoutbot -n 50 --no-pager`.
 
 Ссылка поиска (`drom_url`, `avito_url`, `autoru_url`) — это адрес страницы
 результатов с фильтрами, настроенными прямо на сайте (регион, марка, цена…).

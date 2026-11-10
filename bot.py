@@ -3430,10 +3430,6 @@ async def fallback(message, bot):
                          keyboard=main_menu_kb(message.sender.user_id))
 
 
-# Выкуп авто (ИИ-агент на Авито/Авто.ру/Дром) — свой роутер подключаем раньше
-# основного: там в конце стоит «поймать всё», и команды /buyout до него бы не дошли.
-from buyout import bot_commands as buyout_commands  # noqa: E402
-dp.include_router(buyout_commands.setup(lambda uid: uid is not None and _is_admin(uid)))
 dp.include_router(router)
 
 
@@ -3922,7 +3918,6 @@ async def _set_commands_menu():
             ("help", "Как пользоваться ботом"),
             ("myid", "Мой ID в MAX"),
             ("admin", "Админ-панель (для администраторов)"),
-            ("buyout", "Выкуп авто: ИИ-агент (для администраторов)"),
         ]])
     except Exception as e:  # noqa: BLE001
         logger.warning("Не удалось задать меню команд: %s", e)
@@ -3939,20 +3934,6 @@ async def _main():
     else:
         await _alert_owner(bot, "✅ бот запущен.", key="startup")
     background = [asyncio.create_task(_reminder_loop(bot)), asyncio.create_task(_scheduler_loop(bot))]  # noqa: F841
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        from buyout.engine import BuyoutEngine, run_forever
-
-        async def _buyout_notify(chat_id: int, text: str) -> None:
-            if not await _send_to_chat(bot, chat_id, text[:3900]):
-                # не теряем клиента: если рабочий чат недоступен — карточку получит владелец
-                await _send_to_user(bot, OWNER_USER_ID, f"⚠️ Не удалось отправить в чат {chat_id}:\n\n{text}"[:3900])
-
-        async def _buyout_alert(text: str) -> None:
-            await _alert_owner(bot, text, key=text[:80])
-
-        background.append(asyncio.create_task(run_forever(BuyoutEngine(_buyout_notify, _buyout_alert))))
-    else:
-        logger.info("Выкуп: ANTHROPIC_API_KEY не задан — агент выкупа не запущен")
     try:
         await dp.start_polling(bot)  # штатная остановка (systemctl stop/restart) — сюда возвращаемся
     finally:
