@@ -15,7 +15,7 @@ import os
 import random
 from typing import Awaitable, Callable, Optional
 
-from buyout import agent, dialogs, profiles
+from buyout import agent, bitrix, dialogs, profiles
 from buyout.listings import Listing, rejection_reason
 from buyout.platforms import PlatformError, get_platform
 
@@ -38,8 +38,8 @@ def in_working_hours(hours: str, now: Optional[datetime.datetime] = None) -> boo
 
 
 CARD_TITLES = {
-    "buyout": "🔥 Клиент готов к выкупу",
-    "commission": "🤝 Клиент готов продать на комиссии",
+    "buyout": "🔥 Выкуп — клиент готов к разговору",
+    "commission": "🤝 Комиссия — клиент готов к разговору",
     "unknown": "🔥 Клиент готов к разговору (выкуп или комиссия — уточнить)",
 }
 
@@ -59,27 +59,35 @@ def choose_offer(profile: dict, listing: Listing) -> Optional[str]:
     return None
 
 
-def lead_card(profile: dict, dialog: dict, title: Optional[str] = None) -> str:
+def _phone(value: str) -> str:
+    if value and value.isdigit() and len(value) == 11:
+        return f"+{value[0]} {value[1:4]} {value[4:7]}-{value[7:9]}-{value[9:]}"
+    return value
+
+
+def lead_card(profile: dict, dialog: dict, title: Optional[str] = None, with_messages: bool = False) -> str:
+    """Короткое сообщение в рабочий чат: кто клиент, резюме, ссылка на авто и на карточку в Битрикс24."""
     listing = Listing.from_dict(dialog["listing"])
     lead = dialog.get("lead") or {}
-    lines = [
-        title or CARD_TITLES[dialogs.deal_type(dialog)],
-        f"Салон: {profile['salon']}",
-        "",
-        f"🚗 {listing.summary()}",
-        listing.url,
-        "",
-    ]
-    for label, key in (("Имя", "client_name"), ("📞 Телефон", "phone"), ("Когда удобно", "best_time"),
-                       ("Ожидания по цене", "price_expectation"), ("Состояние", "condition")):
-        if lead.get(key):
-            value = lead[key]
-            if key == "phone" and value.isdigit() and len(value) == 11:
-                value = f"+{value[0]} {value[1:4]} {value[4:7]}-{value[7:9]}-{value[9:]}"
-            lines.append(f"{label}: {value}")
-    if lead.get("summary"):
-        lines += ["", f"📝 {lead['summary']}"]
-    tail = dialog["messages"][-6:]
+    client = ", ".join(x for x in (lead.get("client_name"), _phone(lead.get("phone", ""))) if x) or "имя и телефон не указаны"
+    lines = [title or CARD_TITLES[dialogs.deal_type(dialog)], "", f"👤 Клиент: {client}"]
+    brief = [lead.get("summary")]
+    if lead.get("best_time"):
+        brief.append(f"Звонить: {lead['best_time']}")
+    if lead.get("price_expectation"):
+        brief.append(f"Ожидания по цене: {lead['price_expectation']}")
+    if lead.get("condition"):
+        brief.append(f"Состояние: {lead['condition']}")
+    brief = [x for x in brief if x]
+    if brief:
+        lines.append("📝 " + ". ".join(x.rstrip(".") for x in brief) + ".")
+    lines += ["", f"🚗 {listing.summary()}", f"Объявление: {listing.url}"]
+    if dialog.get("bitrix_url"):
+        lines.append(f"📋 Битрикс24: {dialog['bitrix_url']}")
+    elif dialog.get("bitrix_error"):
+        lines.append(f"⚠️ Карточка в Битрикс24 не создана: {dialog['bitrix_error']}")
+    lines.append(f"Салон: {profile['salon']}")
+    tail = dialog["messages"][-6:] if (with_messages or not dialog.get("bitrix_url")) else []
     if tail:
         who = {"us": "Мы", "client": "Клиент", "manager": "Менеджер"}
         lines += ["", "Последние сообщения:"] + [f"{who.get(m['from'], m['from'])}: {m['text']}" for m in tail]
@@ -172,11 +180,25 @@ class BuyoutEngine:
             await platform.send(dialog["account"], listing, result["reply"])
             dialog = dialogs.add_message(dialog["key"], "us", result["reply"])
         if result["status"] == dialogs.READY and not dialog.get("handed_off"):
+            dialog = await self.to_bitrix(profile, dialog)
             await self.notify(profile["chat_id"], lead_card(profile, dialog))
             dialogs.update(dialog["key"], handed_off=True)
         elif result["status"] == dialogs.NEED_HUMAN:
             await self.notify(profile["chat_id"],
-                              lead_card(profile, dialog, title="🙋 Нужен менеджер: агент не может ответить сам"))
+                              lead_card(profile, dialog, title="🙋 Нужен менеджер: агент не может ответить сам",
+                                        with_messages=True))
+
+    async def to_bitrix(self, profile: dict, dialog: dict) -> dict:
+        """Карточка клиента в Битрикс24. Ошибка не мешает отправить клиента в чат."""
+        if not bitrix.enabled() or dialog.get("bitrix_url"):
+            return dialog
+        try:
+            url = await asyncio.to_thread(bitrix.create_card, profile, dialog)
+            return dialogs.update(dialog["key"], bitrix_url=url)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Битрикс24: не создана карточка %s", dialog["key"])
+            await self._alert_once("bitrix", f"Битрикс24: не получилось создать карточку клиента — {e}")
+            return dialogs.update(dialog["key"], bitrix_error=str(e)[:200])
 
     # --- новые объявления ----------------------------------------------------
 

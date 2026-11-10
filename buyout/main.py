@@ -107,7 +107,8 @@ MENU_TEXT = (
     "/buyout_set <id> ключ=значение; … — настройки (/buyout_help — все параметры)\n"
     "/buyout_chat <id> — выполнить в рабочем чате салона (бот должен быть добавлен в чат)\n"
     "/buyout_try <id> [выкуп|комиссия] — песочница: агент пишет вам как продавцу, ответ — /t текст\n"
-    "/buyout_mute <ID диалога> — забрать диалог у агента\n\n"
+    "/buyout_mute <ID диалога> — забрать диалог у агента\n"
+    "/bitrix_check — проверить Битрикс24 и узнать ID сотрудников\n\n"
     "Вход в аккаунт площадки: на компьютере выполните python -m buyout.login drom <аккаунт> "
     "и пришлите сюда получившийся файл buyout_session_….json.\n\n"
     "Владелец: /admins, /admin_add <ID>, /admin_del <ID>. Ваш ID: /myid"
@@ -136,6 +137,15 @@ async def cmd_start(message, bot):
 @router.message(Command("myid"))
 async def cmd_myid(message, bot):
     await message.answer(text=f"Ваш ID в MAX: {_uid(message)}\nID этого чата: {message.recipient.chat_id}")
+
+
+@router.message(Command("bitrix_check"))
+async def cmd_bitrix_check(message, bot):
+    if not is_admin(_uid(message)):
+        await message.answer(text="Только для администраторов.")
+        return
+    from buyout import bitrix
+    await message.answer(text=await asyncio.to_thread(bitrix.check))
 
 
 @router.message(Command("admins"))
@@ -248,6 +258,7 @@ async def _set_commands():
             ("menu", "Меню и справка"),
             ("buyout", "Профили салонов и статистика"),
             ("buyout_help", "Все параметры настройки"),
+            ("bitrix_check", "Проверить Битрикс24"),
             ("myid", "Мой ID в MAX"),
         ]])
     except Exception as e:  # noqa: BLE001

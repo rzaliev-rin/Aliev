@@ -46,7 +46,9 @@ else
   ask "Ваш ID в MAX — владелец бота (просто Ввод = 4852272):" OWNER
   OWNER=${OWNER:-4852272}
   ask "Ключ Anthropic API (sk-ant-…; или просто Ввод — добавить позже):" AI_KEY
+  ask "Адрес вебхука Битрикс24 (https://…/rest/…/…/; или просто Ввод — добавить позже):" BX_URL
   sed -e "s|^BUYOUT_BOT_TOKEN=.*|BUYOUT_BOT_TOKEN=$BOT_TOKEN|" \
+      -e "s|^BITRIX_WEBHOOK_URL=.*|BITRIX_WEBHOOK_URL=$BX_URL|" \
       -e "s|^OWNER_USER_ID=.*|OWNER_USER_ID=$OWNER|" \
       -e "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=$AI_KEY|" \
       "$APP/buyout/.env.example" > "$APP/.env"

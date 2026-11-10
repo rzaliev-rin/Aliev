@@ -64,6 +64,8 @@ DEFAULT_PROFILE = {
                                   "покупателю доступны кредит и трейд-ин — покупателей больше"],
         "extra": "",             # любые доп. инструкции агенту
     },
+    # Битрикс24: что создавать и на кого назначать (пусто — общие настройки из .env)
+    "bitrix": {"entity": "", "category": "", "responsible": []},
     "limits": {
         "first_messages_per_day": 25,   # новых продавцов в сутки на аккаунт
         "hours": "9-21",                # когда писать (время сервера)
@@ -87,6 +89,8 @@ _KEYS = {
     "manager_name": ("pitch", "manager_name"), "salon_title": ("pitch", "salon_title"),
     "address": ("pitch", "address"), "advantages": ("pitch", "advantages"), "extra": ("pitch", "extra"),
     "per_day": ("limits", "first_messages_per_day"), "hours": ("limits", "hours"),
+    "bitrix_entity": ("bitrix", "entity"), "bitrix_category": ("bitrix", "category"),
+    "bitrix_responsible": ("bitrix", "responsible"),
 }
 for _p in PLATFORMS:
     _KEYS[f"{_p}_url"] = ("platforms", _p, "search_url")
@@ -156,6 +160,22 @@ def delete(profile_id: str) -> bool:
 
 def parse_value(key: str, raw: str):
     raw = raw.strip()
+    if key == "bitrix_entity":
+        value = {"лид": "lead", "lead": "lead", "сделка": "deal", "deal": "deal", "": "", "-": ""}.get(raw.lower())
+        if value is None:
+            raise ValueError("bitrix_entity: лид или сделка")
+        return value
+    if key == "bitrix_responsible":
+        ids = [x.strip() for x in raw.split(",") if x.strip()]
+        if not all(x.isdigit() for x in ids):
+            raise ValueError("bitrix_responsible: ID сотрудников Битрикс24 через запятую (список — /bitrix_check)")
+        return [int(x) for x in ids]
+    if key == "bitrix_category":
+        if raw in ("", "-"):
+            return ""
+        if not raw.isdigit():
+            raise ValueError("bitrix_category: номер воронки сделок (0 — общая)")
+        return int(raw)
     if key == "offer":
         value = _OFFER_ALIASES.get(raw.lower())
         if not value:
@@ -243,6 +263,13 @@ def problems(profile: dict) -> list:
     return out
 
 
+def _bitrix_line(b: dict) -> str:
+    entity = {"lead": "лид", "deal": "сделка"}.get(b.get("entity") or "", "как в общих настройках")
+    resp = ", ".join(map(str, b.get("responsible") or [])) or "общие"
+    cat = f", воронка {b['category']}" if b.get("category") not in (None, "") else ""
+    return f"{entity}{cat}; ответственные: {resp}"
+
+
 def describe(profile: dict) -> str:
     f, pitch, lim = profile["filters"], profile["pitch"], profile["limits"]
 
@@ -283,6 +310,7 @@ def describe(profile: dict) -> str:
     lines += [
         "",
         f"Агент представляется: {pitch['manager_name'] or '—'}, {pitch['salon_title'] or profile['salon']}",
+        "Битрикс24: " + _bitrix_line(profile.get("bitrix") or {}),
         f"Лимит: {lim['first_messages_per_day']} новых продавцов в день на аккаунт, часы {lim['hours']}",
     ]
     issues = problems(profile)

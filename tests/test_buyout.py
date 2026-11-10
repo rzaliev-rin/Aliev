@@ -153,7 +153,7 @@ def test_engine_full_dialog():
     assert d["lead"]["phone"] == "79991234567" and d["lead"]["condition"] == "без ДТП"
     cards = [t for c, t in notes if c == -100]
     assert len(cards) == 1 and "+7 999 123-45-67" in cards[0] and "Сергей" in cards[0]
-    assert cards[0].startswith("🔥 Клиент готов к выкупу")
+    assert cards[0].startswith("🔥 Выкуп — клиент готов к разговору")
 
     # После передачи менеджеру агент молчит, сообщения клиента пересылаются в чат
     sent_before = len(fake.sent)
@@ -207,7 +207,7 @@ def test_commission():
     fake.inbox = [IncomingMessage("avito:2", ["Давайте на комиссию, 79990001122, завтра в 11"])]
     asyncio.run(eng.run_profile(profile, now=NOON))
     card = [t for c, t in notes if c == -100][0]
-    assert card.startswith("🤝 Клиент готов продать на комиссии")
+    assert card.startswith("🤝 Комиссия — клиент готов к разговору")
     s = dialogs.stats("tmn")
     assert s["ready_commission"] == 1 and s["ready_buyout"] == 0
 
@@ -218,6 +218,86 @@ def test_commission():
     fake.sent.clear()
     asyncio.run(eng.run_profile(profiles.get("tmn"), now=NOON))
     assert [k for k, _ in fake.sent] == ["avito:1"]
+
+
+def test_bitrix():
+    """Готовый клиент → лид/сделка в Битрикс24, ссылка в чате; ответственные — по очереди."""
+    import requests
+    from buyout import bitrix
+    calls = []
+
+    class Resp:
+        def __init__(self, data):
+            self._d = data
+
+        def json(self):
+            return self._d
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append((url.rsplit("/", 1)[1], json))
+        return Resp({"result": 100 + len(calls)})
+
+    requests.post = fake_post
+    bitrix.STATE_PATH = os.path.join(_tmp, "bitrix_state.json")
+    os.environ["BITRIX_WEBHOOK_URL"] = "https://expocar.bitrix24.ru/rest/1/secret/"
+    os.environ["BITRIX_ENTITY"] = "lead"
+    try:
+        _reset()
+        _profile()
+        profiles.set_values("tmn", "bitrix_responsible=7,9")
+        profile = profiles.get("tmn")
+        fake = FakePlatform(found=[_listing(1), _listing(3)])
+        register(fake)
+        notes = []
+        ready = _turn("Спасибо! Менеджер позвонит после 18.", status="ready", deal_type="buyout",
+                      client_name="Сергей", phone="79991234567", best_time="после 18", summary="Готов к осмотру")
+        _fake_agent([ready, dict(ready)])
+        eng = _engine(notes)
+        asyncio.run(eng.run_profile(profile, now=NOON))
+        for key in ("avito:1", "avito:3"):
+            fake.inbox = [IncomingMessage(key, ["Сергей, 89991234567, после 18"])]
+            asyncio.run(eng.run_profile(profile, now=NOON))
+        assert [c[0] for c in calls] == ["crm.lead.add.json", "crm.lead.add.json"]
+        f = calls[0][1]["fields"]
+        assert f["TITLE"].startswith("Выкуп: Toyota Camry") and f["NAME"] == "Сергей"
+        assert f["PHONE"][0]["VALUE"] == "+79991234567" and "Переписка" in f["COMMENTS"]
+        assert [c[1]["fields"]["ASSIGNED_BY_ID"] for c in calls] == [7, 9]  # по очереди
+        card = [t for c, t in notes if c == -100][0]
+        assert "📋 Битрикс24: https://expocar.bitrix24.ru/crm/lead/details/101/" in card
+        assert "👤 Клиент: Сергей, +7 999 123-45-67" in card and "Последние сообщения" not in card
+
+        # Сделка: сначала контакт, потом сделка в воронке профиля
+        calls.clear()
+        _reset()
+        _profile()
+        profiles.set_values("tmn", "bitrix_entity=сделка; bitrix_category=3")
+        register(FakePlatform(found=[_listing(5)]))
+        fake = FakePlatform(found=[_listing(5)])
+        register(fake)
+        _fake_agent([dict(ready)])
+        asyncio.run(eng.run_profile(profiles.get("tmn"), now=NOON))
+        fake.inbox = [IncomingMessage("avito:5", ["да"])]
+        asyncio.run(eng.run_profile(profiles.get("tmn"), now=NOON))
+        assert [c[0] for c in calls] == ["crm.contact.add.json", "crm.deal.add.json"]
+        assert calls[1][1]["fields"]["CONTACT_ID"] == 101 and calls[1][1]["fields"]["CATEGORY_ID"] == 3
+        assert dialogs.get("avito:5")["bitrix_url"].endswith("/crm/deal/details/102/")
+
+        # Битрикс24 недоступен — клиент всё равно приходит в чат, с пометкой
+        requests.post = lambda *a, **k: Resp({"error": "INVALID_CREDENTIALS", "error_description": "Неверный вебхук"})
+        _reset()
+        _profile()
+        fake = FakePlatform(found=[_listing(6)])
+        register(fake)
+        _fake_agent([dict(ready)])
+        notes.clear()
+        asyncio.run(eng.run_profile(profiles.get("tmn"), now=NOON))
+        fake.inbox = [IncomingMessage("avito:6", ["да"])]
+        asyncio.run(eng.run_profile(profiles.get("tmn"), now=NOON))
+        card = [t for c, t in notes if c == -100][0]
+        assert "⚠️ Карточка в Битрикс24 не создана: Битрикс24: Неверный вебхук" in card
+        assert any(c == "alert" for c, _ in notes)
+    finally:
+        os.environ.pop("BITRIX_WEBHOOK_URL", None)
 
 
 def test_decline_stops():
