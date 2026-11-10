@@ -3662,7 +3662,10 @@ _last_file_error = ""
 def _backup_attachment_url(message, key_file: bool = False) -> Optional[str]:
     """Ссылка на присланный боту архив «maxbot_backup_….zip» (или, при key_file,
     на JSON-ключ сервисного аккаунта Google)."""
-    for att in (getattr(getattr(message, "body", None), "attachments", None) or []):
+    forwarded = getattr(getattr(message, "link", None), "message", None)  # файл можно и переслать
+    attachments = list(getattr(getattr(message, "body", None), "attachments", None) or []) \
+        + list(getattr(forwarded, "attachments", None) or [])
+    for att in attachments:
         name = (getattr(att, "filename", None) or "").lower()
         url = getattr(getattr(att, "payload", None), "url", None)
         if getattr(att, "type", None) != "file" or not url:
