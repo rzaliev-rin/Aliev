@@ -212,6 +212,8 @@ def _metrics(result) -> dict:
         "limit_ddc": result.purchase_price_ddc,
         "ceiling": result.ceiling_price,
         "refurbishment": result.refurbishment,
+        "gm2_rop": result.gm2_rop,
+        "gm2_ddc": result.gm2_ddc,
     }
 
 
@@ -492,6 +494,35 @@ def _card_status_line(status, price, metrics: dict) -> str:
     return f"📋 СОГЛАСОВАНИЕ СДЕЛКИ · {_status_text(status)}"
 
 
+def _compare_rows(price, sale, prep, gm2, metrics: dict, commission: bool = False) -> list:
+    """Строки сравнения как в старой форме Excel: Прогноз ДЦ против метрики и предела ДДЦ.
+    arrow — выше/ниже метрики (🔺/🔻), для подготовки — без сравнения."""
+    if not metrics or metrics.get("limit_rop") is None:
+        return []
+    prep = prep or 0
+    sale = sale if sale is not None else metrics.get("ptsp_rop")
+    vp = sale - price - prep if (sale is not None and price is not None and not commission) else None
+    rows = [
+        ("Цена клиенту" if commission else "Закупка", price, metrics.get("limit_rop"), metrics.get("limit_ddc")),
+        ("Продажа", sale, metrics.get("ptsp_rop"), metrics.get("ptsp_ddc")),
+    ]
+    if not commission:
+        rows += [("ВП с НДС", vp, metrics.get("gross_margin"), metrics.get("gross_margin")),
+                 ("Подготовка", prep, metrics.get("refurbishment"), None),
+                 ("GM2", gm2, metrics.get("gm2_rop"), metrics.get("gm2_ddc"))]
+    result = []
+    for label, dc, metric, ddc in rows:
+        if label == "Подготовка" or dc is None or metric is None or round(dc) == round(metric):
+            arrow = "▫️"
+        else:
+            arrow = "🔺" if dc > metric else "🔻"
+        result.append({"label": label, "dc": dc, "metric": metric, "ddc": ddc, "arrow": arrow,
+                       # в пользу компании: закупка ниже метрики, остальное — выше
+                       "good": None if arrow == "▫️" else ((dc < metric) if label in ("Закупка", "Цена клиенту")
+                                                          else (dc > metric))})
+    return result
+
+
 def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_name: str, vin,
                          reception_type: Optional[str] = None, appraiser_sale_cost=None,
                          presale_preparation_cost=None, metrics: Optional[dict] = None,
@@ -527,26 +558,17 @@ def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_nam
     lines.append("   " + " · ".join(condition))
     lines.append("")
 
-    if price is not None:
-        label = "Цена комиссии (клиенту)" if commission else "Запрос бизнеса"
-        lines.append(f"💰 {label} {_fmt(price)} ₽")
-    rop, ddc, ceiling = metrics.get("limit_rop"), metrics.get("limit_ddc"), metrics.get("ceiling")
-    if status in (STATUS_OK, "Согласование РОП") and rop is not None and price is not None:
-        lines.append(f"   в пределах лимита выкупа РОП {_fmt(rop)} ₽ (−{_fmt(rop - price)})")
-    elif rop is not None:
-        limits = [f"потолок {_fmt(ceiling)}", f"ДДЦ {_fmt(ddc)}", f"РОП {_fmt(rop)}"]
-        lines.append(("   Лимиты выкупа (справочно): " if commission else "   Лимиты выкупа: ")
-                     + " · ".join(limits))
-
-    sale = appraiser_sale_cost if appraiser_sale_cost is not None else metrics.get("ptsp_rop")
-    if sale:
-        by_metric = v.get("forecast_by_appraiser") is False or appraiser_sale_cost is None
-        forecast = [f"продажа {_fmt(sale)}"]
-        if price is not None and not commission:
-            forecast.append(f"ВП {_fmt(sale - price - (presale_preparation_cost or 0))}"
-                            + (f" (план метрики {_fmt(metrics['gross_margin'])})"
-                               if metrics.get("gross_margin") is not None else ""))
-        lines.append(("📈 Прогноз по метрике: " if by_metric else "📈 Прогноз бизнеса: ") + " · ".join(forecast))
+    rows = _compare_rows(price, appraiser_sale_cost, presale_preparation_cost, result.gm2_negotiated,
+                         metrics, commission)
+    if rows:
+        lines.append("Прогноз ДЦ  (метрика · ДДЦ)")
+        for row in rows:
+            ref = [_fmt(x) for x in (row["metric"], row["ddc"]) if x is not None]
+            lines.append(f"{row['arrow']} {row['label']}  {_fmt(row['dc']) if row['dc'] is not None else '—'}"
+                         + (f"  ({' · '.join(ref)})" if ref and row["label"] != "Подготовка" else ""))
+        lines.append("")
+    elif price is not None:  # старые сделки без метрики
+        lines.append(f"💰 {'Цена комиссии (клиенту)' if commission else 'Запрос бизнеса'} {_fmt(price)} ₽")
 
     market = [f"Авито {_fmt(appraisal_input.avito_price)}"] if appraisal_input.avito_price else []
     if autohub_ptsp:

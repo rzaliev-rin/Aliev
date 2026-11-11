@@ -244,6 +244,9 @@ def _calc_view(data: dict) -> dict:
         "sale": result.manager_resale_forecast, "margin": result.margin_negotiated if price is not None else None,
         "refurbishment": result.refurbishment,
         "ladder": B._price_ladder(result),
+        "compare": B._compare_rows(price, result.manager_resale_forecast, data.get("presale_preparation_cost"),
+                                   result.gm2_negotiated, metrics,
+                                   appraisal_input.reception_type == B.COMMISSION),
         "recommendation": B._recommendation_text(data, result, appraisal_input) if rec else "",
         "card_preview": B._approval_card_text(
             B._vehicle_info(data), appraisal_input, result, data.get("_manager_name") or "", data.get("vin"),

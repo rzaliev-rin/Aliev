@@ -204,18 +204,19 @@
   }
 
   function resultHtml(r, blocked) {
-    const l = r.limits;
+    const cell = (v) => (v == null ? "—" : num(v));
+    const rows = (r.compare || []).map((x) => {
+      const arrow = x.arrow === "🔺" ? "▲" : x.arrow === "🔻" ? "▼" : "";
+      const cls = x.good === true ? "up" : x.good === false ? "dn" : "";
+      return `<tr><td>${esc(x.label)}</td><td>${cell(x.metric)}</td>
+        <td class="dc">${arrow ? `<span class="${cls}">${arrow}</span> ` : ""}${cell(x.dc)}</td>
+        <td>${x.label === "Подготовка" ? cell(x.metric) : cell(x.ddc)}</td></tr>`;
+    }).join("");
     return `<div class="card" id="result">
       <div class="status">${esc(r.status_line || r.status_text)}</div>
-      <div class="kv" style="margin-top:8px">
-        <span>Категория</span><b>${esc(r.category)}</b>
-        <span>Лимит выкупа РОП</span><b>${money(l.rop)}</b>
-        <span>Предел ДДЦ</span><b>${money(l.ddc)}</b>
-        <span>Потолок выкупа</span><b>${money(l.ceiling)}</b>
-        <span>ПЦП по метрике</span><b>${money(r.ptsp)}</b>
-        <span>Продажа (прогноз)</span><b>${money(r.sale)}</b>
-        <span>ВП</span><b>${money(r.margin)} <span class="muted">(план ${money(r.gross_margin_plan)})</span></b>
-      </div>
+      <div class="muted">${esc(r.category)}</div>
+      ${rows ? `<table class="cmp"><tr><th></th><th>Метрика</th><th>Прогноз ДЦ</th><th>ДДЦ</th></tr>${rows}</table>
+        <div class="muted" style="margin-top:6px">▲▼ — выше/ниже метрики: <span class="up">зелёная</span> — в пользу компании, <span class="dn">красная</span> — против.</div>` : ""}
       ${r.recommendation ? `<pre>${esc(r.recommendation)}</pre>` : ""}
       ${r.card_preview ? `<details><summary>Как увидят согласующие</summary><pre>${linkify(r.card_preview)}</pre></details>` : ""}
       ${blocked ? `<div class="note">Отправка на согласование — после заполнения оценки в MaxPoster.</div>`
