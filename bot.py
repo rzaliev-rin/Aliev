@@ -107,7 +107,7 @@ class AppraisalStates(StatesGroup):
 def _fmt(n) -> str:
     if n is None:
         return "—"
-    return f"{n:,.0f}".replace(",", " ")
+    return f"{n:,.0f}".replace(",", "\u00a0")  # неразрывный пробел: сумма не переносится посередине
 
 
 def _text(message) -> str:
