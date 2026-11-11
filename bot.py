@@ -50,7 +50,7 @@ from maxgram.utils.keyboard import InlineKeyboardBuilder
 from config import (MAX_BOT_TOKEN, ALLOWED_USER_IDS, ADMIN_USER_IDS, OWNER_USER_ID,
                     REMINDER_AFTER_MINUTES, REMINDER_HOURS, DIGEST_TIME, REPORT_WEEKDAY, REPORT_TIME,
                     REPORT_USER_IDS, BACKUP_TIME, BACKUP_KEEP_DAYS, DUPLICATE_DAYS, AVITO_MAX_AGE_DAYS,
-                    CHAT_ROUTES, GOOGLE_SERVICE_ACCOUNT_FILE, WEBAPP_PORT, WEBAPP_URL)
+                    CHAT_ROUTES, GOOGLE_SERVICE_ACCOUNT_FILE, WEBAPP_PORT)
 from pricing_engine import (
     AppraisalInput, calc_appraisal, colors_bucket_from_count,
     get_colors_options, get_condition_options, get_extra_options, get_salon_options, RECEPTION_TYPES,
@@ -328,17 +328,11 @@ def skip_kb(payload: str):
     return builder
 
 
-BOT_USER_ID: Optional[int] = None  # ID самого бота в MAX — для кнопки мини-приложения (см. _main)
-
-
 def main_menu_kb(user_id: Optional[int] = None):
     """Главное меню: показывается при входе в бота и после каждой оценки.
     Администраторам, УК, ДДЦ и РОП — ещё кнопка «История оценок»."""
     builder = InlineKeyboardBuilder()
-    sizes = []
-    if WEBAPP_URL and BOT_USER_ID:
-        builder.open_app(text="📱 Открыть приложение", contact_id=BOT_USER_ID)
-        sizes.append(1)
+    sizes = []  # мини-приложение — родной кнопкой MAX «Открыть» у поля ввода (кнопка в сообщении MAX отклоняет)
     builder.callback(text="🆕 Новая оценка", payload="new_appraisal")
     builder.callback(text="🧮 Предварительный расчёт", payload="quick_calc")
     builder.callback(text="📋 Мои оценки", payload="my_appraisals")
@@ -4109,11 +4103,6 @@ async def _main():
     with open(RUN_FLAG_PATH, "w") as f:
         f.write(str(time.time()))
     await _set_commands_menu()
-    global BOT_USER_ID
-    try:
-        BOT_USER_ID = (await bot.get_me()).user_id
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Не удалось узнать ID бота: %s", e)
     try:  # мини-приложение; если порт занят — бот работает и без него
         await webapp.start(sys.modules[__name__], bot, port=WEBAPP_PORT)
     except Exception as e:  # noqa: BLE001
