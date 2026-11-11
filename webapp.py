@@ -340,6 +340,12 @@ async def api_lookup(user, body):
     except Exception as e:  # noqa: BLE001
         raise ApiError(f"Не получилось найти оценку ({e}).")
     data = _from_maxposter(found, user)
+    # та же оценка уже есть в «Моих» и не отправлялась — продолжаем её, а не плодим дубль
+    same = next((r for r in B.appraisals_log.for_user(user.user_id, limit=100)
+                 if data.get("appraisal_id") and str(r.get("appraisal_id")) == str(data["appraisal_id"])
+                 and r.get("outcome") in (None, "not_sent")), None)
+    if same:
+        data["_record_id"] = same["id"]
     data["_query"] = q
     _drafts[user.user_id] = {"data": data, "ts": time.time()}
     return _state_view(data)
@@ -428,10 +434,45 @@ async def api_decide(user, body):
     return {"ok": True, "text": "\n\n".join(m for m in cb.messages if m) or "Готово."}
 
 
+async def api_open(user, body):
+    """Открыть оценку заново: из «Моих оценок» (record_id) или из «Истории» (q — ссылка/VIN).
+    Данные — свежие из Автохаба, выбранное оценщиком раньше (тех. состояние, доп. данные,
+    понижение категории) подставляется из журнала."""
+    rec = None
+    if body.get("record_id"):
+        rec = next((r for r in B.appraisals_log.for_user(user.user_id, limit=500)
+                    if r.get("id") == body["record_id"]), None)
+        if rec is None:
+            raise ApiError("Оценка не найдена.")
+        q = B._maxposter_link(rec.get("appraisal_id")) or rec.get("vin")
+    else:
+        q = (body.get("q") or "").strip()
+    if not q:
+        raise ApiError("У этой оценки нет ссылки на Автохаб и VIN — открыть нельзя.")
+    try:
+        found = await asyncio.to_thread(B.fetch_appraisal, q)
+    except Exception as e:  # noqa: BLE001
+        raise ApiError(f"Не получилось открыть оценку в Автохабе ({e}).")
+    keep = None
+    if rec is not None:
+        keep = {k: rec.get(k) for k in ("reception_type", "colors", "condition", "extra", "category_override")}
+        keep["_record_id"] = rec.get("id")
+    data = _from_maxposter(found, user, keep=keep)
+    data["_query"] = q
+    _drafts[user.user_id] = {"data": data, "ts": time.time()}
+    view = _state_view(data)
+    deal = B.deals_store.get_deal(rec.get("token")) if rec and rec.get("token") else None
+    if deal:
+        view["open_deal"] = (f"Эта оценка уже на согласовании: {B.STAGE_TEXT.get(deal.get('stage'), deal.get('stage'))}, "
+                             f"{B._status_text(deal.get('approval_status'))}. Повторно отправлять не нужно.")
+    return view
+
+
 async def api_my(user, body):
     items = []
     for rec in B.appraisals_log.for_user(user.user_id, limit=30):
         items.append({
+            "id": rec.get("id"),
             "ts": rec.get("ts"), "car": rec.get("vehicle") or "—", "vin": rec.get("vin"),
             "salon": B.salon_label(rec["salon"]) if rec.get("salon") else rec.get("dealer_name"),
             "price": rec.get("negotiated_price"), "status_text": B._status_text(rec.get("status")),
@@ -522,7 +563,7 @@ async def api_admin_action(user, body):
     raise ApiError("Неизвестное действие.")
 
 
-API = {"me": api_me, "login": api_login, "lookup": api_lookup, "refresh": api_refresh, "calc": api_calc, "submit": api_submit,
+API = {"me": api_me, "login": api_login, "lookup": api_lookup, "refresh": api_refresh, "open": api_open, "calc": api_calc, "submit": api_submit,
        "approvals": api_approvals, "decide": api_decide, "my": api_my, "history": api_history,
        "admin": api_admin, "admin_action": api_admin_action}
 OPEN_METHODS = {"me", "login"}  # доступны и без доступа к боту

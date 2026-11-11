@@ -44,7 +44,7 @@
     });
   }
 
-  function render(html) { app.innerHTML = html; bindLinks(); window.scrollTo(0, 0); }
+  function render(html) { app.innerHTML = html; bindLinks(); bindCopy(); bindOpen(); window.scrollTo(0, 0); }
   function spinner(text) { render(`<div class="spinner">${esc(text || "Загрузка…")}</div>`); }
   function errorBox(e) { return `<div class="error">${esc(e.message || e)}</div>`; }
 
@@ -52,6 +52,47 @@
     app.querySelectorAll("a[data-ext]").forEach((a) => a.addEventListener("click", (ev) => {
       if (WA && WA.openLink) { ev.preventDefault(); WA.openLink(a.href); }
     }));
+  }
+
+  // VIN полностью + кнопка «Скопировать»
+  function vinHtml(vin) {
+    if (!vin) return "";
+    return `<span class="vinrow"><span class="vin">${esc(vin)}</span><button class="copy" data-copy="${esc(vin)}">📋 Скопировать</button></span>`;
+  }
+
+  async function copyText(text, btn) {
+    let ok = false;
+    try { await navigator.clipboard.writeText(text); ok = true; } catch (e) { /* запасной способ ниже */ }
+    if (!ok) {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, text.length);
+      try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+    }
+    if (btn) { const t = btn.textContent; btn.textContent = ok ? "✅ Скопировано" : "Выделите и скопируйте"; setTimeout(() => { btn.textContent = t; }, 1500); }
+  }
+
+  function bindCopy(root) {
+    (root || app).querySelectorAll("button[data-copy]").forEach((b) => b.addEventListener("click", (ev) => {
+      ev.stopPropagation(); copyText(b.dataset.copy, b);
+    }));
+  }
+
+  // открыть оценку заново — из «Моих» (record_id) или «Истории» (ссылка/VIN)
+  async function openAppraisal(body) {
+    tab = "new"; drawNav();
+    spinner("Открываю оценку из Автохаба…");
+    try {
+      const r = await api("open", body);
+      draft = Object.assign(r, { _scroll: false });
+      drawDraft();
+    } catch (e) { screenNew(); app.insertAdjacentHTML("beforeend", errorBox(e)); }
+  }
+
+  function bindOpen(root) {
+    (root || app).querySelectorAll("button[data-open], button[data-openq]").forEach((b) => b.addEventListener("click", () =>
+      openAppraisal(b.dataset.open ? { record_id: b.dataset.open } : { q: b.dataset.openq })));
   }
 
   function $(sel) { return app.querySelector(sel); }
@@ -152,7 +193,7 @@
       <div class="card"><div class="kv">
         ${autoLine("Автосалон", d.salon_label || d.dealer_name)}
         ${autoLine("Оценщик", d.appraiser)}
-        ${autoLine("VIN", d.vin)}
+        <span>VIN</span><b>${d.vin ? vinHtml(d.vin) : '<span class="muted">не заполнено</span>'}</b>
         ${autoLine("Год выпуска", d.year)}
         ${autoLine("Пробег", d.mileage == null ? null : num(d.mileage) + " км")}
         ${ed.includes("reception_type") ? "" : autoLine("Тип приёма", d.reception_type)}
@@ -171,6 +212,7 @@
         ${d.maxposter_url ? `<a href="${esc(d.maxposter_url)}" data-ext="1">Автохаб →</a>` : ""}
         ${d.autoteka_url ? ` · <a href="${esc(d.autoteka_url)}" data-ext="1">Автотека →</a>` : ""}</div>
       <button class="secondary" id="refresh">🔄 Обновить из Автохаба</button></div>`;
+    if (draft.open_deal) html += `<div class="note">📨 ${esc(draft.open_deal)}</div>`;
     if (draft.missing_maxposter && draft.missing_maxposter.length)
       html += `<div class="error">Не заполнено в Автохабе:<br>• ${draft.missing_maxposter.map(esc).join("<br>• ")}<br>
         Без этого на согласование не отправить. Заполните оценку в Автохабе и нажмите «Обновить из Автохаба».</div>`;
@@ -335,10 +377,12 @@
       if (!r.items.length) html += `<div class="card muted">Пока нет оценок.</div>`;
       else html += `<div class="card">` + r.items.map((it) => `<div class="list-item">
           <div><b>${esc(it.car)}</b> <span class="muted">${esc(when(it.ts))}</span></div>
-          <div class="muted">${esc(it.salon || "")}${it.price ? " · " + money(it.price) : ""}${it.vin ? " · VIN …" + esc(String(it.vin).slice(-6)) : ""}</div>
+          <div class="muted">${esc(it.salon || "")}${it.price ? " · " + money(it.price) : ""}</div>
+          ${it.vin ? `<div>VIN ${vinHtml(it.vin)}</div>` : ""}
           <div>${esc(it.status_text)} → ${esc(it.outcome)}</div>
           ${it.last_event ? `<div class="muted">${esc(it.last_event)}</div>` : ""}
-          ${it.maxposter_url ? `<a href="${esc(it.maxposter_url)}" data-ext="1">Автохаб →</a>` : ""}</div>`).join("") + `</div>`;
+          <div class="row-actions">${it.maxposter_url || it.vin ? `<button class="small" data-open="${esc(it.id)}">Открыть оценку</button>` : ""}
+          ${it.maxposter_url ? `<a href="${esc(it.maxposter_url)}" data-ext="1">Автохаб →</a>` : ""}</div></div>`).join("") + `</div>`;
       render(html);
     } catch (e) { render(`<h1>Мои оценки</h1>${errorBox(e)}`); }
   }
@@ -378,10 +422,12 @@
           <div class="muted">${[it.salon, it.avito ? "Авито " + money(it.avito) : "", it.price ? "цена " + money(it.price) : "",
             it.category, it.reception_type, it.appraiser ? "оценщик " + it.appraiser : ""].filter(Boolean).map(esc).join(" · ")}</div>
           <div>${it.sent ? "📨 " + esc(it.status_text) + " → " + esc(it.outcome) : "⚪ на согласование не отправлялась"}</div>
+          ${it.vin ? `<div>VIN ${vinHtml(it.vin)}</div>` : ""}
           ${it.mp_status ? `<div class="muted">Автохаб: ${esc(it.mp_status)}</div>` : ""}
-          ${it.maxposter_url ? `<a href="${esc(it.maxposter_url)}" data-ext="1">Автохаб →</a>` : ""}</div>`).join("")
+          <div class="row-actions">${it.maxposter_url || it.vin ? `<button class="small" data-openq="${esc(it.maxposter_url || it.vin)}">Открыть оценку</button>` : ""}
+          ${it.maxposter_url ? `<a href="${esc(it.maxposter_url)}" data-ext="1">Автохаб →</a>` : ""}</div></div>`).join("")
           : `<div class="muted">За этот период оценок нет.</div>`) + `</div>`;
-      bindLinks();
+      bindLinks(); bindCopy(box); bindOpen(box);
     } catch (e) { box.innerHTML = errorBox(e); }
   }
 

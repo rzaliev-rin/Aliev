@@ -1145,6 +1145,9 @@ def _journal_fields(data: dict, result, appraisal_input) -> dict:
         "appraisal_id": data.get("appraisal_id"),     # для ссылки на MaxPoster в «Истории оценок»
         "mileage": data.get("mileage"),
         "appraiser_name": data.get("appraiser_name"),
+        # что выбрал оценщик — чтобы открыть оценку заново в мини-приложении
+        "colors": data.get("colors"), "condition": data.get("condition"), "extra": data.get("extra"),
+        "category_override": data.get("category_override"),
         **_recommendation_fields(_recommendation(data, result, appraisal_input)),
     }
 
