@@ -10,11 +10,11 @@
   let me = null;
   let tab = "new";
   let draft = null;      // текущая оценка
-  let lastResult = null;
 
   // ------------------------------------------------------------ helpers
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const num = (v) => Math.round(Number(v)).toLocaleString("ru-RU");
   const money = (v) => (v == null || v === "" ? "—" : Math.round(Number(v)).toLocaleString("ru-RU") + " ₽");
   const when = (ts) => {
     if (!ts) return "";
@@ -34,6 +34,14 @@
     try { data = await resp.json(); } catch (e) { /* пусто */ }
     if (!resp.ok || data.error) throw new Error(data.error || ("Ошибка " + resp.status));
     return data;
+  }
+
+  // поле суммы: «2800000» -> «2 800 000» прямо при вводе
+  function moneyInput(el) {
+    el.addEventListener("input", () => {
+      const digits = el.value.replace(/\D/g, "");
+      el.value = digits ? Number(digits).toLocaleString("ru-RU") : "";
+    });
   }
 
   function render(html) { app.innerHTML = html; bindLinks(); window.scrollTo(0, 0); }
@@ -100,7 +108,7 @@
 
   // ------------------------------------------------------------ new appraisal
   function screenNew(msg) {
-    draft = null; lastResult = null;
+    draft = null;
     render(`<h1>Новая оценка</h1>
       <div class="card">
         <label>Ссылка на оценку из MaxPoster, VIN или номер сделки</label>
@@ -116,7 +124,7 @@
     const q = $("#q").value.trim();
     if (!q) return;
     spinner("Ищу оценку в MaxPoster…");
-    try { const r = await api("lookup", { q }); draft = r; drawDraft(); }
+    try { const r = await api("lookup", { q }); draft = Object.assign(r, { _scroll: !!r.result }); drawDraft(); }
     catch (e) { screenNew(); app.insertAdjacentHTML("beforeend", errorBox(e)); }
   }
 
@@ -137,50 +145,65 @@
   }
 
   function drawDraft(errorText) {
-    const d = draft.draft, f = d.fields, o = d.options;
-    const res = lastResult;
+    const d = draft.draft, o = d.options, ed = d.editable || [];
+    const res = draft.result || null;
+    const autoLine = (label, value) => `<span>${label}</span><b>${value == null || value === "" ? '<span class="muted">не заполнено</span>' : esc(value)}</b>`;
     let html = `<h1>${esc(d.car)}</h1>
       <div class="card"><div class="kv">
-        <span>Автосалон</span><b>${esc(d.salon_label || d.dealer_name || "—")}</b>
-        <span>Оценщик</span><b>${esc(d.appraiser || "—")}</b>
-        <span>VIN</span><b>${esc(d.vin || "—")}</b>
+        ${autoLine("Автосалон", d.salon_label || d.dealer_name)}
+        ${autoLine("Оценщик", d.appraiser)}
+        ${autoLine("VIN", d.vin)}
+        ${autoLine("Год выпуска", d.year)}
+        ${autoLine("Пробег", d.mileage == null ? null : num(d.mileage) + " км")}
+        ${ed.includes("reception_type") ? "" : autoLine("Тип приёма", d.reception_type)}
+        ${autoLine("ДТП / окрасов", (d.accidents ?? "—") + " / " + (d.repainted ?? "—"))}
+        ${ed.includes("colors") ? "" : autoLine("Окрасы", d.colors)}
+        ${ed.includes("extra") ? "" : autoLine("Доп. данные", d.extra)}
+      </div></div>
+      <div class="card"><div class="kv">
+        <span>Запрос бизнеса</span><b>${d.negotiated == null ? '<span class="muted">не заполнено</span>' : money(d.negotiated)}</b>
+        <span>Прогноз бизнеса (продажа)</span><b>${d.planned == null ? '<span class="muted">не заполнено</span>' : money(d.planned)}</b>
+        <span>Предпродажная подготовка</span><b>${d.presale ? money(d.presale) : "не запланирована"}</b>
         <span>Авито-оценка</span><b>${money(d.avito_price)}</b>
         <span>ПЦП Автохаб</span><b>${money(d.autohub_ptsp)}</b>
-        <span>ДТП / окрасов</span><b>${esc(d.accidents ?? "—")} / ${esc(d.repainted ?? "—")}</b>
       </div>
-      <div class="muted" style="margin-top:6px">${d.maxposter_url ? `<a href="${esc(d.maxposter_url)}" data-ext="1">MaxPoster →</a>` : ""}
-        ${d.autoteka_url ? ` · <a href="${esc(d.autoteka_url)}" data-ext="1">Автотека →</a>` : ""}</div></div>`;
+      <div class="muted" style="margin-top:6px">Данные из MaxPoster. Ошибка — исправьте в MaxPoster и нажмите «Обновить».
+        ${d.maxposter_url ? `<a href="${esc(d.maxposter_url)}" data-ext="1">MaxPoster →</a>` : ""}
+        ${d.autoteka_url ? ` · <a href="${esc(d.autoteka_url)}" data-ext="1">Автотека →</a>` : ""}</div>
+      <button class="secondary" id="refresh">🔄 Обновить из MaxPoster</button></div>`;
+    if (draft.missing_maxposter && draft.missing_maxposter.length)
+      html += `<div class="error">Не заполнено в MaxPoster:<br>• ${draft.missing_maxposter.map(esc).join("<br>• ")}<br>
+        Без этого на согласование не отправить. Заполните оценку в MaxPoster и нажмите «Обновить из MaxPoster».</div>`;
     if (d.warnings && d.warnings.length) html += `<div class="note">${linkify(d.warnings.join("\n"))}</div>`;
-    html += `<div class="card">
-      <label>Тип приёма</label>${chips("reception_type", o.reception_type, f.reception_type)}
-      <label>Автосалон</label>${chips("salon", o.salon, f.salon)}
-      <div class="row"><div><label>Год выпуска</label><input data-f="year" inputmode="numeric" value="${esc(f.year ?? "")}"></div>
-        <div><label>Пробег, км</label><input data-f="mileage" inputmode="numeric" value="${esc(f.mileage ?? "")}"></div></div>
-      <label>Окрасы</label>${chips("colors", o.colors, f.colors)}
-      <label>Тех. состояние</label>${chips("condition", o.condition, f.condition)}
-      <label>Доп. данные</label>${chips("extra", o.extra, f.extra)}
-    </div>
-    <div class="card">
-      <label>Запрос бизнеса — цена выкупа, ₽</label><input data-f="negotiated" inputmode="numeric" value="${esc(d.negotiated ?? "")}" placeholder="например 1 250 000">
-      <label>Прогноз бизнеса — цена продажи, ₽ (пусто — ПЦП по метрике)</label><input data-f="planned" inputmode="numeric" value="${esc(d.planned ?? "")}">
-      <label>Предпродажная подготовка, ₽</label><input data-f="presale_preparation_cost" inputmode="numeric" value="${esc(f.presale_preparation_cost ?? "")}">
-      <button id="calc">Посчитать</button>
-    </div>`;
+    const labels = { reception_type: "Тип приёма", colors: "Окрасы", condition: "Тех. состояние", extra: "Доп. данные" };
+    if (ed.length) {
+      html += `<div class="card"><div class="muted">Этого нет в MaxPoster — выберите:</div>` +
+        ed.map((k) => `<label>${labels[k]}</label>${chips(k, o[k], d[k])}`).join("") +
+        `<button id="calc">Посчитать</button></div>`;
+    }
     if (errorText) html += `<div class="error">${esc(errorText)}</div>`;
-    if (draft.missing && draft.missing.length && res === null && draft._tried)
-      html += `<div class="error">Заполните: ${esc(draft.missing.join(", "))}</div>`;
-    if (res) html += resultHtml(res);
+    if (draft.missing && draft.missing.length && draft._tried)
+      html += `<div class="error">Выберите: ${esc(draft.missing.join(", "))}</div>`;
+    if (res) html += resultHtml(res, draft.missing_maxposter && draft.missing_maxposter.length);
     render(html);
     app.querySelectorAll(".chips").forEach((c) => c.addEventListener("click", (ev) => {
       const chip = ev.target.closest(".chip"); if (!chip) return;
       c.querySelectorAll(".chip").forEach((x) => x.classList.remove("on")); chip.classList.add("on");
     }));
     on("#calc", calc);
+    on("#refresh", refresh);
     on("#submit", () => submit(false));
-    if (res) $("#result").scrollIntoView({ behavior: "smooth" });
+    if (res && draft._scroll) { $("#result").scrollIntoView({ behavior: "smooth" }); draft._scroll = false; }
   }
 
-  function resultHtml(r) {
+  async function refresh() {
+    const fields = collect();
+    spinner("Обновляю из MaxPoster…");
+    try { draft = await api("refresh", { fields }); drawDraft(); }
+    catch (e) { drawDraft(e.message); }
+  }
+
+  function resultHtml(r, blocked) {
     const l = r.limits;
     return `<div class="card" id="result">
       <div class="status">${esc(r.status_line || r.status_text)}</div>
@@ -194,9 +217,9 @@
         <span>ВП</span><b>${money(r.margin)} <span class="muted">(план ${money(r.gross_margin_plan)})</span></b>
       </div>
       ${r.recommendation ? `<pre>${esc(r.recommendation)}</pre>` : ""}
-      ${r.card_preview ? `<details><summary>Как увидят согласующие</summary><pre>${linkify(r.card_preview)}</pre></details>
-        <button id="submit">📨 Отправить на согласование</button>` :
-        `<div class="note">Укажите «Запрос бизнеса», чтобы отправить на согласование.</div>`}
+      ${r.card_preview ? `<details><summary>Как увидят согласующие</summary><pre>${linkify(r.card_preview)}</pre></details>` : ""}
+      ${blocked ? `<div class="note">Отправка на согласование — после заполнения оценки в MaxPoster.</div>`
+                : `<button id="submit">📨 Отправить на согласование</button>`}
     </div>`;
   }
 
@@ -204,8 +227,7 @@
     const fields = collect();
     try {
       const r = await api("calc", { fields });
-      draft = Object.assign(r, { _tried: true });
-      lastResult = r.result || null;
+      draft = Object.assign(r, { _tried: true, _scroll: true });
       drawDraft();
     } catch (e) { drawDraft(e.message); }
   }
@@ -255,9 +277,10 @@
     if (action === "adjust") {
       const box = document.getElementById("adj-" + token);
       if (!box.innerHTML) {
-        box.innerHTML = `<label>Новая цена выкупа, ₽</label><input id="ap-${token}" inputmode="numeric">
-          <label>Новая ПЦП (цена продажи), ₽</label><input id="af-${token}" inputmode="numeric">
+        box.innerHTML = `<label>Новая цена выкупа, ₽</label><input id="ap-${token}" inputmode="numeric" data-money="1">
+          <label>Новая ПЦП (цена продажи), ₽</label><input id="af-${token}" inputmode="numeric" data-money="1">
           <button class="small" id="as-${token}">Вернуть оценщику на корректировку</button>`;
+        box.querySelectorAll("input[data-money]").forEach(moneyInput);
         document.getElementById("as-" + token).addEventListener("click", () => doDecide(token, "adjust", {
           price: document.getElementById("ap-" + token).value, forecast: document.getElementById("af-" + token).value }));
       }

@@ -117,7 +117,7 @@ def _text(message) -> str:
 
 def _parse_positive(text: str) -> float:
     """Число > 0 из строки вида '1 200 000' или '950000,5'. Бросает ValueError, если не число или ≤ 0."""
-    value = float((text or "").strip().replace(" ", "").replace(" ", "").replace(",", "."))
+    value = float(re.sub(r"\s+", "", text or "").replace(",", "."))
     if value <= 0:
         raise ValueError("amount must be positive")
     return value

@@ -114,38 +114,101 @@ def _options() -> dict:
     }
 
 
+# Что оценщик выбирает сам (этого нет в MaxPoster). Тип приёма и окрасы — только
+# если MaxPoster их не дал; всё остальное (салон, год, пробег, цены) — только из
+# MaxPoster, правится там и подтягивается кнопкой «Обновить из MaxPoster».
+CHOICES = ("reception_type", "colors", "condition", "extra")
+
+
+def _editable(data: dict) -> list:
+    auto = set(data.get("_auto") or [])
+    return [k for k in CHOICES if k not in auto]
+
+
 def _draft_view(data: dict) -> dict:
     car = " ".join(str(x) for x in [data.get("brand"), data.get("model"), data.get("year")] if x)
+    opts = _options()
     return {
         "car": car or "—", "vin": data.get("vin"), "appraiser": data.get("appraiser_name"),
         "dealer_name": data.get("dealer_name"), "salon": data.get("salon"),
         "salon_label": B.salon_label(data["salon"]) if data.get("salon") else None,
+        "year": data.get("year"), "mileage": data.get("mileage"),
         "avito_price": data.get("avito_price"), "accidents": data.get("accidents_count"),
         "repainted": data.get("repainted_parts_count"), "autohub_ptsp": data.get("autohub_ptsp"),
         "maxposter_url": B._maxposter_link(data.get("appraisal_id")), "autoteka_url": data.get("autoteka_url"),
-        "fields": {k: data.get(k) for k in ("reception_type", "salon", "year", "mileage", "colors", "condition",
-                                             "extra", "presale_preparation_cost")},
-        "planned": data.get("manager_resale_forecast", data.get("appraisal_sale_cost")),
-        "negotiated": data.get("negotiated_price", data.get("appraisal_purchase_cost")),
+        "reception_type": data.get("reception_type"), "colors": data.get("colors"),
+        "condition": data.get("condition"), "extra": data.get("extra"),
+        "negotiated": data.get("negotiated_price"), "planned": data.get("manager_resale_forecast"),
+        "presale": data.get("presale_preparation_cost"),
+        "editable": _editable(data),
+        "options": {k: opts[k] for k in CHOICES},
         "warnings": B._appraisal_warnings(data),
-        "options": _options(),
     }
 
 
-def _missing(data: dict) -> list:
+def _missing_choices(data: dict) -> list:
+    labels = {"reception_type": "тип приёма", "colors": "окрасы", "condition": "тех. состояние",
+              "extra": "доп. данные"}
+    return [labels[k] for k in CHOICES if not data.get(k)]
+
+
+def _missing_maxposter(data: dict) -> list:
+    """Что не заполнено в самой оценке MaxPoster (без этого не отправить)."""
     need = []
-    if not data.get("reception_type"):
-        need.append("тип приёма")
     if not data.get("salon") or data["salon"] not in B.get_salon_options():
-        need.append("автосалон")
+        need.append(f"автосалон «{data.get('dealer_name') or '—'}» не найден в таблице салонов — сообщите администратору")
     if not data.get("year"):
         need.append("год выпуска")
     if data.get("mileage") is None:
         need.append("пробег")
-    for key, label in (("colors", "окрасы"), ("condition", "тех. состояние"), ("extra", "доп. данные")):
-        if not data.get(key):
-            need.append(label)
+    if not data.get("avito_price"):
+        need.append("Авито-оценка")
+    if data.get("negotiated_price") is None:
+        need.append("цена закупки (Запрос бизнеса)")
+    if data.get("manager_resale_forecast") is None:
+        need.append("цена продажи (Прогноз бизнеса)")
     return need
+
+
+def _can_calc(data: dict) -> bool:
+    """Для расчёта лимитов хватает салона, года, пробега, Авито и выбранных пунктов."""
+    return (not _missing_choices(data) and data.get("salon") in B.get_salon_options()
+            and data.get("year") and data.get("mileage") is not None and data.get("avito_price"))
+
+
+def _apply_choices(data: dict, fields: dict) -> None:
+    """Принимаем только пункты, которых нет в MaxPoster; остальное из запроса игнорируем."""
+    for key in _editable(data):
+        value = fields.get(key)
+        if value and value in _options()[key]:
+            data[key] = value
+    if fields.get("extra") and "extra" in _editable(data):
+        data["_extra_manual"] = True
+
+
+def _from_maxposter(found, user, keep: Optional[dict] = None) -> dict:
+    data = B._maxposter_state(found, user.first_name or str(user.user_id), user.user_id)
+    data["negotiated_price"] = data.get("appraisal_purchase_cost")
+    data["manager_resale_forecast"] = data.get("appraisal_sale_cost")
+    # «Более 3х ДТП» — автоматически, как в чате
+    if (not data.get("extra") and (data.get("accidents_count") or 0) > B.ACCIDENTS_AUTO_THRESHOLD
+            and B.ACCIDENTS_AUTO_OPTION in B.get_extra_options()):
+        data["extra"] = B.ACCIDENTS_AUTO_OPTION
+    data["_auto"] = [k for k in CHOICES if data.get(k) and k not in ("condition",)]
+    if keep:  # «Обновить из MaxPoster» — выбранное вручную не теряем
+        for key in _editable(data):
+            if keep.get(key):
+                data[key] = keep[key]
+        data["_record_id"] = keep.get("_record_id")
+    return data
+
+
+def _state_view(data: dict) -> dict:
+    view = {"draft": _draft_view(data), "missing": _missing_choices(data),
+            "missing_maxposter": _missing_maxposter(data)}
+    if _can_calc(data):
+        view["result"] = _calc_view(data)
+    return view
 
 
 def _num(v) -> Optional[float]:
@@ -155,25 +218,6 @@ def _num(v) -> Optional[float]:
         return B._parse_amount(str(v))
     except Exception:  # noqa: BLE001
         raise ApiError(f"Не понял число: {v}")
-
-
-def _apply_fields(data: dict, fields: dict) -> None:
-    for key in ("reception_type", "salon", "colors", "condition", "extra"):
-        if key in fields and fields[key]:
-            data[key] = fields[key]
-    if fields.get("extra"):
-        data["_extra_manual"] = True
-    for key in ("year", "mileage"):
-        if fields.get(key) not in (None, ""):
-            data[key] = int(_num(fields[key]))
-    for key, target in (("planned", "manager_resale_forecast"), ("negotiated", "negotiated_price"),
-                        ("presale_preparation_cost", "presale_preparation_cost")):
-        if key in fields:
-            data[target] = _num(fields[key])
-    # «Более 3х ДТП» — автоматически, как в чате
-    if (not data.get("extra") and (data.get("accidents_count") or 0) > B.ACCIDENTS_AUTO_THRESHOLD
-            and B.ACCIDENTS_AUTO_OPTION in B.get_extra_options()):
-        data["extra"] = B.ACCIDENTS_AUTO_OPTION
 
 
 def _calc_view(data: dict) -> dict:
@@ -285,31 +329,42 @@ async def api_lookup(user, body):
         found = await asyncio.to_thread(B.fetch_appraisal, q)
     except Exception as e:  # noqa: BLE001
         raise ApiError(f"Не получилось найти оценку ({e}).")
-    data = B._maxposter_state(found, user.first_name or str(user.user_id), user.user_id)
-    _apply_fields(data, {})
+    data = _from_maxposter(found, user)
+    data["_query"] = q
     _drafts[user.user_id] = {"data": data, "ts": time.time()}
-    return {"draft": _draft_view(data), "missing": _missing(data)}
+    return _state_view(data)
+
+
+async def api_refresh(user, body):
+    """Оценщик поправил оценку в MaxPoster — подтягиваем заново, выбранное вручную сохраняем."""
+    old = _draft(user.user_id)
+    _apply_choices(old, body.get("fields") or {})
+    try:
+        found = await asyncio.to_thread(B.fetch_appraisal, old["_query"])
+    except Exception as e:  # noqa: BLE001
+        raise ApiError(f"Не получилось обновить из MaxPoster ({e}).")
+    data = _from_maxposter(found, user, keep=old)
+    data["_query"] = old["_query"]
+    _drafts[user.user_id] = {"data": data, "ts": time.time()}
+    return _state_view(data)
 
 
 async def api_calc(user, body):
     data = _draft(user.user_id)
-    _apply_fields(data, body.get("fields") or {})
-    missing = _missing(data)
-    view = {"draft": _draft_view(data), "missing": missing}
-    if not missing:
-        view["result"] = _calc_view(data)
-    return view
+    _apply_choices(data, body.get("fields") or {})
+    return _state_view(data)
 
 
 async def api_submit(user, body):
     if not B._allowed(user.user_id):
         raise ApiError("Нет доступа к боту.", 403)
     data = _draft(user.user_id)
-    _apply_fields(data, body.get("fields") or {})
-    if _missing(data):
-        raise ApiError("Заполните: " + ", ".join(_missing(data)))
-    if data.get("negotiated_price") is None:
-        raise ApiError("Укажите «Запрос бизнеса» — цену выкупа, согласованную с клиентом.")
+    _apply_choices(data, body.get("fields") or {})
+    if _missing_choices(data):
+        raise ApiError("Выберите: " + ", ".join(_missing_choices(data)) + ".")
+    if _missing_maxposter(data):
+        raise ApiError("Не заполнено в MaxPoster: " + "; ".join(_missing_maxposter(data))
+                       + ". Заполните оценку в MaxPoster и нажмите «Обновить из MaxPoster».")
     open_deals, _ = B._vin_duplicates(data.get("vin"), data.get("_record_id"))
     if open_deals and not body.get("dup_ok"):
         return {"duplicate": True, "text": "\n".join(B._appraisal_warnings(data))
@@ -457,7 +512,7 @@ async def api_admin_action(user, body):
     raise ApiError("Неизвестное действие.")
 
 
-API = {"me": api_me, "login": api_login, "lookup": api_lookup, "calc": api_calc, "submit": api_submit,
+API = {"me": api_me, "login": api_login, "lookup": api_lookup, "refresh": api_refresh, "calc": api_calc, "submit": api_submit,
        "approvals": api_approvals, "decide": api_decide, "my": api_my, "history": api_history,
        "admin": api_admin, "admin_action": api_admin_action}
 OPEN_METHODS = {"me", "login"}  # доступны и без доступа к боту
