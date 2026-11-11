@@ -526,6 +526,15 @@ def _compare_rows(price, sale, prep, gm2, metrics: dict, commission: bool = Fals
     return result
 
 
+def _category_line(category: str, auto: Optional[str] = None) -> str:
+    """«🏷 КАТЕГОРИЯ В» или «🏷 КАТЕГОРИЯ С — понижена оценщиком (по метрике В)»."""
+    letter = str(category).replace("Категория ", "").strip()
+    line = f"🏷 КАТЕГОРИЯ {letter}"
+    if auto and auto != category:
+        line += f" — понижена оценщиком (по метрике {str(auto).replace('Категория ', '').strip()})"
+    return line
+
+
 def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_name: str, vin,
                          reception_type: Optional[str] = None, appraiser_sale_cost=None,
                          presale_preparation_cost=None, metrics: Optional[dict] = None,
@@ -542,13 +551,12 @@ def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_nam
     salon = salon_label(v["salon"]) if v.get("salon") else (v.get("city") or v.get("dealer_name"))
     who = _short_name(v.get("appraiser_name") or manager_name)
     lines.append(" · ".join(x for x in [salon, reception_type, who] if x))
+    if result.category:
+        lines.append(_category_line(result.category, metrics.get("category_auto")))
     lines.append("")
 
     car = " ".join(str(x) for x in [v.get("brand"), v.get("model"), v.get("year")] if x)
-    category = str(result.category or "").replace("Категория ", "кат. ") or None
-    auto = metrics.get("category_auto")
-    if category and auto and auto != result.category:  # оценщик понизил категорию
-        category += f" (понижена оценщиком, по метрике {str(auto).replace('Категория ', '')})"
+    category = None  # категория — отдельной строкой под статусом (см. выше)
     mileage = f"{_fmt(round(v['mileage'] / 1000))} тыс. км" if v.get("mileage") is not None else None
     owners = f"{int(v['owners'])} влад." if v.get("owners") else None
     lines.append("🚗 " + " · ".join(x for x in [car or "авто", mileage, category, owners] if x))
@@ -598,7 +606,7 @@ def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_nam
     if v.get("autoteka_url"):
         footer.append(f"Автотека: {v['autoteka_url']}")
     if vin:
-        footer.append(f"VIN …{str(vin)[-6:]}" if len(str(vin)) > 8 else f"VIN {vin}")
+        footer.append(f"VIN {vin}")
     if footer:
         lines.append("")
         lines += footer
@@ -1982,7 +1990,9 @@ def _pats_card_text(deal: dict, approved_role_label: str = "") -> str:
         "📋 НА ПОДТВЕРЖДЕНИЕ В АВТОХАБ (ПАЦ)\n"
         f"🏢 Автосалон: {_deal_salon_label(deal)}\n"
         f"Тип контракта: {deal.get('reception_type') or '—'}\n"
-        f"VIN: {deal.get('vin') or '—'}\n"
+        + (_category_line(deal["category"], (deal.get("metrics") or {}).get("category_auto")) + "\n"
+           if deal.get("category") else "")
+        + f"VIN: {deal.get('vin') or '—'}\n"
         + link_line +
         f"Оценщик: {(deal.get('vehicle') or {}).get('appraiser_name') or deal.get('manager_name') or '—'}\n"
         f"Цена выкупа: {_fmt(deal['negotiated_price']) + ' ₽' if deal.get('negotiated_price') else '—'}\n"
