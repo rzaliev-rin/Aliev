@@ -437,11 +437,19 @@
   }
 
   // ------------------------------------------------------------ admin
-  async function screenAdmin(msg) {
+  async function screenAdmin(msg, invite) {
     spinner();
     try {
       const r = await api("admin");
-      let html = `<h1>Админ-панель</h1>${msg ? `<div class="note">${linkify(msg)}</div>` : ""}
+      let html = `<h1>Админ-панель</h1>${msg ? `<div class="note">${linkify(msg)}</div>` : ""}`;
+      if (r.owner) {  // приглашения без почты — только владелец
+        html += `<div class="card"><div class="status">➕ Пригласить сотрудника</div>
+          <div class="muted">Одноразовая ссылка: человек открывает её — и сразу получает доступ, без почты и заявки.</div>
+          ${invite ? `<pre>${linkify(invite)}</pre><button class="secondary" data-copy="${esc(invite)}">📋 Скопировать приглашение</button>
+            <div class="muted">Отправьте этот текст сотруднику в MAX.</div>` : ""}
+          <button data-a="invite">${invite ? "Создать ещё одно" : "Создать приглашение"}</button></div>`;
+      }
+      html += `
         <div class="card"><div class="status">${r.bot_enabled ? "🟢 Бот работает" : "🔴 Бот остановлен"}</div>
           <div class="muted">Заявок в очереди: ${r.queue}</div>
           ${r.bot_enabled ? `<button class="secondary" data-a="bot_stop">⛔ Остановить бота</button>`
@@ -465,7 +473,7 @@
         const a = b.dataset.a;
         if (a === "bot_stop" && !confirm("Остановить бота для всех? Незавершённые заявки будут закрыты.")) return;
         if (a === "revoke_user" && !confirm(`Закрыть доступ: ${b.dataset.name || b.dataset.id}?`)) return;
-        try { const res = await api("admin_action", { action: a, id: b.dataset.id }); screenAdmin(res.text); }
+        try { const res = await api("admin_action", { action: a, id: b.dataset.id }); screenAdmin(res.text, res.invite); }
         catch (e) { screenAdmin("⚠️ " + e.message); }
       }));
     } catch (e) { render(`<h1>Админ-панель</h1>${errorBox(e)}`); }

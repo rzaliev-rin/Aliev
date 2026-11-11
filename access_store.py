@@ -10,6 +10,7 @@
 import json
 import os
 import datetime
+import secrets
 from typing import Optional
 
 STORE_PATH = os.path.join(os.path.dirname(__file__), "access_store.json")
@@ -24,6 +25,7 @@ def _load() -> dict:
         data.setdefault("allowed", {})
         data.setdefault("pending", {})
         data.setdefault("bot_enabled", True)
+        data.setdefault("invites", {})
         # миграция со старого формата (allowed как список ID без имён)
         if isinstance(data["allowed"], list):
             data["allowed"] = {str(uid): {"name": "", "approved_at": ""} for uid in data["allowed"]}
@@ -117,3 +119,39 @@ def set_bot_enabled(enabled: bool) -> None:
     data = _load()
     data["bot_enabled"] = enabled
     _save(data)
+
+
+# ---------------------------------------------------------------- приглашения
+INVITE_DAYS = 7
+
+
+def create_invite(created_by: int, note: str = "") -> str:
+    """Одноразовое приглашение: код вида inv_1a2b3c4d (действует INVITE_DAYS дней)."""
+    data = _load()
+    code = "inv_" + secrets.token_hex(4)
+    data.setdefault("invites", {})[code] = {
+        "created_by": created_by, "note": note,
+        "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "used_by": None,
+    }
+    _save(data)
+    return code
+
+
+def use_invite(code: str, user_id: int, name: Optional[str] = None) -> Optional[dict]:
+    """Открывает доступ по приглашению. Возвращает приглашение или None (нет, использовано, истекло)."""
+    data = _load()
+    inv = data.get("invites", {}).get((code or "").strip().lower())
+    if not inv or inv.get("used_by"):
+        return None
+    created = datetime.datetime.strptime(inv["created_at"], "%Y-%m-%d %H:%M:%S")
+    if datetime.datetime.now() - created > datetime.timedelta(days=INVITE_DAYS):
+        return None
+    inv["used_by"] = user_id
+    inv["used_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    key = str(user_id)
+    data["pending"].pop(key, None)
+    data["allowed"][key] = {"name": name or inv.get("note") or "",
+                            "approved_at": inv["used_at"], "via": "приглашение"}
+    _save(data)
+    return inv
+

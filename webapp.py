@@ -302,7 +302,8 @@ async def api_me(user, body):
     if allowed:
         approvals = sum(1 for _, d in B.deals_store.list_deals().items() if _deal_actions(uid, d))
     return {"user_id": uid, "name": B._full_name(user) or user.first_name, "allowed": allowed,
-            "bot_enabled": B.access_store.is_bot_enabled(), "admin": allowed and B._is_admin(uid),
+            "bot_enabled": B.access_store.is_bot_enabled(),
+        "owner": B._is_owner(user.user_id), "admin": allowed and B._is_admin(uid),
             "history": allowed and B._history_scope(uid)[0], "approvals": approvals,
             "email_login": B.email_auth.enabled(), "email_domains": B.email_auth.domains_text()}
 
@@ -544,6 +545,10 @@ async def api_admin(user, body):
 async def api_admin_action(user, body):
     _require_admin(user)
     action, target = body.get("action"), body.get("id")
+    if action == "invite":
+        if not B._is_owner(user.user_id):
+            raise ApiError("Приглашать сотрудников может только владелец бота.", 403)
+        return {"ok": True, "invite": B._invite_text(B.access_store.create_invite(user.user_id))}
     if action == "approve_user":
         B.access_store.approve(int(target))
         await B._send_to_user(BOT, int(target), B.ACCESS_GRANTED_TEXT, keyboard=B.main_menu_kb(int(target)))

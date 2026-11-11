@@ -846,6 +846,47 @@ async def on_access_admin_req(callback, bot):
                                                           if is_new else "Заявка уже зарегистрирована, ожидайте одобрения."))
 
 
+BOT_USERNAME: Optional[str] = None  # @имя бота в MAX — для ссылки-приглашения (см. _main)
+INVITE_RE = re.compile(r"inv_[0-9a-f]{8}", re.IGNORECASE)
+
+
+def _invite_text(code: str) -> str:
+    """Текст приглашения — администратор пересылает его сотруднику."""
+    link = f"https://max.ru/{BOT_USERNAME}?start={code}" if BOT_USERNAME else None
+    return ("Приглашение в бот «Метрика_оценка АСП» (оценка и согласование выкупа).\n\n"
+            + (f"Откройте ссылку и нажмите «Начать»:\n{link}\n\n" if link else "")
+            + f"{'Если ссылка не открылась — н' if link else 'Н'}айдите в MAX бота «Метрика_оценка АСП» "
+              f"и отправьте ему код:\n{code}\n\n"
+            + f"Приглашение одноразовое, действует {access_store.INVITE_DAYS} дней.")
+
+
+async def _accept_invite(bot, code: str, user_id: int, name: str, answer_fn) -> bool:
+    """Сотрудник пришёл по приглашению: открываем доступ и сообщаем пригласившему."""
+    inv = access_store.use_invite(code, user_id, name)
+    if not inv:
+        await answer_fn(text="Это приглашение уже использовано или устарело. Попросите администратора прислать новое.")
+        return False
+    await answer_fn(text=f"Здравствуйте{', ' + name if name else ''}!\n\n" + ACCESS_GRANTED_TEXT,
+                    keyboard=main_menu_kb(user_id))
+    logger.info("[access] вход по приглашению %s: %s %s", code, user_id, name)
+    if inv.get("created_by"):
+        await _send_to_user(bot, inv["created_by"], f"✅ По вашему приглашению в бота вошёл: {name or 'без имени'} (ID {user_id}).")
+    return True
+
+
+@router.message_callback(F.payload == "admin_invite")
+async def on_admin_invite(callback, bot):
+    user_id = _get_user_id(callback)
+    if not _is_owner(user_id):
+        await _toast(callback, "Приглашать сотрудников может только владелец бота.")
+        return
+    code = access_store.create_invite(user_id)
+    await callback.answer(text="➕ Приглашение создано. Перешлите сотруднику следующее сообщение "
+                               "(удерживайте его → «Переслать»). Ссылка одноразовая.",
+                          keyboard=admin_menu_kb(user_id))
+    await _send_to_user(bot, user_id, _invite_text(code))
+
+
 async def _deny_callback(callback, bot) -> None:
     """Нажатие кнопки меню без доступа: регистрируем заявку (раньше не регистрировалась)."""
     user_id = _get_user_id(callback)
@@ -862,6 +903,10 @@ async def _deny_callback(callback, bot) -> None:
 
 async def _deny_and_request_access(message, user_id: int, bot=None) -> None:
     name = _full_name(getattr(message, "sender", None))
+    invite = INVITE_RE.search(_text(message))
+    if invite and access_store.is_bot_enabled():  # прислали код приглашения (или «/start inv_…»)
+        await _accept_invite(bot, invite.group(0).lower(), user_id, name, message.answer)
+        return
     if email_auth.enabled() and access_store.is_bot_enabled():
         await _email_login(message.answer, user_id, name, _text(message), bot)
         return
@@ -1363,7 +1408,16 @@ async def on_update_price(callback, state: FSMContext, bot):
 
 @router.bot_started()
 async def on_bot_started(event: BotStarted, bot=None):
-    user_id = getattr(event, "user_id", None) or getattr(getattr(event, "sender", None), "user_id", None)
+    user_id = _get_user_id(event)  # у bot_started пользователь в event.user
+    payload = (getattr(event, "payload", None) or "").strip()
+    if payload and not INVITE_RE.fullmatch(payload):
+        try:  # MAX может передать параметр ссылки в base64
+            payload = (event.deep_link() or payload).strip()
+        except Exception:  # noqa: BLE001
+            pass
+    if user_id is not None and INVITE_RE.fullmatch(payload) and not _allowed(user_id):
+        await _accept_invite(bot, payload, user_id, _full_name(getattr(event, "user", None)), event.answer)
+        return
     if user_id is not None and not _allowed(user_id) and email_auth.enabled() and access_store.is_bot_enabled():
         await event.answer(text=EMAIL_LOGIN_TEXT.format(domains=email_auth.domains_text()),
                            keyboard=_email_login_kb())
@@ -1601,6 +1655,9 @@ def admin_menu_kb(user_id: Optional[int] = None):
     builder.callback(text="🗂 История оценок", payload="hist")
     builder.callback(text="📖 Все команды", payload="admin_cmds")
     sizes = [2, 2, 2, 1]
+    if _is_owner(user_id):  # приглашать без почты может только владелец
+        builder.callback(text="➕ Пригласить сотрудника", payload="admin_invite")
+        sizes.append(1)
     if _is_owner(user_id):
         builder.callback(text="📥 Данные продаж (180 дн.)", payload="collect_sales")
         builder.callback(text="💾 Резервная копия", payload="backup_now")
@@ -4103,6 +4160,11 @@ async def _main():
     with open(RUN_FLAG_PATH, "w") as f:
         f.write(str(time.time()))
     await _set_commands_menu()
+    global BOT_USERNAME
+    try:
+        BOT_USERNAME = (await bot.get_me()).username
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось узнать имя бота: %s", e)
     try:  # мини-приложение; если порт занят — бот работает и без него
         await webapp.start(sys.modules[__name__], bot, port=WEBAPP_PORT)
     except Exception as e:  # noqa: BLE001
