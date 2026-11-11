@@ -153,7 +153,7 @@ def _missing_choices(data: dict) -> list:
 
 
 def _missing_maxposter(data: dict) -> list:
-    """Что не заполнено в самой оценке MaxPoster (без этого не отправить)."""
+    """Что не заполнено в самой оценке Автохаб (без этого не отправить)."""
     need = []
     if not data.get("salon") or data["salon"] not in B.get_salon_options():
         need.append(f"автосалон «{data.get('dealer_name') or '—'}» не найден в таблице салонов — сообщите администратору")
@@ -177,7 +177,7 @@ def _can_calc(data: dict) -> bool:
 
 
 def _apply_choices(data: dict, fields: dict) -> None:
-    """Принимаем только пункты, которых нет в MaxPoster; остальное из запроса игнорируем."""
+    """Принимаем только пункты, которых нет в Автохабе; остальное из запроса игнорируем."""
     for key in _editable(data):
         value = fields.get(key)
         if value and value in _options()[key]:
@@ -327,7 +327,7 @@ async def api_login(user, body):
 async def api_lookup(user, body):
     q = (body.get("q") or "").strip()
     if not q:
-        raise ApiError("Вставьте ссылку на оценку из MaxPoster, VIN или номер сделки.")
+        raise ApiError("Вставьте ссылку на оценку из Автохаба, VIN или номер сделки.")
     try:
         found = await asyncio.to_thread(B.fetch_appraisal, q)
     except Exception as e:  # noqa: BLE001
@@ -339,13 +339,13 @@ async def api_lookup(user, body):
 
 
 async def api_refresh(user, body):
-    """Оценщик поправил оценку в MaxPoster — подтягиваем заново, выбранное вручную сохраняем."""
+    """Оценщик поправил оценку в Автохабе — подтягиваем заново, выбранное вручную сохраняем."""
     old = _draft(user.user_id)
     _apply_choices(old, body.get("fields") or {})
     try:
         found = await asyncio.to_thread(B.fetch_appraisal, old["_query"])
     except Exception as e:  # noqa: BLE001
-        raise ApiError(f"Не получилось обновить из MaxPoster ({e}).")
+        raise ApiError(f"Не получилось обновить из Автохаба ({e}).")
     data = _from_maxposter(found, user, keep=old)
     data["_query"] = old["_query"]
     _drafts[user.user_id] = {"data": data, "ts": time.time()}
@@ -366,8 +366,8 @@ async def api_submit(user, body):
     if _missing_choices(data):
         raise ApiError("Выберите: " + ", ".join(_missing_choices(data)) + ".")
     if _missing_maxposter(data):
-        raise ApiError("Не заполнено в MaxPoster: " + "; ".join(_missing_maxposter(data))
-                       + ". Заполните оценку в MaxPoster и нажмите «Обновить из MaxPoster».")
+        raise ApiError("Не заполнено в Автохабе: " + "; ".join(_missing_maxposter(data))
+                       + ". Заполните оценку в Автохабе и нажмите «Обновить из Автохаба».")
     open_deals, _ = B._vin_duplicates(data.get("vin"), data.get("_record_id"))
     if open_deals and not body.get("dup_ok"):
         return {"duplicate": True, "text": "\n".join(B._appraisal_warnings(data))

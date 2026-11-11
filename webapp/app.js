@@ -111,11 +111,11 @@
     draft = null;
     render(`<h1>Новая оценка</h1>
       <div class="card">
-        <label>Ссылка на оценку из MaxPoster, VIN или номер сделки</label>
+        <label>Ссылка на оценку из Автохаба, VIN или номер сделки</label>
         <input id="q" placeholder="https://… или XW8ZZZ…" autocomplete="off">
         <button id="find">Найти оценку</button>
       </div>${msg ? `<div class="note">${linkify(msg)}</div>` : ""}
-      <p class="muted">Ручной ввод без MaxPoster и предварительный расчёт — в чате с ботом.</p>`);
+      <p class="muted">Ручной ввод без Автохаба и предварительный расчёт — в чате с ботом.</p>`);
     on("#find", lookup);
     $("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") lookup(); });
   }
@@ -123,7 +123,7 @@
   async function lookup() {
     const q = $("#q").value.trim();
     if (!q) return;
-    spinner("Ищу оценку в MaxPoster…");
+    spinner("Ищу оценку в Автохабе…");
     try { const r = await api("lookup", { q }); draft = Object.assign(r, { _scroll: !!r.result }); drawDraft(); }
     catch (e) { screenNew(); app.insertAdjacentHTML("beforeend", errorBox(e)); }
   }
@@ -167,17 +167,17 @@
         <span>Авито-оценка</span><b>${money(d.avito_price)}</b>
         <span>ПЦП Автохаб</span><b>${money(d.autohub_ptsp)}</b>
       </div>
-      <div class="muted" style="margin-top:6px">Данные из MaxPoster. Ошибка — исправьте в MaxPoster и нажмите «Обновить».
-        ${d.maxposter_url ? `<a href="${esc(d.maxposter_url)}" data-ext="1">MaxPoster →</a>` : ""}
+      <div class="muted" style="margin-top:6px">Данные из Автохаба. Ошибка — исправьте в Автохабе и нажмите «Обновить».
+        ${d.maxposter_url ? `<a href="${esc(d.maxposter_url)}" data-ext="1">Автохаб →</a>` : ""}
         ${d.autoteka_url ? ` · <a href="${esc(d.autoteka_url)}" data-ext="1">Автотека →</a>` : ""}</div>
-      <button class="secondary" id="refresh">🔄 Обновить из MaxPoster</button></div>`;
+      <button class="secondary" id="refresh">🔄 Обновить из Автохаба</button></div>`;
     if (draft.missing_maxposter && draft.missing_maxposter.length)
-      html += `<div class="error">Не заполнено в MaxPoster:<br>• ${draft.missing_maxposter.map(esc).join("<br>• ")}<br>
-        Без этого на согласование не отправить. Заполните оценку в MaxPoster и нажмите «Обновить из MaxPoster».</div>`;
+      html += `<div class="error">Не заполнено в Автохабе:<br>• ${draft.missing_maxposter.map(esc).join("<br>• ")}<br>
+        Без этого на согласование не отправить. Заполните оценку в Автохабе и нажмите «Обновить из Автохаба».</div>`;
     if (d.warnings && d.warnings.length) html += `<div class="note">${linkify(d.warnings.join("\n"))}</div>`;
     const labels = { reception_type: "Тип приёма", colors: "Окрасы", condition: "Тех. состояние", extra: "Доп. данные" };
     if (ed.length) {
-      html += `<div class="card"><div class="muted">Этого нет в MaxPoster — выберите:</div>` +
+      html += `<div class="card"><div class="muted">Этого нет в Автохабе — выберите:</div>` +
         ed.map((k) => `<label>${labels[k]}</label>${chips(k, o[k], d[k])}`).join("") +
         `<button id="calc">Посчитать</button></div>`;
     }
@@ -198,7 +198,7 @@
 
   async function refresh() {
     const fields = collect();
-    spinner("Обновляю из MaxPoster…");
+    spinner("Обновляю из Автохаба…");
     try { draft = await api("refresh", { fields }); drawDraft(); }
     catch (e) { drawDraft(e.message); }
   }
@@ -219,7 +219,7 @@
         <div class="muted" style="margin-top:6px">▲▼ — выше/ниже метрики: <span class="up">зелёная</span> — в пользу компании, <span class="dn">красная</span> — против.</div>` : ""}
       ${r.recommendation ? `<pre>${esc(r.recommendation)}</pre>` : ""}
       ${r.card_preview ? `<details><summary>Как увидят согласующие</summary><pre>${linkify(r.card_preview)}</pre></details>` : ""}
-      ${blocked ? `<div class="note">Отправка на согласование — после заполнения оценки в MaxPoster.</div>`
+      ${blocked ? `<div class="note">Отправка на согласование — после заполнения оценки в Автохабе.</div>`
                 : `<button id="submit">📨 Отправить на согласование</button>`}
     </div>`;
   }
@@ -311,7 +311,7 @@
           <div class="muted">${esc(it.salon || "")}${it.price ? " · " + money(it.price) : ""}${it.vin ? " · VIN …" + esc(String(it.vin).slice(-6)) : ""}</div>
           <div>${esc(it.status_text)} → ${esc(it.outcome)}</div>
           ${it.last_event ? `<div class="muted">${esc(it.last_event)}</div>` : ""}
-          ${it.maxposter_url ? `<a href="${esc(it.maxposter_url)}" data-ext="1">MaxPoster →</a>` : ""}</div>`).join("") + `</div>`;
+          ${it.maxposter_url ? `<a href="${esc(it.maxposter_url)}" data-ext="1">Автохаб →</a>` : ""}</div>`).join("") + `</div>`;
       render(html);
     } catch (e) { render(`<h1>Мои оценки</h1>${errorBox(e)}`); }
   }
@@ -342,7 +342,7 @@
   }
 
   async function loadHistory() {
-    const box = $("#hist"); box.innerHTML = `<div class="spinner">Собираю оценки из MaxPoster…</div>`;
+    const box = $("#hist"); box.innerHTML = `<div class="spinner">Собираю оценки из Автохаба…</div>`;
     try {
       const r = await api("history", { salon: histSalon, period: histPeriod, from: $("#from").value, to: $("#to").value });
       box.innerHTML = `<pre>${esc(r.summary)}</pre>${r.note ? `<div class="note">${esc(r.note)}</div>` : ""}<div class="card">` +
@@ -351,8 +351,8 @@
           <div class="muted">${[it.salon, it.avito ? "Авито " + money(it.avito) : "", it.price ? "цена " + money(it.price) : "",
             it.category, it.reception_type, it.appraiser ? "оценщик " + it.appraiser : ""].filter(Boolean).map(esc).join(" · ")}</div>
           <div>${it.sent ? "📨 " + esc(it.status_text) + " → " + esc(it.outcome) : "⚪ на согласование не отправлялась"}</div>
-          ${it.mp_status ? `<div class="muted">MaxPoster: ${esc(it.mp_status)}</div>` : ""}
-          ${it.maxposter_url ? `<a href="${esc(it.maxposter_url)}" data-ext="1">MaxPoster →</a>` : ""}</div>`).join("")
+          ${it.mp_status ? `<div class="muted">Автохаб: ${esc(it.mp_status)}</div>` : ""}
+          ${it.maxposter_url ? `<a href="${esc(it.maxposter_url)}" data-ext="1">Автохаб →</a>` : ""}</div>`).join("")
           : `<div class="muted">За этот период оценок нет.</div>`) + `</div>`;
       bindLinks();
     } catch (e) { box.innerHTML = errorBox(e); }

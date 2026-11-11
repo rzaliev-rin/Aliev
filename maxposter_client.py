@@ -114,7 +114,7 @@ def parse_date(value: Any) -> Optional[datetime.datetime]:
 
 
 def map_reception(raw_value: Any, brand: Optional[str] = None) -> Optional[str]:
-    """Тип приёма из MaxPoster -> тип по метрике (с учётом бренда салона)."""
+    """Тип приёма из Автохаба -> тип по метрике (с учётом бренда салона)."""
     key = str(raw_value or "").strip().lower()
     if not key:
         return None
@@ -131,7 +131,7 @@ def map_reception(raw_value: Any, brand: Optional[str] = None) -> Optional[str]:
 
 
 def extract_market(data: dict) -> dict:
-    """Рыночные поля оценки MaxPoster (сверены по /raw оценки 8737839)."""
+    """Рыночные поля оценки Автохаб (сверены по /raw оценки 8737839)."""
     liq = data.get("liquidity") or {}
 
     def num(v):
@@ -287,7 +287,7 @@ def fetch_appraisal(query: str) -> AppraisalData:
     """
     if not MAXPOSTER_API_KEY:
         raise MaxPosterError(
-            "Не задан MAXPOSTER_API_KEY — интеграция с MaxPoster ещё не настроена."
+            "Не задан MAXPOSTER_API_KEY — интеграция с Автохабом ещё не настроена."
         )
 
     parsed = extract_search_query(query)
@@ -314,7 +314,7 @@ def fetch_appraisal(query: str) -> AppraisalData:
     resp = requests.post(url, headers=headers, json=body, timeout=10)
     if resp.status_code != 200:
         raise MaxPosterError(
-            f"MaxPoster API вернул {resp.status_code}: {resp.text[:300]}"
+            f"Автохаб API вернул {resp.status_code}: {resp.text[:300]}"
         )
 
     payload = resp.json()
@@ -398,7 +398,7 @@ def _post_appraisals(body: dict, attempts: int = 4) -> list:
             )
         except (requests.Timeout, requests.ConnectionError) as e:
             if attempt == attempts - 1:
-                raise MaxPosterError(f"MaxPoster не ответил за отведённое время ({e.__class__.__name__}), "
+                raise MaxPosterError(f"Автохаб не ответил за отведённое время ({e.__class__.__name__}), "
                                      "попробуйте позже") from e
             time.sleep(5 * (attempt + 1))
             continue
@@ -407,7 +407,7 @@ def _post_appraisals(body: dict, attempts: int = 4) -> list:
             continue
         break
     if resp.status_code != 200:
-        raise MaxPosterError(f"MaxPoster API вернул {resp.status_code}: {resp.text[:200]}")
+        raise MaxPosterError(f"Автохаб API вернул {resp.status_code}: {resp.text[:200]}")
     return (resp.json().get("data") or {}).get("appraisals") or []
 
 
@@ -450,7 +450,7 @@ def list_appraisals(dealer_id: Optional[int], start: datetime.date, end: datetim
     Листаем от новых к старым и останавливаемся, когда пошли оценки раньше start."""
     global _dealer_filter_field
     if not MAXPOSTER_API_KEY:
-        raise MaxPosterError("Не задан MAXPOSTER_API_KEY — интеграция с MaxPoster не настроена.")
+        raise MaxPosterError("Не задан MAXPOSTER_API_KEY — интеграция с Автохабом не настроена.")
 
     fields = [None]
     if dealer_id is not None:

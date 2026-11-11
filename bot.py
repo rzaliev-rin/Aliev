@@ -177,7 +177,7 @@ def _vehicle_header(vehicle_info: dict, reception_type: Optional[str] = None) ->
         lines.append(f"Пробег: {_fmt(vehicle_info['mileage'])} км")
     link = _maxposter_link(vehicle_info.get("appraisal_id"))
     if link:
-        lines.append(f"Оценка в MaxPoster: {link}")
+        lines.append(f"Оценка в Автохабе: {link}")
     return "\n".join(lines)
 
 
@@ -588,7 +588,7 @@ def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_nam
     link = _maxposter_link(v.get("appraisal_id"))
     footer = []
     if link:
-        footer.append(f"MaxPoster: {link}")
+        footer.append(f"Автохаб: {link}")
     if v.get("autoteka_url"):
         footer.append(f"Автотека: {v['autoteka_url']}")
     if vin:
@@ -690,7 +690,7 @@ async def _submit_for_approval(bot, appraisal_input, result, vehicle_info: dict,
                        list(dealer_chats.list_salons()))
         await _alert_owner(
             bot,
-            f"⚠️ Заявка не ушла: салон «{dealer_name or '—'}» (так он называется в MaxPoster) не привязан к чату.\n"
+            f"⚠️ Заявка не ушла: салон «{dealer_name or '—'}» (так он называется в Автохабе) не привязан к чату.\n"
             f"Напишите в рабочем чате салона:\n/register_salon {dealer_name or 'Название салона'}",
             key=f"no_chat:{dealer_name}")
         return (
@@ -759,7 +759,7 @@ def _can_approve(user_id: Optional[int], approvers) -> bool:
     return _is_admin(user_id)
 
 
-ACCESS_GRANTED_TEXT = ("✅ Доступ к боту открыт. Пришлите ссылку на оценку из MaxPoster, VIN "
+ACCESS_GRANTED_TEXT = ("✅ Доступ к боту открыт. Пришлите ссылку на оценку из Автохаба, VIN "
                        "или номер сделки — или выберите действие:")
 
 
@@ -947,7 +947,7 @@ async def _finish_scoring(state: FSMContext, answer_fn, bot, auto_note: str = ""
         await answer_fn(
             text="🧮 ПРЕДВАРИТЕЛЬНЫЙ РАСЧЁТ\n\n" + header
             + "\n\nЭто прикидка — на согласование ничего не отправлено. Для сделки сделайте "
-              "оценку в MaxPoster и нажмите «Новая оценка».",
+              "оценку в Автохабе и нажмите «Новая оценка».",
             keyboard=main_menu_kb(data.get("_manager_user_id")),
         )
         return
@@ -1007,7 +1007,7 @@ EDITABLE_FIELDS = {
 def review_kb():
     builder = InlineKeyboardBuilder()
     builder.callback(text="📨 Отправить на согласование", payload="confirm_submit")
-    builder.callback(text="🔄 Обновить из MaxPoster", payload="update_price")
+    builder.callback(text="🔄 Обновить из Автохаба", payload="update_price")
     for field, label in EDITABLE_FIELDS.items():
         builder.callback(text=f"✏️ {label}", payload=f"edit:{field}")
     builder.adjust(1, 1, 2, 2)
@@ -1062,8 +1062,8 @@ def _appraisal_warnings(data: dict) -> list:
             dt = datetime.datetime.fromisoformat(data["appraisal_date"])
             age = (datetime.datetime.now() - dt).days
             if age > AVITO_MAX_AGE_DAYS:
-                lines.append(f"⚠️ Оценка в MaxPoster от {dt:%d.%m.%Y} ({age} дн. назад) — по метрике Авито-оценка "
-                             "нужна на день осмотра. Обновите её в MaxPoster.")
+                lines.append(f"⚠️ Оценка в Автохабе от {dt:%d.%m.%Y} ({age} дн. назад) — по метрике Авито-оценка "
+                             "нужна на день осмотра. Обновите её в Автохабе.")
         except ValueError:
             pass
     return lines
@@ -1319,16 +1319,16 @@ async def on_update_price(callback, state: FSMContext, bot):
         fresh = await asyncio.to_thread(fetch_appraisal, str(appraisal_id))
     except Exception as e:  # noqa: BLE001 — MaxPosterError или сетевой сбой
         if not isinstance(e, MaxPosterError):
-            logger.exception("Ошибка обновления оценки %s из MaxPoster", appraisal_id)
+            logger.exception("Ошибка обновления оценки %s из Автохаба", appraisal_id)
         await callback.answer(
-            text=f"Не удалось обновить данные из MaxPoster ({e}). Проверьте оценку и нажмите кнопку ещё раз.",
+            text=f"Не удалось обновить данные из Автохаба ({e}). Проверьте оценку и нажмите кнопку ещё раз.",
             keyboard=review_kb(),
         )
         return
 
     if fresh.appraisal_purchase_cost is None:
         await callback.answer(
-            text="В MaxPoster пока не видно новой закупочной цены — сначала обновите её там "
+            text="В Автохабе пока не видно новой закупочной цены — сначала обновите её там "
                  "(блок «Продажа»), затем нажмите эту кнопку ещё раз.",
             keyboard=review_kb(),
         )
@@ -1367,7 +1367,7 @@ async def on_bot_started(event: BotStarted, bot=None):
     await event.answer(
         text=(
             "Привет! Я считаю выкупную цену авто в трейд-ин по метрике АСП.\n\n"
-            "Пришлите ссылку на оценку из MaxPoster, VIN или номер сделки — или выберите действие:"
+            "Пришлите ссылку на оценку из Автохаба, VIN или номер сделки — или выберите действие:"
         ),
         keyboard=main_menu_kb(user_id),
     )
@@ -1968,7 +1968,7 @@ def _deal_salon_label(deal: dict) -> str:
 def _pats_card_text(deal: dict, approved_role_label: str = "") -> str:
     status_line = f"Статус: {approved_role_label}\n" if approved_role_label else ""
     link = _maxposter_link((deal.get("vehicle") or {}).get("appraisal_id"))
-    link_line = f"Оценка в MaxPoster: {link}\n" if link else ""
+    link_line = f"Оценка в Автохабе: {link}\n" if link else ""
     return (
         "📋 НА ПОДТВЕРЖДЕНИЕ В АВТОХАБ (ПАЦ)\n"
         f"🏢 Автосалон: {_deal_salon_label(deal)}\n"
@@ -2142,7 +2142,7 @@ async def _return_for_correction(bot, token: str, deal: dict, role: Optional[str
         f"Предложенная цена выкупа: {_fmt(deal.get('negotiated_price'))} ₽\n"
         f"Предложенная ПЦП: {_fmt(deal.get('manager_resale_forecast'))} ₽\n\n"
         "⚠️ Оценщику нужно скорректировать закупочную цену и/или цену продажи "
-        "в MaxPoster и заново прислать боту оценку на согласование."
+        "в Автохабе и заново прислать боту оценку на согласование."
     )
     if salon_chat_id:
         sent = await _send_to_chat(bot, salon_chat_id, text)
@@ -2154,7 +2154,7 @@ async def _return_for_correction(bot, token: str, deal: dict, role: Optional[str
         bot, token, deal,
         f"🔄 Оценка возвращена на корректировку{role_label}: предложено — цена выкупа "
         f"{_fmt(deal.get('negotiated_price'))} ₽, ПЦП {_fmt(deal.get('manager_resale_forecast'))} ₽. "
-        "Поправьте цены в MaxPoster и отправьте оценку заново.",
+        "Поправьте цены в Автохабе и отправьте оценку заново.",
         outcome="correction")
     card = _deal_card_text(deal)
     deals_store.delete_deal(token)
@@ -2477,11 +2477,11 @@ async def on_pats_done(callback, bot):
 
     pats_confirmer = _get_user_name(callback) or "ПАЦ"
     pats_card = _pats_card_text(deal, deal.get("final_approved_by_role"))
-    confirm_line = f"\n\n✅ ПАЦ подтвердил приёмку: {pats_confirmer}\n\nНе забудьте нажать «Согласовать» в самом Автохаб."
+    confirm_line = f"\n\n✅ ПАЦ подтвердил приёмку: {pats_confirmer}\n\nНе забудьте нажать «Согласовать» в Автохабе."
 
     deals_store.delete_deal(token)  # в чат салона не пишем — только оценщику в личку
     await _notify_appraiser(bot, token, deal,
-                            f"🏁 ПАЦ подтвердил приёмку ({pats_confirmer}). Не забудьте нажать «Согласовать» в Автохабе.",
+                            f"🏁 ПАЦ подтвердил приёмку ({pats_confirmer}). Автомобиль принят на склад.",
                             outcome="accepted")
     await callback.answer(text=pats_card + confirm_line)
 
@@ -2498,7 +2498,7 @@ async def on_bot_added_to_chat(event, bot):
             text=(
                 f"Бот добавлен в этот {kind}. ID чата: {chat_id}\n\n"
                 "Если это рабочий чат салона — админ вводит здесь:\n"
-                "/register_salon Название салона как в MaxPoster\n\n"
+                "/register_salon Название салона как в Автохабе\n\n"
                 "Если это общий чат ПАЦ — админ вводит здесь:\n"
                 "/register_pats"
             ),
@@ -2767,7 +2767,7 @@ def _history_entry(n: int, row: dict) -> str:
         lines.append("   " + " · ".join(facts))
     lines.append("   " + state_line)
     if row.get("mp_status"):
-        lines.append(f"   MaxPoster: {row['mp_status']}")
+        lines.append(f"   Автохаб: {row['mp_status']}")
     link = _maxposter_link(row.get("appraisal_id"))
     if link:
         lines.append(f"   {link}")
@@ -2775,7 +2775,7 @@ def _history_entry(n: int, row: dict) -> str:
 
 
 def _salon_dealer_id(salon: Optional[str]) -> Optional[int]:
-    """«10120: АСП Toyota - Екатеринбург» -> 10120 (номер салона = dealer.id в MaxPoster)."""
+    """«10120: АСП Toyota - Екатеринбург» -> 10120 (номер салона = dealer.id в Автохабе)."""
     m = re.match(r"\s*(\d+)\s*:", salon or "")
     return int(m.group(1)) if m else None
 
@@ -2837,8 +2837,8 @@ async def _history_rows(salon: Optional[str], uk_scope: Optional[set],
                 got = [i for i in got if find_salon(i.get("dealer_name")) == target]
             items += got
     except Exception as e:  # noqa: BLE001 — MaxPoster недоступен: показываем хотя бы журнал бота
-        logger.warning("[history] MaxPoster: %s", e)
-        items, note = [], "⚠️ MaxPoster сейчас недоступен — показаны только оценки, сделанные через бота."
+        logger.warning("[history] Автохаб: %s", e)
+        items, note = [], "⚠️ Автохаб сейчас недоступен — показаны только оценки, сделанные через бота."
     if uk_scope is not None:
         items = [i for i in items if dealer_chats.normalize_salon_name(i.get("dealer_name")) in uk_scope
                  or dealer_chats.normalize_salon_name(find_salon(i.get("dealer_name"))) in uk_scope]
@@ -3041,7 +3041,7 @@ async def cmd_register_salon(message, command: CommandObject, bot):
             builder.callback(text=salon_label(name), payload=f"regsalon:{i}")
         builder.adjust(2)
         await message.answer(text="Какой салон привязать к этому чату? Нажмите кнопку.\n"
-                                  "(Или: /register_salon Название как в MaxPoster)", keyboard=builder)
+                                  "(Или: /register_salon Название как в Автохабе)", keyboard=builder)
         return
     chat_id = message.recipient.chat_id
     name = command.args.strip()
@@ -3098,7 +3098,7 @@ async def cmd_salons(message, bot):
 async def _start_new_appraisal(state: FSMContext, answer_fn):
     await state.clear()
     await state.set_state(AppraisalStates.waiting_link)
-    await answer_fn(text="Пришлите ссылку на оценку из MaxPoster, VIN, номер сделки, или напишите «вручную».")
+    await answer_fn(text="Пришлите ссылку на оценку из Автохаба, VIN, номер сделки, или напишите «вручную».")
 
 
 def _is_private_chat(message) -> bool:
@@ -3119,13 +3119,13 @@ def _is_private_chat(message) -> bool:
 
 HELP_TEXT = (
     "❓ КАК ПОЛЬЗОВАТЬСЯ БОТОМ\n\n"
-    "🆕 Новая оценка — пришлите ссылку на оценку из MaxPoster (или VIN, номер сделки, «вручную»). "
-    "Бот сам подставит автосалон, год, пробег, окрасы, ДТП, переподготовку и цены из MaxPoster, "
+    "🆕 Новая оценка — пришлите ссылку на оценку из Автохаба (или VIN, номер сделки, «вручную»). "
+    "Бот сам подставит автосалон, год, пробег, окрасы, ДТП, переподготовку и цены из Автохаба, "
     "спросит недостающее кнопками и покажет расчёт. На согласование карточка уходит только по кнопке "
     "«Отправить на согласование».\n\n"
     "✏️ На экране итога можно исправить тип приёма, окрасы, тех. состояние и доп. данные — "
     "бот пересчитает статус.\n\n"
-    "🧮 Предварительный расчёт — быстрая прикидка без MaxPoster: Авито-оценка, год, пробег и пара кнопок. "
+    "🧮 Предварительный расчёт — быстрая прикидка без Автохаба: Авито-оценка, год, пробег и пара кнопок. "
     "Ничего не отправляется.\n\n"
     "📋 Мои оценки — последние 10 оценок и где сейчас каждая сделка. О решениях согласующих бот "
     "пишет вам сам.\n\n"
@@ -3363,7 +3363,7 @@ async def on_waiting_link(message, state: FSMContext, bot):
         data = await asyncio.to_thread(fetch_appraisal, text)
     except Exception as e:  # noqa: BLE001 — MaxPosterError или сетевой сбой
         if not isinstance(e, MaxPosterError):
-            logger.exception("Ошибка запроса к MaxPoster: %r", text)
+            logger.exception("Ошибка запроса к Автохабу: %r", text)
         await message.answer(
             text=(
                 f"Не получилось найти оценку ({e}).\n"
@@ -3396,7 +3396,7 @@ async def on_waiting_link(message, state: FSMContext, bot):
     if data.reception_type in RECEPTION_TYPES:
         auto.append(f"тип приёма — {data.reception_type}")
     elif data.reception_raw:
-        logger.warning("Тип приёма из MaxPoster «%s» не сопоставлен — добавьте его в MAXPOSTER_RECEPTION_MAP",
+        logger.warning("Тип приёма из Автохаба «%s» не сопоставлен — добавьте его в MAXPOSTER_RECEPTION_MAP",
                        data.reception_raw)
     warnings = _appraisal_warnings(await state.get_data())
     salon_line = (f"🏢 Автосалон: {salon_label(salon)}" if salon
@@ -3408,7 +3408,7 @@ async def on_waiting_link(message, state: FSMContext, bot):
         f"Нашёл оценку.\n{salon_line}\n{vehicle_line + chr(10) if vehicle_line else ''}"
         f"ВИН: {data.vin or '—'}, Оценщик: {data.appraiser_name or '—'}\n"
         f"Авито-оценка: {_fmt(data.avito_price)} ₽, ДТП: {data.accidents_count}"
-        + ("\n\nИз MaxPoster подставлено: " + "; ".join(auto) + "." if auto else "")
+        + ("\n\nИз Автохаба подставлено: " + "; ".join(auto) + "." if auto else "")
         + ("\n\n" + "\n".join(warnings) if warnings else "")
     )
     await _ask_next(state, message.answer, bot, note=note)
@@ -3958,7 +3958,7 @@ def _zip_file(path: str) -> str:
 
 
 async def _collect_sales(bot, user_id: int, days: int) -> None:
-    await _send_to_user(bot, user_id, f"⏳ Собираю оценки из MaxPoster за {days} дн. и проверяю данные о "
+    await _send_to_user(bot, user_id, f"⏳ Собираю оценки из Автохаба за {days} дн. и проверяю данные о "
                                       "продажах — это может занять несколько минут. Файлы пришлю сюда.")
     import sales_export
     try:
@@ -3996,7 +3996,7 @@ ADMIN_COMMANDS_TEXT = (
     "/help — помощь · /myid — мой ID\n"
     "РОП, ДДЦ, УК: /history — история оценок\n\n"
     "Администратор: /admin — админ-панель · /approve ID · /deny ID — доступ · /users · /pending · "
-    "/queue — очередь согласования · /report [дней] — отчёт · /raw ссылка — поля MaxPoster · "
+    "/queue — очередь согласования · /report [дней] — отчёт · /raw ссылка — поля Автохаба · "
     "/salons — салоны\n"
     "В чате салона: /register_salon Название — привязать чат · в чате ПАЦ: /register_pats\n"
     "Владелец: /backup — резервная копия · /collect_sales [дней] — данные продаж · "
