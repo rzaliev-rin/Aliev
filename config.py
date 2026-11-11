@@ -60,13 +60,13 @@ ALLOWED_USER_IDS = {
 # бот ОДИН раз повторно присылает карточку с кнопками (на каждом этапе: салон, УК, ПАЦ).
 # Только в рабочие часы (время сервера), REMINDER_HOURS="9-21" — с 9:00 до 21:00.
 # REMINDER_AFTER_MINUTES=0 — выключить напоминания полностью.
-REMINDER_AFTER_MINUTES = int(os.environ.get("REMINDER_AFTER_MINUTES", "60") or 0)
+REMINDER_AFTER_MINUTES = int(os.environ.get("REMINDER_AFTER_MINUTES", "0") or 0)  # по умолчанию выключены
 _hours = os.environ.get("REMINDER_HOURS", "9-21").split("-")
 REMINDER_HOURS = (int(_hours[0]), int(_hours[1])) if len(_hours) == 2 else (9, 21)
 
 # --- Расписание (время сервера, ЧЧ:ММ; пусто — выключено) ---
 # Утренняя сводка согласующим: что ждёт именно их решения
-DIGEST_TIME = os.environ.get("DIGEST_TIME", "09:00").strip()
+DIGEST_TIME = os.environ.get("DIGEST_TIME", "off").strip()  # утренняя сводка по ожидающим сделкам; "09:00" — включить
 # Недельный отчёт: день недели (0 — понедельник) и время
 REPORT_WEEKDAY = int(os.environ.get("REPORT_WEEKDAY", "0") or 0)
 REPORT_TIME = os.environ.get("REPORT_TIME", "09:00").strip()

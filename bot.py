@@ -1981,16 +1981,51 @@ def _pats_card_text(deal: dict, approved_role_label: str = "") -> str:
     )
 
 
+PATS_MARK_TEXT = {
+    ("diag", "open"): "⏳ Запрошено у оценщика: загрузить диагностику в Заказ-наряды",
+    ("diag", "fixed"): "✅ Оценщик: диагностика загружена — проверьте",
+    ("cat", "open"): "⏳ Запрошено у оценщика: исправить категорию в Автохаб",
+    ("cat", "fixed"): "✅ Оценщик: категория исправлена — проверьте",
+}
+
+
+def _pats_full_text(deal: dict) -> str:
+    """Карточка ПАЦ с отметками по запросам (что запрошено у оценщика и что он сделал)."""
+    text = (_pats_card_text(deal, deal.get("final_approved_by_role") or "")
+            + "\n⚠️ Перед подтверждением проверьте, что в Документы → Заказ-наряды приложена диагностика.")
+    marks = [PATS_MARK_TEXT[(k, v)] for k, v in (deal.get("pats_requests") or {}).items() if (k, v) in PATS_MARK_TEXT]
+    return text + ("\n\n" + "\n".join(marks) if marks else "")
+
+
+async def _refresh_pats_card(bot, token: str) -> bool:
+    """Обновляет уже отправленную карточку в чате ПАЦ (новое сообщение не шлём)."""
+    deal = deals_store.get_deal(token)
+    if not deal:
+        return False
+    text = _pats_full_text(deal)
+    done = False
+    cards = list(deal.get("card_msgs") or [])
+    for card in cards:
+        if card.get("stage") != "pats_pending" or not card.get("mid"):
+            continue
+        try:
+            await bot.edit_message(message_id=card["mid"], text=text[:3900], keyboard=pats_done_kb(token))
+            card["text"] = text
+            done = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[pats_card] token=%s mid=%s: %s", token, card["mid"], e)
+    if done:
+        deals_store.update_deal(token, card_msgs=cards)
+    return done
+
+
 async def _send_to_pats(bot, token: str, deal: dict, approved_role_label: str = "") -> str:
     """Отправляет карточку в чат ПАЦ (финальный этап перед складом).
     Возвращает заметку о результате для ответа согласовавшему."""
     deals_store.update_deal(token, stage="pats_pending", final_approved_by_role=approved_role_label)
     pats_chat_id = dealer_chats.get_pats_chat_id()
     logger.info("[send_to_pats] token=%s pats_chat_id=%s", token, pats_chat_id)
-    pats_text = (
-        _pats_card_text(deal, approved_role_label)
-        + "\n⚠️ Перед подтверждением проверьте, что в Документы → Заказ-наряды приложена диагностика."
-    )
+    pats_text = _pats_full_text(deals_store.get_deal(token) or deal)
     if not pats_chat_id:
         logger.warning("[send_to_pats] token=%s — чат ПАЦ не зарегистрирован, карточка не отправлена", token)
         return "\n\n⚠️ Чат ПАЦ ещё не зарегистрирован."
@@ -2354,7 +2389,7 @@ PATS_FIX_TEXT = {"diag": "диагностика загружена в Зака�
 
 @router.message_callback(F.payload.startswith("pats_fixed:"))
 async def on_pats_fixed(callback, bot):
-    """Оценщик отмечает, что выполнил запрос ПАЦ — ПАЦ получает уведомление с кнопками карточки."""
+    """Оценщик отмечает, что выполнил запрос ПАЦ — отметка появляется в самой карточке ПАЦ."""
     _, kind, token = callback.payload.split(":", 2)
     deal = deals_store.get_deal(token)
     if not deal or deal.get("stage") != "pats_pending":
@@ -2368,23 +2403,14 @@ async def on_pats_fixed(callback, bot):
     requests_state[kind] = "fixed"
     deals_store.update_deal(token, pats_requests=requests_state)
 
-    vehicle = deal.get("vehicle") or {}
-    vehicle_line = " ".join(str(x) for x in [vehicle.get("brand"), vehicle.get("model"), vehicle.get("year")] if x)
-    who = _full_name(getattr(callback, "user", None)) or vehicle.get("appraiser_name") or deal.get("manager_name") or "оценщик"
-    link = _maxposter_link(vehicle.get("appraisal_id"))
-    text = (f"✅ {who}: {PATS_FIX_TEXT.get(kind, 'замечание исправлено')}.\n"
-            f"{_deal_salon_label(deal)} · {vehicle_line or '—'} · VIN {deal.get('vin') or '—'}"
-            + (f"\n{link}" if link else "")
-            + "\n\nПроверьте и нажмите «Готово», если всё в порядке.")
-    pats_chat_id = dealer_chats.get_pats_chat_id()
-    sent = bool(pats_chat_id) and await _send_to_chat(bot, pats_chat_id, text, keyboard=pats_done_kb(token), track=token)
+    sent = await _refresh_pats_card(bot, token)  # отметка в карточке ПАЦ вместо нового сообщения
     try:
         appraisals_log.update_by_token(token, last_event=f"Оценщик: {PATS_FIX_TEXT.get(kind)}")
     except Exception as e:  # noqa: BLE001
         logger.error("Не удалось обновить журнал по сделке %s: %s", token, e)
     await callback.answer(text=f"✅ Отмечено: {PATS_FIX_TEXT.get(kind)}.\n"
-                               + ("ПАЦ получил уведомление." if sent
-                                  else "⚠️ Не удалось уведомить ПАЦ — напишите в чат ПАЦ вручную."))
+                               + ("Отметка появилась в карточке ПАЦ." if sent
+                                  else "⚠️ Не удалось отметить в карточке ПАЦ — напишите в чат ПАЦ вручную."))
 
 
 async def _send_pats_request(callback, bot, kind: str) -> None:
@@ -2429,12 +2455,10 @@ async def _send_pats_request(callback, bot, kind: str) -> None:
     requests_state[kind] = "open"
     deals_store.update_deal(token, pats_requests=requests_state)
 
-    pats_chat_id = dealer_chats.get_pats_chat_id()
-    pats_note = request_text + ("\n\n(отправлено оценщику лично)" if sent_dm else "\n\n⚠️ Не удалось отправить оценщику лично — сообщите вручную.")
-    if pats_chat_id:
-        await _send_to_chat(bot, pats_chat_id, pats_note)
-
-    await _toast(callback, "Запрос отправлен.")
+    # в чат ПАЦ новое сообщение не шлём — отмечаем запрос в самой карточке
+    await _refresh_pats_card(bot, token)
+    await _toast(callback, "Запрос отправлен оценщику." if sent_dm
+                 else "⚠️ Не удалось написать оценщику лично — сообщите ему вручную.")
 
 
 @router.message_callback(F.payload.startswith("pats_done:"))
@@ -2455,12 +2479,7 @@ async def on_pats_done(callback, bot):
     pats_card = _pats_card_text(deal, deal.get("final_approved_by_role"))
     confirm_line = f"\n\n✅ ПАЦ подтвердил приёмку: {pats_confirmer}\n\nНе забудьте нажать «Согласовать» в самом Автохаб."
 
-    salon_chat_id = _deal_chat(deal)
-    if salon_chat_id:
-        card = _deal_card_text(deal)
-        await _send_to_chat(bot, salon_chat_id, card + confirm_line)
-
-    deals_store.delete_deal(token)
+    deals_store.delete_deal(token)  # в чат салона не пишем — только оценщику в личку
     await _notify_appraiser(bot, token, deal,
                             f"🏁 ПАЦ подтвердил приёмку ({pats_confirmer}). Не забудьте нажать «Согласовать» в Автохабе.",
                             outcome="accepted")
