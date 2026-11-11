@@ -200,6 +200,11 @@
         ${autoLine("ДТП / окрасов", (d.accidents ?? "—") + " / " + (d.repainted ?? "—"))}
         ${ed.includes("colors") ? "" : autoLine("Окрасы", d.colors)}
         ${ed.includes("extra") ? "" : autoLine("Доп. данные", d.extra)}
+        <span>Категория</span><b>${res ? `<span class="catbadge">${esc(res.category.replace("Категория ", ""))}</span>`
+          + (res.category_auto && res.category !== res.category_auto
+             ? ` <span class="muted">понижена (по метрике ${esc(res.category_auto.replace("Категория ", ""))})</span>`
+             : ` <span class="muted">по метрике</span>`)
+          : '<span class="muted">после выбора тех. состояния</span>'}</b>
       </div></div>
       <div class="card"><div class="kv">
         <span>Запрос бизнеса</span><b>${d.negotiated == null ? '<span class="muted">не заполнено</span>' : money(d.negotiated)}</b>
