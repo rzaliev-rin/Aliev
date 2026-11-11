@@ -2,6 +2,7 @@
 # Установка бота «Метрика_оценка АСП» на чистый сервер Ubuntu одной командой:
 #   curl -sL https://raw.githubusercontent.com/rzaliev-rin/Aliev/claude/bot-metrika-refactor-4t2oii/deploy/install.sh | bash
 # Повторный запуск безопасен: обновляет код, а .env, ключ Google и данные бота не трогает.
+# Без GitHub (из архива-резервной копии): LOCAL_SRC=/путь/к/распакованной/папке bash install.sh
 set -e
 
 BRANCH="claude/bot-metrika-refactor-4t2oii"
@@ -20,11 +21,17 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq python3 python3-venv python3-pip curl unzip ca-certificates > /dev/null
 
-echo "=== 2/5 Скачиваю бота с GitHub…"
 TMP=$(mktemp -d)
-curl -sL -o "$TMP/bot.zip" "$ZIP_URL"
-python3 -m zipfile -e "$TMP/bot.zip" "$TMP/src"
-SRC=$(ls -d "$TMP"/src/Aliev-*)
+if [ -n "$LOCAL_SRC" ] && [ -f "$LOCAL_SRC/bot.py" ]; then
+  # установка из резервной копии кода (архив, распакованный на сервере), без GitHub
+  echo "=== 2/5 Беру бота из резервной копии: $LOCAL_SRC"
+  SRC="$LOCAL_SRC"
+else
+  echo "=== 2/5 Скачиваю бота с GitHub…"
+  curl -sL -o "$TMP/bot.zip" "$ZIP_URL"
+  python3 -m zipfile -e "$TMP/bot.zip" "$TMP/src"
+  SRC=$(ls -d "$TMP"/src/Aliev-*)
+fi
 mkdir -p "$APP/tests"
 cp "$SRC"/*.py "$SRC"/requirements.txt "$SRC"/params_table_v2.csv "$APP"/
 cp "$SRC"/tests/*.py "$APP"/tests/
