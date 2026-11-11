@@ -177,7 +177,11 @@ def _can_calc(data: dict) -> bool:
 
 
 def _apply_choices(data: dict, fields: dict) -> None:
-    """Принимаем только пункты, которых нет в Автохабе; остальное из запроса игнорируем."""
+    """Принимаем только пункты, которых нет в Автохабе; остальное из запроса игнорируем.
+    category — понижение категории оценщиком ("auto" — вернуть расчётную)."""
+    if fields.get("category"):
+        cat = fields["category"]
+        data["category_override"] = cat if cat in B.CATEGORY_ORDER else None
     for key in _editable(data):
         value = fields.get(key)
         if value and value in _options()[key]:
@@ -200,6 +204,7 @@ def _from_maxposter(found, user, keep: Optional[dict] = None) -> dict:
             if keep.get(key):
                 data[key] = keep[key]
         data["_record_id"] = keep.get("_record_id")
+        data["category_override"] = keep.get("category_override")
     return data
 
 
@@ -239,6 +244,8 @@ def _calc_view(data: dict) -> dict:
         "status_text": B._status_text(result.approval_status),
         "status_line": B._card_status_line(result.approval_status, price, metrics) if price is not None else None,
         "category": result.category,
+        "category_auto": result.category_auto,
+        "category_options": B.lower_categories(result.category_auto),
         "limits": {"rop": result.purchase_price_rop, "ddc": result.purchase_price_ddc, "ceiling": result.ceiling_price},
         "ptsp": result.planned_sale_price_rop, "gross_margin_plan": result.gross_margin_rop,
         "sale": result.manager_resale_forecast, "margin": result.margin_negotiated if price is not None else None,

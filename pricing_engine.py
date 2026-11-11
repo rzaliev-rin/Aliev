@@ -207,6 +207,17 @@ class AppraisalInput:
     negotiated_price: Optional[float] = None   # C14 "Прогноз ДЦ: закупка" — цена, о которой договорились с клиентом
     refurbishment_cost: float = 0.0            # C15 "Переподготовка"
     manager_resale_forecast: Optional[float] = None  # C12 "Прогноз ДЦ: цена продажи" (если не задан — ПЦП по метрике)
+    category_override: Optional[str] = None    # оценщик понизил категорию (повысить нельзя)
+
+
+CATEGORY_ORDER = ["Категория А", "Категория В", "Категория С"]  # от лучшей к худшей
+
+
+def lower_categories(category: str) -> list:
+    """Категории, до которых оценщик может понизить расчётную (включая её саму)."""
+    if category not in CATEGORY_ORDER:
+        return [category]
+    return CATEGORY_ORDER[CATEGORY_ORDER.index(category):]
 
 
 @dataclass
@@ -230,6 +241,7 @@ class AppraisalResult:
     manager_resale_forecast: Optional[float]  # C12 (введённый или = B12)
     margin_negotiated: Optional[float]        # C13 = C12 − C14 − C15
     gm2_negotiated: Optional[float]    # C16
+    category_auto: Optional[str] = None  # категория по метрике (до понижения оценщиком)
 
     @property
     def can_accept(self) -> bool:
@@ -246,6 +258,9 @@ def calc_appraisal(data: AppraisalInput, today: Optional[datetime.date] = None) 
 
     per_year = mileage_per_year(data.year, data.mileage, today)                       # E3
     category, score = calc_category(data.colors, data.condition, data.extra, per_year)  # B4, K5
+    category_auto = category
+    if data.category_override and data.category_override in lower_categories(category):
+        category = data.category_override  # понижение оценщиком: дальше всё считается по ней
     street = data.reception_type == STREET_BUYOUT
 
     # E4/E5: потолок закупки к Авито Оценке
@@ -323,4 +338,5 @@ def calc_appraisal(data: AppraisalInput, today: Optional[datetime.date] = None) 
         manager_resale_forecast=manager_resale_forecast,
         margin_negotiated=margin_negotiated,
         gm2_negotiated=gm2_negotiated,
+        category_auto=category_auto,
     )

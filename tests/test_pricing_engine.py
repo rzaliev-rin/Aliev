@@ -113,6 +113,17 @@ def test_new_salon_from_sheet_row():
         pricing_config._params_cache, pricing_config._params_cache_at = saved
 
 
+
+def test_category_can_only_be_lowered():
+    base = dict(avito_price=1_000_000, reception_type="Trade-In", salon="3896: АСП Новосибирск Chery")
+    auto = calc_appraisal(AppraisalInput(**base, **CAT_A), today=TODAY)
+    lowered = calc_appraisal(AppraisalInput(**base, **CAT_A, category_override="Категория В"), today=TODAY)
+    assert auto.category == "Категория А" and lowered.category == "Категория В"
+    assert lowered.category_auto == "Категория А"
+    assert lowered.purchase_price_rop < auto.purchase_price_rop  # расчёт идёт по пониженной категории
+    raised = calc_appraisal(AppraisalInput(**base, **CAT_B, category_override="Категория А"), today=TODAY)
+    assert raised.category == "Категория В"  # повысить нельзя
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

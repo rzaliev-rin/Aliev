@@ -57,6 +57,7 @@ from pricing_engine import (
     find_salon, salon_label, salon_info, is_young_car, UK_STATUSES, STATUS_REJECT,
     STATUS_OK, STATUS_DDC, STATUS_UK, STATUS_UK_CEILING, STATUS_COMMISSION, COMMISSION,
     EXTRA_YOUNG_CAR, EXTRA_NOT_APPLICABLE, METRIC_VERSION,
+    CATEGORY_ORDER, lower_categories,  # noqa: F401 — нужны мини-приложению (webapp.py)
 )
 from maxposter_client import fetch_appraisal, MaxPosterError, map_reception, list_appraisals
 from sheets_logger import log_appraisal
@@ -196,6 +197,7 @@ def _appraisal_input(data: dict) -> AppraisalInput:
         refurbishment_cost=data.get("presale_preparation_cost") or 0.0,
         manager_resale_forecast=data.get("manager_resale_forecast"),
         negotiated_price=data.get("negotiated_price"),
+        category_override=data.get("category_override"),
     )
 
 
@@ -214,6 +216,7 @@ def _metrics(result) -> dict:
         "refurbishment": result.refurbishment,
         "gm2_rop": result.gm2_rop,
         "gm2_ddc": result.gm2_ddc,
+        "category_auto": getattr(result, "category_auto", None),
     }
 
 
@@ -543,6 +546,9 @@ def _approval_card_text(vehicle_info: dict, appraisal_input, result, manager_nam
 
     car = " ".join(str(x) for x in [v.get("brand"), v.get("model"), v.get("year")] if x)
     category = str(result.category or "").replace("Категория ", "кат. ") or None
+    auto = metrics.get("category_auto")
+    if category and auto and auto != result.category:  # оценщик понизил категорию
+        category += f" (понижена оценщиком, по метрике {str(auto).replace('Категория ', '')})"
     mileage = f"{_fmt(round(v['mileage'] / 1000))} тыс. км" if v.get("mileage") is not None else None
     owners = f"{int(v['owners'])} влад." if v.get("owners") else None
     lines.append("🚗 " + " · ".join(x for x in [car or "авто", mileage, category, owners] if x))

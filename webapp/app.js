@@ -137,7 +137,7 @@
 
   function collect() {
     const f = {};
-    app.querySelectorAll(".chips").forEach((c) => {
+    app.querySelectorAll(".chips[data-name]").forEach((c) => {
       const on = c.querySelector(".chip.on"); if (on) f[c.dataset.name] = on.dataset.v;
     });
     app.querySelectorAll("input[data-f]").forEach((i) => { f[i.dataset.f] = i.value.trim(); });
@@ -186,10 +186,11 @@
       html += `<div class="error">Выберите: ${esc(draft.missing.join(", "))}</div>`;
     if (res) html += resultHtml(res, draft.missing_maxposter && draft.missing_maxposter.length);
     render(html);
-    app.querySelectorAll(".chips").forEach((c) => c.addEventListener("click", (ev) => {
+    app.querySelectorAll(".chips[data-name]").forEach((c) => c.addEventListener("click", (ev) => {
       const chip = ev.target.closest(".chip"); if (!chip) return;
       c.querySelectorAll(".chip").forEach((x) => x.classList.remove("on")); chip.classList.add("on");
     }));
+    app.querySelectorAll(".chip.cat").forEach((c) => c.addEventListener("click", () => setCategory(c.dataset.cat)));
     on("#calc", calc);
     on("#refresh", refresh);
     on("#submit", () => submit(false));
@@ -203,6 +204,21 @@
     catch (e) { drawDraft(e.message); }
   }
 
+  // Категория: по метрике — автоматически; оценщик может только понизить (А → В/С, В → С)
+  function categoryHtml(r) {
+    const all = ["Категория А", "Категория В", "Категория С"];
+    const allowed = r.category_options || [r.category];
+    const chipsHtml = all.map((c) => {
+      const letter = c.replace("Категория ", "");
+      if (!allowed.includes(c)) return `<span class="chip off">${letter}</span>`;
+      return `<span class="chip cat ${c === r.category ? "on" : ""}" data-cat="${esc(c)}">${letter}</span>`;
+    }).join("");
+    const lowered = r.category_auto && r.category !== r.category_auto;
+    return `<div class="catrow"><span class="catlabel">Категория</span><div class="chips">${chipsHtml}</div></div>
+      <div class="muted">${lowered ? `Понижена оценщиком. По метрике — ${esc(r.category_auto.replace("Категория ", ""))}, расчёт ниже — по ${esc(r.category.replace("Категория ", ""))}.`
+        : `По метрике. Можно понизить — нажмите ${allowed.length > 1 ? allowed.slice(1).map((c) => c.replace("Категория ", "")).join(" или ") : "— ниже уже некуда"}.`}</div>`;
+  }
+
   function resultHtml(r, blocked) {
     const cell = (v) => (v == null ? "—" : num(v));
     const rows = (r.compare || []).map((x) => {
@@ -214,7 +230,7 @@
     }).join("");
     return `<div class="card" id="result">
       <div class="status">${esc(r.status_line || r.status_text)}</div>
-      <div class="muted">${esc(r.category)}</div>
+      ${categoryHtml(r)}
       ${rows ? `<table class="cmp"><tr><th></th><th>Метрика</th><th>Прогноз ДЦ</th><th>ДДЦ</th></tr>${rows}</table>
         <div class="muted" style="margin-top:6px">▲▼ — выше/ниже метрики: <span class="up">зелёная</span> — в пользу компании, <span class="dn">красная</span> — против.</div>` : ""}
       ${r.recommendation ? `<pre>${esc(r.recommendation)}</pre>` : ""}
@@ -222,6 +238,17 @@
       ${blocked ? `<div class="note">Отправка на согласование — после заполнения оценки в Автохабе.</div>`
                 : `<button id="submit">📨 Отправить на согласование</button>`}
     </div>`;
+  }
+
+  async function setCategory(cat) {
+    const auto = draft.result && draft.result.category_auto;
+    const fields = collect();
+    fields.category = cat === auto ? "auto" : cat;
+    try {
+      const r = await api("calc", { fields });
+      draft = Object.assign(r, { _tried: true, _scroll: true });
+      drawDraft();
+    } catch (e) { drawDraft(e.message); }
   }
 
   async function calc() {
