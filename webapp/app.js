@@ -231,7 +231,20 @@
     if (errorText) html += `<div class="error">${esc(errorText)}</div>`;
     if (draft.missing && draft.missing.length && draft._tried)
       html += `<div class="error">Выберите: ${esc(draft.missing.join(", "))}</div>`;
-    if (res) html += resultHtml(res, draft.missing_maxposter && draft.missing_maxposter.length);
+    if (res) html += resultHtml(res, draft.missing_maxposter && draft.missing_maxposter.length, !!draft.uk_recommend);
+    if (draft.uk_recommend) {
+      const d0 = draft.draft;
+      html += `<div class="card" id="ukrec"><div class="status">📣 Рекомендация УК</div>
+        <div class="muted">Уйдёт в личку ДДЦ и РОП салона (${esc(draft.uk_recommend.recipients)}).</div>
+        <label>Рекомендуемая закупка, ₽ <span class="muted">· сейчас ${money(d0.negotiated)}</span></label>
+        <input id="ukbuy" inputmode="numeric" data-money="1" placeholder="${d0.negotiated ? num(d0.negotiated) : ""}">
+        <label>Рекомендуемая цена продажи, ₽ <span class="muted">· сейчас ${money(d0.planned)}</span></label>
+        <input id="uksale" inputmode="numeric" data-money="1" placeholder="${d0.planned ? num(d0.planned) : ""}">
+        <label>Комментарий (необязательно)</label>
+        <textarea id="ukcomment" rows="2" placeholder="Например: по рынку продажа выше, торг с клиентом"></textarea>
+        <button id="uksend">Отправить ДДЦ и РОП</button>
+        ${draft._uk_sent ? `<div class="note">${linkify(draft._uk_sent)}</div>` : ""}</div>`;
+    }
     render(html);
     app.querySelectorAll(".chips[data-name]").forEach((c) => c.addEventListener("click", (ev) => {
       const chip = ev.target.closest(".chip"); if (!chip) return;
@@ -241,7 +254,21 @@
     on("#calc", calc);
     on("#refresh", refresh);
     on("#submit", () => submit(false));
+    app.querySelectorAll("input[data-money]").forEach(moneyInput);
+    on("#uksend", ukSend);
     if (res && draft._scroll) { $("#result").scrollIntoView({ behavior: "smooth" }); draft._scroll = false; }
+  }
+
+  async function ukSend() {
+    const buy = $("#ukbuy").value, sale = $("#uksale").value, comment = $("#ukcomment").value;
+    if (!buy && !sale) { alert("Укажите рекомендуемую закупку и/или цену продажи."); return; }
+    if (!confirm("Отправить рекомендацию ДДЦ и РОП салона?")) return;
+    const btn = $("#uksend"); btn.disabled = true; btn.textContent = "Отправляю…";
+    try {
+      const r = await api("uk_recommend", { buy, sale, comment });
+      draft._uk_sent = r.text; drawDraft();
+      $("#ukrec").scrollIntoView({ behavior: "smooth" });
+    } catch (e) { btn.disabled = false; btn.textContent = "Отправить ДДЦ и РОП"; alert(e.message); }
   }
 
   async function refresh() {
@@ -266,7 +293,7 @@
         : `По метрике. Можно понизить — нажмите ${allowed.length > 1 ? allowed.slice(1).map((c) => c.replace("Категория ", "")).join(" или ") : "— ниже уже некуда"}.`}</div>`;
   }
 
-  function resultHtml(r, blocked) {
+  function resultHtml(r, blocked, viewOnly) {
     const cell = (v) => (v == null ? "—" : num(v));
     const rows = (r.compare || []).map((x) => {
       const arrow = x.arrow === "🔺" ? "▲" : x.arrow === "🔻" ? "▼" : "";
@@ -282,7 +309,7 @@
         <div class="muted" style="margin-top:6px">▲▼ — выше/ниже метрики: <span class="up">зелёная</span> — в пользу компании, <span class="dn">красная</span> — против.</div>` : ""}
       ${r.recommendation ? `<pre>${esc(r.recommendation)}</pre>` : ""}
       ${r.card_preview ? `<details><summary>Как увидят согласующие</summary><pre>${linkify(r.card_preview)}</pre></details>` : ""}
-      ${blocked ? `<div class="note">Отправка на согласование — после заполнения оценки в Автохабе.</div>`
+      ${viewOnly ? "" : blocked ? `<div class="note">Отправка на согласование — после заполнения оценки в Автохабе.</div>`
                 : `<button id="submit">📨 Отправить на согласование</button>`}
     </div>`;
   }

@@ -208,12 +208,85 @@ def _from_maxposter(found, user, keep: Optional[dict] = None) -> dict:
     return data
 
 
-def _state_view(data: dict) -> dict:
+def _state_view(data: dict, user=None) -> dict:
     view = {"draft": _draft_view(data), "missing": _missing_choices(data),
             "missing_maxposter": _missing_maxposter(data)}
     if _can_calc(data):
         view["result"] = _calc_view(data)
+    if user is not None and data.get("_from_history") and _is_uk_for(user.user_id, data):
+        view["uk_recommend"] = {"recipients": _uk_recipients_text(data)}
     return view
+
+
+def _is_uk_for(user_id: int, data: dict) -> bool:
+    dealer = data.get("dealer_name") or data.get("salon")
+    return user_id in B.approval_hierarchy.get_uk_approvers(dealer)
+
+
+def _uk_recipients(data: dict) -> set:
+    dealer = data.get("dealer_name") or data.get("salon")
+    return (B.approval_hierarchy.get_role_ids(dealer, "ДДЦ") | B.approval_hierarchy.get_role_ids(dealer, "РОП"))
+
+
+def _uk_recipients_text(data: dict) -> str:
+    dealer = data.get("dealer_name") or data.get("salon")
+    ddc = len(B.approval_hierarchy.get_role_ids(dealer, "ДДЦ"))
+    rop = len(B.approval_hierarchy.get_role_ids(dealer, "РОП"))
+    return f"ДДЦ: {ddc}, РОП: {rop}" if ddc or rop else "в таблице «Иерархия согласования» нет ДДЦ и РОП этого салона"
+
+
+def _diff(new, old) -> str:
+    if old is None or new is None:
+        return ""
+    d = round(new - old)
+    return " (без изменений)" if d == 0 else f" ({'+' if d > 0 else '−'}{B._fmt(abs(d))})"
+
+
+async def api_uk_recommend(user, body):
+    """УК рекомендует ДДЦ и РОП салона другие цены закупки и продажи по оценке из «Истории»."""
+    data = _draft(user.user_id)
+    if not _is_uk_for(user.user_id, data):
+        raise ApiError("Рекомендацию может дать только УК этого салона.", 403)
+    buy, sale = _num(body.get("buy")), _num(body.get("sale"))
+    if not buy and not sale:
+        raise ApiError("Укажите рекомендуемую цену закупки и/или продажи.")
+    recipients = _uk_recipients(data) - {user.user_id}
+    if not recipients:
+        raise ApiError("Некому отправить: в таблице «Иерархия согласования» нет ДДЦ и РОП этого салона.")
+    who = B._short_name(B._full_name(user)) or "член УК"
+    car = " ".join(str(x) for x in [data.get("brand"), data.get("model"), data.get("year")] if x)
+    salon = B.salon_label(data["salon"]) if data.get("salon") else data.get("dealer_name")
+    cur_buy, cur_sale = data.get("negotiated_price"), data.get("manager_resale_forecast")
+    link = B._maxposter_link(data.get("appraisal_id"))
+    rec = []
+    if buy:
+        rec.append(f"закупка {B._fmt(buy)} ₽{_diff(buy, cur_buy)}")
+    if sale:
+        rec.append(f"продажа {B._fmt(sale)} ₽{_diff(sale, cur_sale)}")
+    comment = (body.get("comment") or "").strip()[:500]
+    text = (f"📣 РЕКОМЕНДАЦИЯ УК\n"
+            f"Управляющая компания в лице {who} рекомендует изменить параметры по сделке:\n\n"
+            f"🏢 {salon} · {car or 'авто'}\n"
+            + (f"VIN {data['vin']}\n" if data.get("vin") else "")
+            + (f"Оценка в Автохабе: {link}\n" if link else "")
+            + f"\nЗапрос бизнеса: закупка {B._fmt(cur_buy)} ₽, продажа {B._fmt(cur_sale)} ₽\n"
+            + f"Рекомендация УК: {', '.join(rec)}"
+            + (f"\n\nКомментарий: {comment}" if comment else ""))
+    sent = 0
+    for uid in recipients:
+        if await B._send_to_user(BOT, uid, text):
+            sent += 1
+    try:
+        if data.get("_record_id"):
+            B.appraisals_log.update(data["_record_id"], last_event=f"Рекомендация УК ({who}): " + ", ".join(rec))
+    except Exception as e:  # noqa: BLE001
+        logger.error("журнал: %s", e)
+    logger.info("[uk_recommend] %s -> %s получателей: %s", user.user_id, sent, rec)
+    if not sent:
+        raise ApiError("Не удалось отправить ни одному получателю — возможно, они ещё не писали боту.")
+    return {"ok": True, "text": f"✅ Рекомендация отправлена в личку: {sent} из {len(recipients)} (ДДЦ и РОП салона).\n\n" + text}
+
+
 
 
 def _num(v) -> Optional[float]:
@@ -349,7 +422,7 @@ async def api_lookup(user, body):
         data["_record_id"] = same["id"]
     data["_query"] = q
     _drafts[user.user_id] = {"data": data, "ts": time.time()}
-    return _state_view(data)
+    return _state_view(data, user)
 
 
 async def api_refresh(user, body):
@@ -362,14 +435,15 @@ async def api_refresh(user, body):
         raise ApiError(f"Не получилось обновить из Автохаба ({e}).")
     data = _from_maxposter(found, user, keep=old)
     data["_query"] = old["_query"]
+    data["_from_history"] = old.get("_from_history")
     _drafts[user.user_id] = {"data": data, "ts": time.time()}
-    return _state_view(data)
+    return _state_view(data, user)
 
 
 async def api_calc(user, body):
     data = _draft(user.user_id)
     _apply_choices(data, body.get("fields") or {})
-    return _state_view(data)
+    return _state_view(data, user)
 
 
 async def api_submit(user, body):
@@ -460,8 +534,9 @@ async def api_open(user, body):
         keep["_record_id"] = rec.get("id")
     data = _from_maxposter(found, user, keep=keep)
     data["_query"] = q
+    data["_from_history"] = rec is None  # открыта из «Истории» — УК может дать рекомендацию
     _drafts[user.user_id] = {"data": data, "ts": time.time()}
-    view = _state_view(data)
+    view = _state_view(data, user)
     deal = B.deals_store.get_deal(rec.get("token")) if rec and rec.get("token") else None
     if deal:
         view["open_deal"] = (f"Эта оценка уже на согласовании: {B.STAGE_TEXT.get(deal.get('stage'), deal.get('stage'))}, "
@@ -568,7 +643,7 @@ async def api_admin_action(user, body):
     raise ApiError("Неизвестное действие.")
 
 
-API = {"me": api_me, "login": api_login, "lookup": api_lookup, "refresh": api_refresh, "open": api_open, "calc": api_calc, "submit": api_submit,
+API = {"me": api_me, "login": api_login, "lookup": api_lookup, "refresh": api_refresh, "open": api_open, "uk_recommend": api_uk_recommend, "calc": api_calc, "submit": api_submit,
        "approvals": api_approvals, "decide": api_decide, "my": api_my, "history": api_history,
        "admin": api_admin, "admin_action": api_admin_action}
 OPEN_METHODS = {"me", "login"}  # доступны и без доступа к боту
