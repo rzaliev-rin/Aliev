@@ -41,16 +41,23 @@ echo "=== 4/5 Настройки"
 if [ -f "$APP/.env" ]; then
   echo "Файл настроек уже есть — оставляю как есть ($APP/.env)."
 else
-  ask "Вставьте ТОКЕН НОВОГО бота MAX (от @MasterBot; не токен бота метрики!):" BOT_TOKEN
+  ask "Вставьте ТОКЕН бота MAX для выкупа (от @MasterBot; не токен бота метрики!):" BOT_TOKEN
   while [ -z "$BOT_TOKEN" ]; do ask "Токен обязателен. Вставьте токен бота MAX:" BOT_TOKEN; done
   ask "Ваш ID в MAX — владелец бота (просто Ввод = 4852272):" OWNER
   OWNER=${OWNER:-4852272}
-  ask "API-ключ Yandex AI Studio (AQVN…; или просто Ввод — добавить позже):" YA_KEY
-  ask "ID каталога Yandex Cloud (b1g…; или просто Ввод — добавить позже):" YA_FOLDER
+  ask "Ключ Claude API (sk-ant-…; или просто Ввод — если ИИ будет YandexGPT или добавите позже):" AI_KEY
+  YA_KEY=""; YA_FOLDER=""; PROVIDER="anthropic"
+  if [ -z "$AI_KEY" ]; then
+    ask "API-ключ Yandex AI Studio (AQVN…; или просто Ввод — добавить позже):" YA_KEY
+    [ -n "$YA_KEY" ] && ask "ID каталога Yandex Cloud (b1g…):" YA_FOLDER
+    [ -n "$YA_KEY" ] && PROVIDER="yandex"
+  fi
   ask "Адрес вебхука Битрикс24 (https://…/rest/…/…/; или просто Ввод — добавить позже):" BX_URL
   sed -e "s|^BUYOUT_BOT_TOKEN=.*|BUYOUT_BOT_TOKEN=$BOT_TOKEN|" \
       -e "s|^BITRIX_WEBHOOK_URL=.*|BITRIX_WEBHOOK_URL=$BX_URL|" \
       -e "s|^OWNER_USER_ID=.*|OWNER_USER_ID=$OWNER|" \
+      -e "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=$AI_KEY|" \
+      -e "s|^BUYOUT_AI_PROVIDER=.*|BUYOUT_AI_PROVIDER=$PROVIDER|" \
       -e "s|^YANDEX_API_KEY=.*|YANDEX_API_KEY=$YA_KEY|" \
       -e "s|^YANDEX_FOLDER_ID=.*|YANDEX_FOLDER_ID=$YA_FOLDER|" \
       "$APP/buyout/.env.example" > "$APP/.env"

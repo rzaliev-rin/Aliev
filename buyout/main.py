@@ -297,8 +297,9 @@ async def _main():
         tasks.append(asyncio.create_task(run_forever(BuyoutEngine(notify, alert))))
         await alert(f"✅ запущен ({agent.describe_provider()}). Агент работает по включённым профилям (/buyout).")
     else:
-        await alert("запущен, но не настроен ИИ (YANDEX_API_KEY и YANDEX_FOLDER_ID в .env) — агент не пишет "
-                    "продавцам. Добавьте ключ и перезапустите: systemctl restart buyoutbot")
+        await alert("запущен, но не настроен ИИ: в /root/buyoutbot/.env нет ключа (ANTHROPIC_API_KEY для Claude "
+                    "или YANDEX_API_KEY + YANDEX_FOLDER_ID для YandexGPT) — агент не пишет продавцам. "
+                    "Добавьте ключ и перезапустите: systemctl restart buyoutbot")
     await dp.start_polling(bot)
 
 
