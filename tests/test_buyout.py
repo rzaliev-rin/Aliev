@@ -352,6 +352,52 @@ def test_agent_request_shape():
     agent._client = None
 
 
+def test_yandex_request_shape():
+    """Запрос к YandexGPT (OpenAI-совместимый API Yandex AI Studio) и разбор ответа — без сети."""
+    import httpx2 as httpx
+    from openai import OpenAI
+    captured = {}
+
+    def handler(request):
+        captured["url"] = str(request.url)
+        captured["project"] = request.headers.get("openai-project")
+        captured["auth"] = request.headers.get("authorization")
+        captured["body"] = json.loads(request.content)
+        content = json.dumps({"reply": "Спасибо, Сергей! Менеджер позвонит после 18.", "status": "READY",
+                              "lead": {"deal_type": "комиссия", "client_name": "Сергей",
+                                       "phone": "8 (999) 123-45-67", "best_time": "после 18",
+                                       "price_expectation": "", "condition": "", "summary": "Готов"}},
+                             ensure_ascii=False)
+        body = {"id": "1", "object": "chat.completion", "created": 0, "model": "yandexgpt-5.1",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": content}}]}
+        return httpx.Response(200, json=body)
+
+    os.environ.update(YANDEX_API_KEY="AQVN-test", YANDEX_FOLDER_ID="b1gfolder", BUYOUT_AI_PROVIDER="yandex")
+    try:
+        agent._yandex_client = OpenAI(api_key="AQVN-test", base_url=agent.YANDEX_BASE_URL, project="b1gfolder",
+                                      http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+        assert agent.provider() == "yandex" and agent.configured()
+        _reset()
+        profile = _profile()
+        dialog = {"listing": _listing(1).to_dict(), "lead": {}, "offer": "both",
+                  "messages": [{"from": "us", "text": "Добрый день!"}, {"from": "client", "text": "Сергей, 89991234567"}]}
+        result = agent.next_turn(profile, dialog)
+        assert captured["url"] == "https://ai.api.cloud.yandex.net/v1/chat/completions"
+        assert captured["project"] == "b1gfolder" and captured["auth"] == "Bearer AQVN-test"
+        b = captured["body"]
+        assert b["model"] == "gpt://b1gfolder/yandexgpt-5.1"
+        assert b["response_format"]["type"] == "json_schema" and b["messages"][0]["role"] == "system"
+        assert "Алексей" in b["messages"][0]["content"] and "Сергей, 89991234567" in b["messages"][1]["content"]
+        # нормализация: статус в нижнем регистре, телефон — цифры с 7, непонятный тип сделки — unknown
+        assert result["status"] == "ready" and result["lead"]["phone"] == "79991234567"
+        assert result["lead"]["deal_type"] == "unknown"
+    finally:
+        for k in ("YANDEX_API_KEY", "YANDEX_FOLDER_ID", "BUYOUT_AI_PROVIDER"):
+            os.environ.pop(k, None)
+        agent._yandex_client = None
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

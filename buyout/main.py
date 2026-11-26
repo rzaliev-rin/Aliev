@@ -268,13 +268,14 @@ async def _set_commands():
 async def _main():
     await _set_commands()
     tasks = []
-    if os.environ.get("ANTHROPIC_API_KEY"):
+    from buyout import agent
+    if agent.configured():
         from buyout.engine import BuyoutEngine, run_forever
         tasks.append(asyncio.create_task(run_forever(BuyoutEngine(notify, alert))))
-        await alert("✅ запущен. Агент работает по включённым профилям (/buyout).")
+        await alert(f"✅ запущен ({agent.describe_provider()}). Агент работает по включённым профилям (/buyout).")
     else:
-        await alert("запущен, но ANTHROPIC_API_KEY не задан в .env — агент не пишет продавцам. "
-                    "Добавьте ключ и перезапустите: systemctl restart buyoutbot")
+        await alert("запущен, но не настроен ИИ (YANDEX_API_KEY и YANDEX_FOLDER_ID в .env) — агент не пишет "
+                    "продавцам. Добавьте ключ и перезапустите: systemctl restart buyoutbot")
     await dp.start_polling(bot)
 
 

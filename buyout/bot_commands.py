@@ -315,7 +315,7 @@ async def cmd_buyout_try(message, command: CommandObject, bot):
     try:
         text = await asyncio.to_thread(agent.opening_message, p, listing, offer)
     except Exception as e:  # noqa: BLE001
-        await message.answer(text=f"Агент недоступен: {type(e).__name__}: {e}\nПроверьте ANTHROPIC_API_KEY в .env.")
+        await message.answer(text=f"Агент недоступен: {type(e).__name__}: {e}\nПроверьте ключ ИИ в .env (YANDEX_API_KEY, YANDEX_FOLDER_ID).")
         return
     _sandboxes[_uid(message)] = {"profile_id": p["id"], "dialog": {
         "key": "sandbox", "listing": listing.to_dict(), "lead": {}, "status": dialogs.ACTIVE, "offer": offer,

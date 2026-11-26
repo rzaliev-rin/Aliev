@@ -9,14 +9,15 @@
   status  — active / ready / declined / not_relevant / need_human
   lead    — что удалось узнать: выкуп или комиссия, имя, телефон, удобное время, состояние, ожидания по цене
 
-Модель: Claude (Anthropic API). Ключ — ANTHROPIC_API_KEY в .env.
+Модель (BUYOUT_AI_PROVIDER в .env):
+  yandex    — YandexGPT / Alice AI в Yandex AI Studio (YANDEX_API_KEY, YANDEX_FOLDER_ID, YANDEX_MODEL)
+  anthropic — Claude (ANTHROPIC_API_KEY)
+Не указан — берётся тот, для которого задан ключ (сначала Яндекс).
 """
 import json
 import logging
 import os
 from typing import Optional
-
-import anthropic
 
 from buyout import dialogs
 from buyout.listings import Listing
@@ -25,15 +26,55 @@ logger = logging.getLogger(__name__)
 
 MODEL = os.environ.get("BUYOUT_MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("BUYOUT_EFFORT", "medium")  # low / medium / high
+YANDEX_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
 
-_client: Optional[anthropic.Anthropic] = None
+_client = None         # Anthropic
+_yandex_client = None  # Yandex AI Studio (OpenAI-совместимый API)
 
 
-def _get_client() -> anthropic.Anthropic:
+def provider() -> str:
+    """yandex / anthropic / "" (ничего не настроено)."""
+    chosen = os.environ.get("BUYOUT_AI_PROVIDER", "").strip().lower()
+    if chosen in ("yandex", "anthropic"):
+        return chosen
+    if os.environ.get("YANDEX_API_KEY"):
+        return "yandex"
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    return ""
+
+
+def configured() -> bool:
+    p = provider()
+    if p == "yandex":
+        return bool(os.environ.get("YANDEX_API_KEY") and os.environ.get("YANDEX_FOLDER_ID"))
+    return p == "anthropic" and bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+
+def describe_provider() -> str:
+    p = provider()
+    if p == "yandex":
+        return f"Yandex AI Studio, модель {os.environ.get('YANDEX_MODEL', 'yandexgpt-5.1')}"
+    if p == "anthropic":
+        return f"Anthropic, модель {MODEL}"
+    return "не настроена"
+
+
+def _get_client():
     global _client
     if _client is None:
+        import anthropic
         _client = anthropic.Anthropic()  # ANTHROPIC_API_KEY из окружения
     return _client
+
+
+def _get_yandex_client():
+    global _yandex_client
+    if _yandex_client is None:
+        from openai import OpenAI
+        _yandex_client = OpenAI(api_key=os.environ["YANDEX_API_KEY"], base_url=YANDEX_BASE_URL,
+                                project=os.environ["YANDEX_FOLDER_ID"])  # каталог Yandex Cloud
+    return _yandex_client
 
 
 # Общие правила — одинаковые для всех салонов (кэшируются на стороне API).
@@ -169,8 +210,83 @@ def _transcript(messages: list) -> str:
     return "\n".join(f"{who.get(m['from'], m['from'])}: {m['text']}" for m in messages)
 
 
+# Для YandexGPT — упрощённая схема: в документации нет enum/additionalProperties,
+# поэтому допустимые значения описаны словами, а ответ проверяется в _normalize().
+YANDEX_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reply": {"type": "string", "description": "Текст, который уйдёт продавцу"},
+        "status": {"type": "string", "description": "Одно из: active, ready, declined, not_relevant, need_human"},
+        "lead": {
+            "type": "object",
+            "properties": {
+                "deal_type": {"type": "string", "description": "Одно из: buyout, commission, unknown"},
+                "client_name": {"type": "string"},
+                "phone": {"type": "string", "description": "Только цифры с кодом страны, например 79991234567"},
+                "best_time": {"type": "string"},
+                "price_expectation": {"type": "string"},
+                "condition": {"type": "string"},
+                "summary": {"type": "string"},
+            },
+            "required": ["deal_type", "client_name", "phone", "best_time", "price_expectation", "condition", "summary"],
+        },
+    },
+    "required": ["reply", "status", "lead"],
+}
+_STATUSES = {dialogs.ACTIVE, dialogs.READY, dialogs.DECLINED, dialogs.NOT_RELEVANT, dialogs.NEED_HUMAN}
+_LEAD_KEYS = ("deal_type", "client_name", "phone", "best_time", "price_expectation", "condition", "summary")
+
+
+def _normalize(data) -> dict:
+    """Приводим ответ модели к нужному виду: неизвестный статус — продолжаем диалог,
+    телефон — только цифры, все поля лида — строки."""
+    if not isinstance(data, dict):
+        raise ValueError("модель вернула не JSON-объект")
+    status = str(data.get("status") or "").strip().lower()
+    lead_in = data.get("lead") if isinstance(data.get("lead"), dict) else {}
+    lead = {k: str(lead_in.get(k) or "").strip() for k in _LEAD_KEYS}
+    if lead["deal_type"] not in ("buyout", "commission"):
+        lead["deal_type"] = "unknown"
+    digits = "".join(ch for ch in lead["phone"] if ch.isdigit())
+    if len(digits) == 11 and digits[0] == "8":
+        digits = "7" + digits[1:]
+    elif len(digits) == 10:
+        digits = "7" + digits
+    lead["phone"] = digits
+    return {"reply": str(data.get("reply") or "").strip(),
+            "status": status if status in _STATUSES else dialogs.ACTIVE,
+            "lead": lead}
+
+
+def _parse_json(text: str):
+    text = (text or "").strip()
+    if text.startswith("```"):  # на всякий случай: ответ в блоке ```json … ```
+        text = text.strip("`")
+        text = text[text.find("{"):]
+    start, end = text.find("{"), text.rfind("}")
+    return json.loads(text[start:end + 1] if start >= 0 and end > start else text)
+
+
+def _ask_yandex(profile: dict, task: str) -> dict:
+    model = os.environ.get("YANDEX_MODEL", "yandexgpt-5.1")
+    response = _get_yandex_client().chat.completions.create(
+        model=f"gpt://{os.environ['YANDEX_FOLDER_ID']}/{model}",
+        messages=[
+            {"role": "system", "content": RULES + "\n\n" + salon_block(profile)
+             + "\n\nОтвечай строго JSON-объектом с полями reply, status, lead."},
+            {"role": "user", "content": task},
+        ],
+        temperature=float(os.environ.get("YANDEX_TEMPERATURE", "0.5")),
+        max_tokens=1500,
+        response_format={"type": "json_schema", "json_schema": {"name": "turn", "schema": YANDEX_SCHEMA}},
+    )
+    return _normalize(_parse_json(response.choices[0].message.content))
+
+
 def _ask(profile: dict, task: str) -> dict:
     """Один запрос к модели. Всё состояние диалога передаём текстом — это просто и надёжно."""
+    if provider() == "yandex":
+        return _ask_yandex(profile, task)
     response = _get_client().beta.messages.create(
         model=MODEL,
         max_tokens=4000,
@@ -188,7 +304,7 @@ def _ask(profile: dict, task: str) -> dict:
         return {"reply": "", "status": dialogs.NEED_HUMAN,
                 "lead": {"summary": "Агент не смог ответить — нужен менеджер"}}
     text = next((b.text for b in response.content if b.type == "text"), "")
-    return json.loads(text)
+    return _normalize(json.loads(text))
 
 
 _OPENING_HOOK = {

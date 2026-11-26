@@ -267,9 +267,10 @@ https://auto.drom.ru/…
    ```bash
    curl -sL https://raw.githubusercontent.com/rzaliev-rin/Aliev/claude/peaceful-dijkstra-2793bo/deploy/install_buyout.sh | bash
    ```
-   Скрипт ставит Python, Chromium, код и спросит токен нового бота, ваш ID в MAX
-   и ключ Anthropic API (console.anthropic.com; можно добавить позже в
-   `/root/buyoutbot/.env`, затем `systemctl restart buyoutbot`).
+   Скрипт ставит Python, Chromium, код и спросит токен нового бота, ваш ID в MAX,
+   API-ключ и ID каталога Yandex AI Studio (ИИ — YandexGPT; можно добавить позже в
+   `/root/buyoutbot/.env`, затем `systemctl restart buyoutbot`). Запасной вариант —
+   Claude: `ANTHROPIC_API_KEY` + `BUYOUT_AI_PROVIDER=anthropic`.
 3. Вход в аккаунт площадки — на своём компьютере (откроется браузер):
    ```bash
    pip install playwright && playwright install chromium
