@@ -265,7 +265,30 @@ async def _set_commands():
         logger.warning("Не удалось задать меню команд: %s", e)
 
 
+async def _drop_old_webhooks() -> None:
+    """Если бот раньше работал через конструктор или другую программу, у него может
+    остаться вебхук — тогда наши сообщения уходят туда. Снимаем такие подключения."""
+    try:
+        subs = await bot.get_subscriptions()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось проверить вебхуки бота: %s", e)
+        return
+    removed = []
+    for sub in subs or []:
+        try:
+            await bot.delete_subscription(url=sub.url)
+            removed.append(sub.url)
+        except Exception as e:  # noqa: BLE001
+            logger.error("Не удалось снять вебхук %s: %s", sub.url, e)
+    if removed:
+        host = ", ".join(sorted({u.split("/")[2] if "//" in u else u for u in removed}))
+        await alert(f"снял старое подключение бота к другой программе ({host}). "
+                    "Теперь сообщения этого бота обрабатывает только агент выкупа. "
+                    "Если старая программа (рассылка новостей) ещё включена — выключите её, иначе она подключится снова.")
+
+
 async def _main():
+    await _drop_old_webhooks()
     await _set_commands()
     tasks = []
     from buyout import agent
